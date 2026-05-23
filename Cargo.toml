@@ -1,0 +1,10 @@
+[workspace]
+members = [
+  "crates/quota-core",
+  "crates/codex-quota-card",
+  "crates/codex-quota-mcp",
+  "crates/codex-quota-watch",
+  "crates/codex-ornament-bridge",
+  "src-tauri",
+]
+resolver = "2"

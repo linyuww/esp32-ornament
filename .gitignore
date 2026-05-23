@@ -1,0 +1,43 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+.vs/
+.vscode/
+.idea/
+
+# Node / frontend
+node_modules/
+dist/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Rust
+target/
+
+# ESP-IDF
+firmware/**/build/
+firmware/**/managed_components/
+firmware/**/dependencies.lock
+firmware/**/sdkconfig
+firmware/**/sdkconfig.old
+firmware/**/release/
+
+# Generated preview intermediates
+firmware/**/docs/__pycache__/
+firmware/**/docs/*.exe
+firmware/**/docs/*.ppm
+
+# Logs and local archives
+*.log
+*.tgz
+*.tar
+*.tar.gz
+*.zip
+
+# Local secrets / credentials
+.env
+.env.*
+auth.json
+tokens.json
+secrets.json

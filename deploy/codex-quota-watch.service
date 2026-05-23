@@ -1,0 +1,21 @@
+[Unit]
+Description=Codex quota watcher for OpenClaw
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=CODEX_AUTH_PATH=/etc/codex-quota/auth.json
+Environment=CODEX_QUOTA_STATE=/var/lib/codex-quota/state.json
+Environment=POLL_INTERVAL_SECONDS=30
+Environment=OPENCLAW_BIN=/usr/local/bin/openclaw
+Environment=OPENCLAW_TARGET=default
+Environment=HTTP_PROXY=http://127.0.0.1:10809
+Environment=HTTPS_PROXY=http://127.0.0.1:10809
+Environment=ALL_PROXY=socks5h://127.0.0.1:10809
+ExecStart=/usr/local/bin/codex-quota-watch
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

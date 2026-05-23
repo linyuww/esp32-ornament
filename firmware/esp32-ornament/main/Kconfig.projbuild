@@ -1,0 +1,140 @@
+menu "Codex Ornament"
+
+config ORNAMENT_WIFI_SSID
+    string "Wi-Fi SSID"
+    default ""
+
+config ORNAMENT_WIFI_PASSWORD
+    string "Wi-Fi password"
+    default ""
+
+config ORNAMENT_BRIDGE_URL
+    string "Bridge state URL"
+    default "http://192.168.1.100:8787/state"
+
+config ORNAMENT_CONNECT_TIMEOUT_MS
+    int "Wi-Fi connect timeout in milliseconds"
+    default 60000
+    range 5000 120000
+
+config ORNAMENT_PROV_AP_PREFIX
+    string "Provisioning SoftAP SSID prefix"
+    default "Codex-Ornament"
+
+config ORNAMENT_PROV_AP_PASSWORD
+    string "Provisioning SoftAP password"
+    default "codex1234"
+    help
+        Use at least 8 characters. Set empty for an open provisioning AP.
+
+config ORNAMENT_PROV_AP_CHANNEL
+    int "Provisioning SoftAP channel"
+    default 1
+    range 1 13
+
+config ORNAMENT_PROV_SCAN_MAX
+    int "Maximum Wi-Fi networks shown in provisioning portal"
+    default 16
+    range 4 32
+
+config ORNAMENT_POLL_INTERVAL_MS
+    int "Bridge poll interval in milliseconds"
+    default 3000
+    range 1000 60000
+
+config ORNAMENT_SNTP_SERVER
+    string "SNTP server"
+    default "pool.ntp.org"
+
+config ORNAMENT_TIMEZONE
+    string "POSIX timezone"
+    default "CST-8"
+    help
+        POSIX timezone string used by localtime_r(). CST-8 means UTC+8.
+
+config ORNAMENT_QUOTA_CRITICAL_PERCENT
+    int "Critical quota percent"
+    default 10
+    range 0 100
+
+config ORNAMENT_QUOTA_WARN_PERCENT
+    int "Warning quota percent"
+    default 25
+    range 0 100
+
+config ORNAMENT_DONE_FLASH_MS
+    int "Task done ring flash duration in milliseconds"
+    default 10000
+    range 0 600000
+
+config ORNAMENT_STANDBY_CLOCK_MS
+    int "Switch to standby clock page after idle milliseconds"
+    default 120000
+    range 0 3600000
+    help
+        Set 0 to disable the dedicated standby clock page. Idle status switches to clock after this duration.
+
+config ORNAMENT_DISPLAY_DRIVER
+    string "Display driver variant"
+    default "st77916_qspi"
+    help
+        Purchased screen is a 1.5 inch 360x360 ST77916 QSPI 16P round TFT.
+        Use st77916_qspi by default.
+
+config ORNAMENT_LCD_SPI_HOST
+    int "LCD SPI host"
+    default 2
+    help
+        SPI2_HOST is normally 1 and SPI3_HOST is normally 2 in ESP-IDF enum values.
+
+config ORNAMENT_LCD_H_RES
+    int "LCD horizontal resolution"
+    default 360
+
+config ORNAMENT_LCD_V_RES
+    int "LCD vertical resolution"
+    default 360
+
+config ORNAMENT_LCD_PIXEL_CLOCK_HZ
+    int "LCD pixel clock Hz"
+    default 40000000
+
+config ORNAMENT_LCD_PIN_SCLK
+    int "LCD SCLK GPIO"
+    default 12
+
+config ORNAMENT_LCD_PIN_MOSI
+    int "LCD IO0 GPIO for QSPI"
+    default 11
+
+config ORNAMENT_LCD_PIN_MISO
+    int "LCD IO1 GPIO for QSPI"
+    default 13
+
+config ORNAMENT_LCD_PIN_D2
+    int "LCD IO2 GPIO for QSPI"
+    default 14
+
+config ORNAMENT_LCD_PIN_D3
+    int "LCD IO3 GPIO for QSPI"
+    default 15
+
+config ORNAMENT_LCD_PIN_CS
+    int "LCD CS GPIO"
+    default 10
+
+config ORNAMENT_LCD_PIN_DC
+    int "LCD DC GPIO for SPI"
+    default -1
+    help
+        Not used by the purchased QSPI panel.
+
+config ORNAMENT_LCD_PIN_RST
+    int "LCD RST GPIO"
+    default 8
+
+config ORNAMENT_LCD_PIN_BL
+    int "LCD backlight control GPIO"
+    default 7
+
+endmenu

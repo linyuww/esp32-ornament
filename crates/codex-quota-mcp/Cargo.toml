@@ -1,0 +1,9 @@
+[package]
+name = "codex-quota-mcp"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+quota-core = { path = "../quota-core" }
+serde_json = "1"
+
