@@ -6,6 +6,7 @@
 #include "esp_log.h"
 #include "settings.h"
 
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -55,6 +56,15 @@ static int json_percent(cJSON *parent, const char *name)
     return -1;
 }
 
+static int json_nonnegative_int(cJSON *parent, const char *name)
+{
+    cJSON *item = cJSON_GetObjectItemCaseSensitive(parent, name);
+    if (cJSON_IsNumber(item) && item->valuedouble > 0 && item->valuedouble <= INT_MAX) {
+        return (int)item->valuedouble;
+    }
+    return 0;
+}
+
 static esp_err_t parse_state_json(const char *json_text, ornament_state_t *state)
 {
     cJSON *root = cJSON_Parse(json_text);
@@ -65,6 +75,8 @@ static esp_err_t parse_state_json(const char *json_text, ornament_state_t *state
     ornament_state_init(state);
     copy_json_string(root, "status", state->quota_status, sizeof(state->quota_status));
     state->status = ornament_status_from_text(state->quota_status);
+    state->active_task_count = json_nonnegative_int(root, "activeTaskCount");
+    state->done_seq = json_nonnegative_int(root, "doneSeq");
 
     cJSON *task = cJSON_GetObjectItemCaseSensitive(root, "task");
     if (cJSON_IsObject(task)) {

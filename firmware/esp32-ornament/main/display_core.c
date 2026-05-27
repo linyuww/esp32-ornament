@@ -32,6 +32,7 @@
 #define HUD_DIM_AMBER display_core_rgb565(86, 46, 0)
 #define HUD_DIM_RED display_core_rgb565(76, 0, 0)
 #define HUD_DIM_BLUE display_core_rgb565(0, 28, 66)
+#define HUD_DIM_CYAN display_core_rgb565(0, 64, 78)
 #define HUD_DIM_GREEN display_core_rgb565(14, 70, 16)
 #define HUD_DEEP_BLUE display_core_rgb565(0, 12, 32)
 #define HUD_PANEL_BLUE display_core_rgb565(0, 66, 82)
@@ -623,27 +624,64 @@ static uint16_t status_color(ornament_status_t status)
     }
 }
 
-static const char *status_label(ornament_status_t status)
+static void status_label(const ornament_state_t *state, char *out, size_t out_size)
 {
+    if (out_size == 0) {
+        return;
+    }
+
+    if (state != NULL && state->status == ORNAMENT_STATUS_RUNNING && state->active_task_count > 1) {
+        snprintf(out, out_size, "%d TASKS", state->active_task_count);
+        return;
+    }
+
+    const char *label = "DONE";
+    ornament_status_t status = state != NULL ? state->status : ORNAMENT_STATUS_DONE;
     switch (status) {
     case ORNAMENT_STATUS_RUNNING:
-        return "AGENT ACTIVE";
+        label = "1 TASK";
+        break;
     case ORNAMENT_STATUS_DONE:
-        return "TASK DONE";
+        label = "DONE";
+        break;
     case ORNAMENT_STATUS_ERROR:
-        return "HOOK ERROR";
+        label = "HOOK ERROR";
+        break;
     case ORNAMENT_STATUS_EVENT:
-        return "EVENT";
+        label = "EVENT";
+        break;
     case ORNAMENT_STATUS_IDLE:
     default:
-        return "IDLE";
+        label = "DONE";
+        break;
+    }
+    strlcpy(out, label, out_size);
+}
+
+static uint16_t active_dot_color_for(const ornament_state_t *state, uint16_t status)
+{
+    if (state->status != ORNAMENT_STATUS_RUNNING) {
+        return status;
+    }
+
+    switch (state->active_dot_phase & 0x03) {
+    case 0:
+        return HUD_WHITE;
+    case 1:
+    case 3:
+        return HUD_CYAN;
+    case 2:
+    default:
+        return HUD_DIM_CYAN;
     }
 }
 
 static void draw_status_badge(const ornament_state_t *state)
 {
     uint16_t color = status_color(state->status);
-    const char *label = status_label(state->status);
+    uint16_t dot_color = active_dot_color_for(state, color);
+    char label[24];
+    status_label(state, label, sizeof(label));
     const int y = sy(292);
     const int dot = ss(10);
     int x_scale = ss(2);
@@ -655,7 +693,7 @@ static void draw_status_badge(const ornament_state_t *state)
     if (dot_y < y) {
         dot_y = y;
     }
-    fill_circle(dot_x, dot_y + dot / 2, dot / 2, color);
+    fill_circle(dot_x, dot_y + dot / 2, dot / 2, dot_color);
     draw_text_xy(text_x, y, label, x_scale, y_scale, color);
 
     if (state->status == ORNAMENT_STATUS_ERROR) {

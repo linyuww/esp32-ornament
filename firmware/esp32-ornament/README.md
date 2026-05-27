@@ -230,7 +230,7 @@ Invoke-RestMethod http://<ESP32-IP>/status
 - 顶部：`CODEX QUOTA`。
 - 标题下方：`HH:MM`、`MM-DD`、`WiFi -62dBm`；未校时时显示 `--:--`。
 - 中部：`CURRENT` 和 `WEEKLY` 两个额度面板。
-- 底部：`AGENT ACTIVE`、`TASK DONE`、`HOOK ERROR` 等状态。
+- 底部：`AGENT ACTIVE`、`TASK DONE`、`HOOK ERROR` 等状态；执行中 `AGENT ACTIVE` 前的小圆点会以 4Hz 呼吸闪烁。
 - 右侧弧形软件圆环：模拟 RGB 灯环，不需要真实灯环硬件。
 - 待机时钟页：当 Bridge 返回 `idle` 持续默认 `120 秒` 后，自动切到大号时钟页面；一旦出现运行、完成、错误状态，就回到额度/状态页面。
 
@@ -256,6 +256,7 @@ Invoke-RestMethod http://<ESP32-IP>/status
 | `ORNAMENT_QUOTA_CRITICAL_PERCENT` | `10` | 严重低额度红色阈值 |
 | `ORNAMENT_DONE_FLASH_MS` | `10000` | 任务完成后圆环闪烁时长 |
 | `ORNAMENT_POLL_INTERVAL_MS` | `3000` | ESP32 轮询桥接服务间隔 |
+| `ORNAMENT_UI_FRAME_MS` | `250` | running/完成闪烁等本地 UI 动画刷新间隔 |
 | `ORNAMENT_STANDBY_CLOCK_MS` | `120000` | idle 后切到待机时钟页的等待时间，设为 `0` 可关闭 |
 
 修改后重新构建：
@@ -419,6 +420,8 @@ python .\docs\render_ui_preview.py
 | 文件 | 场景 |
 | --- | --- |
 | `docs\large-ui-preview-normal.png` | 正常额度，青色圆环 |
+| `docs\large-ui-preview-running-bright.png` | `AGENT ACTIVE` 小圆点亮帧 |
+| `docs\large-ui-preview-running-dim.png` | `AGENT ACTIVE` 小圆点暗帧 |
 | `docs\large-ui-preview-warn.png` | 额度低于 25%，橙色 |
 | `docs\large-ui-preview-critical.png` | 额度低于 10%，红色 |
 | `docs\large-ui-preview-done-flash.png` | 任务完成闪烁窗口，绿色圆环 |

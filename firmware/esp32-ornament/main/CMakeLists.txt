@@ -1,8 +1,10 @@
 idf_component_register(
   SRCS
     "app_main.c"
+    "asrpro_link.c"
     "bridge_client.c"
     "config_portal.c"
+    "device_identity.c"
     "ornament_state.c"
     "settings.c"
     "system_status.c"
@@ -21,5 +23,6 @@ idf_component_register(
     esp_wifi
     json
     lwip
+    mdns
     nvs_flash
 )

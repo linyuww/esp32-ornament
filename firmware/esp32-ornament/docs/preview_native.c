@@ -114,6 +114,8 @@ int main(int argc, char **argv)
 {
     const char *output_dir = argc > 1 ? argv[1] : ".";
     ornament_state_t normal;
+    ornament_state_t running_bright;
+    ornament_state_t running_dim;
     ornament_state_t warn;
     ornament_state_t critical;
     ornament_state_t done_flash_on;
@@ -132,6 +134,10 @@ int main(int argc, char **argv)
         true,
         -62,
         true);
+    running_bright = normal;
+    running_bright.active_dot_phase = 0;
+    running_dim = normal;
+    running_dim.active_dot_phase = 2;
     make_state(
         &warn,
         ORNAMENT_STATUS_RUNNING,
@@ -196,6 +202,12 @@ int main(int argc, char **argv)
         true);
 
     if (render_one(output_dir, "normal", &normal, false) != 0) {
+        return 1;
+    }
+    if (render_one(output_dir, "running-bright", &running_bright, false) != 0) {
+        return 1;
+    }
+    if (render_one(output_dir, "running-dim", &running_dim, false) != 0) {
         return 1;
     }
     if (render_one(output_dir, "warn", &warn, false) != 0) {

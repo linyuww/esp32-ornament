@@ -286,10 +286,11 @@ void display_render_error(const char *message)
 
 void display_render_state(const ornament_state_t *state)
 {
-    ESP_LOGI(
+    ESP_LOGD(
         TAG,
-        "state status=%d primary=%d secondary=%d title=%s message=%s",
+        "state status=%d active_tasks=%d primary=%d secondary=%d title=%s message=%s",
         state->status,
+        state->active_task_count,
         state->primary_remaining_percent,
         state->secondary_remaining_percent,
         state->task_title,
@@ -299,7 +300,7 @@ void display_render_state(const ornament_state_t *state)
 
 void display_render_clock(const ornament_state_t *state)
 {
-    ESP_LOGI(
+    ESP_LOGD(
         TAG,
         "clock time=%s date=%s wifi=%s rssi=%d",
         state->local_time,

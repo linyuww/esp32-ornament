@@ -37,10 +37,26 @@ config ORNAMENT_PROV_SCAN_MAX
     default 16
     range 4 32
 
+config ORNAMENT_HOSTNAME_PREFIX
+    string "Network hostname prefix"
+    default "codex-ornament"
+    help
+        The firmware appends the last two STA MAC bytes, for example
+        codex-ornament-4ad4.local.
+
+config ORNAMENT_MDNS_ENABLED
+    bool "Advertise local web console with mDNS"
+    default y
+
 config ORNAMENT_POLL_INTERVAL_MS
     int "Bridge poll interval in milliseconds"
     default 3000
     range 1000 60000
+
+config ORNAMENT_UI_FRAME_MS
+    int "Animated UI frame interval in milliseconds"
+    default 250
+    range 100 2000
 
 config ORNAMENT_SNTP_SERVER
     string "SNTP server"
@@ -66,6 +82,63 @@ config ORNAMENT_DONE_FLASH_MS
     int "Task done ring flash duration in milliseconds"
     default 10000
     range 0 600000
+
+menu "ASRPRO done reminder"
+
+config ORNAMENT_ASRPRO_DONE_NOTIFY
+    bool "Notify ASRPRO when task status becomes done"
+    default y
+    help
+        When the bridge status enters done, send a UART trigger to ASRPRO.
+        Configure the ASRPRO project to receive the trigger string and play
+        the chosen audio file. Other task statuses are not announced.
+
+config ORNAMENT_ASRPRO_UART_NUM
+    int "ASRPRO UART port"
+    depends on ORNAMENT_ASRPRO_DONE_NOTIFY
+    default 1
+    range 0 2
+
+config ORNAMENT_ASRPRO_UART_BAUD
+    int "ASRPRO UART baud rate"
+    depends on ORNAMENT_ASRPRO_DONE_NOTIFY
+    default 9600
+    range 1200 921600
+
+config ORNAMENT_ASRPRO_UART_TX_GPIO
+    int "ESP32 TX GPIO to ASRPRO RX"
+    depends on ORNAMENT_ASRPRO_DONE_NOTIFY
+    default 17
+
+config ORNAMENT_ASRPRO_UART_RX_GPIO
+    int "ESP32 RX GPIO from ASRPRO TX, or -1 when unused"
+    depends on ORNAMENT_ASRPRO_DONE_NOTIFY
+    default -1
+
+config ORNAMENT_ASRPRO_DONE_TRIGGER
+    string "ASRPRO done trigger string"
+    depends on ORNAMENT_ASRPRO_DONE_NOTIFY
+    default "codex_done"
+    help
+        ASRPRO should match this exact serial string and play the user's
+        selected audio file.
+
+config ORNAMENT_ASRPRO_DONE_SUFFIX
+    string "ASRPRO done trigger suffix"
+    depends on ORNAMENT_ASRPRO_DONE_NOTIFY
+    default ""
+    help
+        Optional suffix sent after the trigger. Leave empty for exact-string
+        matching in ASRPRO. Use a line ending only if the ASRPRO project also
+        matches that line ending.
+
+config ORNAMENT_ASRPRO_TX_WAIT_MS
+    int "ASRPRO UART TX wait in milliseconds"
+    depends on ORNAMENT_ASRPRO_DONE_NOTIFY
+    default 100
+    range 10 2000
+
+endmenu
 
 config ORNAMENT_STANDBY_CLOCK_MS
     int "Switch to standby clock page after idle milliseconds"
