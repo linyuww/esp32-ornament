@@ -239,19 +239,39 @@ static uint16_t alert_dim_color_for(const ornament_state_t *state)
 
 static void draw_ring_ticks(const ornament_state_t *state)
 {
+    bool marquee = state->status == ORNAMENT_STATUS_RUNNING && !state->done_flash_active;
     uint16_t ring_color = alert_color_for(state);
     uint16_t dim_color = alert_dim_color_for(state);
+    uint16_t trail_color = marquee ? dim_color : ring_color;
 
     draw_rect_outline(sx(9), sy(9), sx(342), sy(342), ss(2), dim_color);
     const int tick = ss(5);
     const int step = sx(16);
-    for (int x = sx(20); x <= sx(335); x += step) {
-        fill_rect(x, sy(9), tick, tick, ring_color);
-        fill_rect(x, sy(346), tick, tick, ring_color);
+    const int x_start = sx(20);
+    const int x_end = x_start + ((sx(335) - x_start) / step) * step;
+    const int y_start = sy(24);
+    const int y_end = y_start + ((sy(330) - y_start) / step) * step;
+    int index = 0;
+    int phase = (state->active_dot_phase & 0x03) * 2;
+    for (int x = x_start; x <= x_end; x += step) {
+        uint16_t top_color = marquee && ((index + phase) % 8) >= 3 ? trail_color : ring_color;
+        fill_rect(x, sy(9), tick, tick, top_color);
+        index++;
     }
-    for (int y = sy(24); y <= sy(330); y += step) {
-        fill_rect(sx(9), y, tick, tick, ring_color);
-        fill_rect(sx(346), y, tick, tick, ring_color);
+    for (int y = y_start; y <= y_end; y += step) {
+        uint16_t right_color = marquee && ((index + phase) % 8) >= 3 ? trail_color : ring_color;
+        fill_rect(sx(346), y, tick, tick, right_color);
+        index++;
+    }
+    for (int x = x_end; x >= x_start; x -= step) {
+        uint16_t bottom_color = marquee && ((index + phase) % 8) >= 3 ? trail_color : ring_color;
+        fill_rect(x, sy(346), tick, tick, bottom_color);
+        index++;
+    }
+    for (int y = y_end; y >= y_start; y -= step) {
+        uint16_t left_color = marquee && ((index + phase) % 8) >= 3 ? trail_color : ring_color;
+        fill_rect(sx(9), y, tick, tick, left_color);
+        index++;
     }
 }
 
