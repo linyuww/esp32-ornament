@@ -359,7 +359,8 @@ static esp_err_t root_get_handler(httpd_req_t *req)
     status_label(state.codex_task_status, codex_status, sizeof(codex_status));
     status_label(state.claude_task_status, claude_status, sizeof(claude_status));
 
-    char *html = calloc(1, 8192);
+    const size_t html_size = 12288;
+    char *html = calloc(1, html_size);
     if (html == NULL) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
         return ESP_FAIL;
@@ -367,97 +368,113 @@ static esp_err_t root_get_handler(httpd_req_t *req)
     size_t used = 0;
     append(
         html,
-        8192,
+        html_size,
         &used,
         "<!doctype html><html><head><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
         "<title>Codex Ornament Console</title>"
         "<style>"
-        "body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:22px;background:#0b1116;color:#edf7fb}"
-        "main{max-width:760px;margin:auto}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px}"
-        ".card{border:1px solid #263744;border-radius:8px;padding:14px;background:#111a21}.k{color:#8fa3b1;font-size:13px}.v{font-size:22px;margin-top:5px}"
-        ".task-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px;margin-top:12px}"
-        ".task-detail{min-height:56px;overflow:hidden;text-overflow:ellipsis}"
-        "button,a.btn{box-sizing:border-box;display:inline-block;margin:8px 8px 0 0;padding:10px 12px;border:0;border-radius:8px;background:#49d3c8;color:#06100f;font-weight:700;text-decoration:none}"
-        "button.warn{background:#ffbf45}.danger{background:#ff5b5b}code{word-break:break-all;color:#c6f7ff}"
-        "input{box-sizing:border-box;width:100%;padding:10px;border-radius:8px;border:1px solid #344a58;background:#0e171e;color:#fff}"
-        "pre{white-space:pre-wrap;word-break:break-word;background:#070b0e;border-radius:8px;padding:10px;color:#b9cbd6}"
-        "</style></head><body><main><h1>Codex Ornament Console</h1>");
-    appendf(html, 8192, &used, "<p class=\"k\">Local URL</p><p><code>%s</code></p>", device_identity_mdns_url());
-    appendf(html, 8192, &used, "<p class=\"k\">Bridge URL</p><p><code>%s</code></p>", bridge_url);
-    append(html, 8192, &used, "<div class=\"grid\">");
-    appendf(html, 8192, &used, "<div class=\"card\"><div class=\"k\">Wi-Fi</div><div class=\"v\">%s %ddBm</div></div>", state.wifi_connected ? wifi_ssid : "OFF", state.wifi_rssi);
-    appendf(html, 8192, &used, "<div class=\"card\"><div class=\"k\">Time</div><div class=\"v\">%s %s</div></div>", state.local_time, state.local_date);
-    appendf(html, 8192, &used, "<div class=\"card\"><div class=\"k\">Quota</div><div class=\"v\">%d%% / %d%%</div></div>", state.primary_remaining_percent, state.secondary_remaining_percent);
-    append(html, 8192, &used, "</div>");
-    append(html, 8192, &used, "<div class=\"task-grid\">");
+        ":root{color-scheme:dark;--bg:#101214;--panel:#171b20;--panel2:#1d2329;--line:#303841;--text:#eef2f6;--muted:#98a4ae;--accent:#45d3c8;--warn:#f2b84b;--danger:#ff6b6b}"
+        "*{box-sizing:border-box}body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:0;background:var(--bg);color:var(--text)}"
+        "main{max-width:960px;margin:0 auto;padding:24px}h1{margin:0;font-size:28px;line-height:1.15;letter-spacing:0}h2{margin:22px 0 10px;font-size:16px;letter-spacing:0;color:#dbe3ea}"
+        ".top{display:flex;justify-content:space-between;gap:16px;align-items:flex-start;margin-bottom:18px}.sub{margin:6px 0 0;color:var(--muted);font-size:13px}"
+        ".badges{display:flex;flex-wrap:wrap;gap:8px;justify-content:flex-end}.badge{border:1px solid var(--line);border-radius:8px;padding:7px 9px;background:var(--panel);color:#d9e2e8;font-size:13px}"
+        ".urls{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:10px;margin-bottom:12px}.urlbox{border:1px solid var(--line);border-radius:8px;background:#13171b;padding:10px 12px}"
+        ".grid,.task-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px}.task-grid{margin-top:12px}"
+        ".card{border:1px solid var(--line);border-radius:8px;padding:14px;background:var(--panel);box-shadow:0 8px 22px rgba(0,0,0,.18)}"
+        ".card-head{display:flex;justify-content:space-between;gap:12px;align-items:flex-start}.k{color:var(--muted);font-size:13px}.v{font-size:22px;line-height:1.2;margin-top:5px;color:var(--text)}"
+        ".counts{text-align:right;color:var(--muted);font-size:13px;line-height:1.55}.counts b{color:var(--text);font-size:15px}.task-detail{min-height:72px;border:1px solid var(--line);border-radius:8px;background:#13171b;padding:12px;overflow:hidden}"
+        ".task-detail b{display:block;margin:5px 0;color:#f4f7fa}.task-detail p{margin:0;color:#b9c5ce;word-break:break-word}.ops{border:1px solid var(--line);border-radius:8px;background:var(--panel);padding:14px;margin-top:16px}"
+        ".actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}button,a.btn{display:inline-block;padding:10px 12px;border:0;border-radius:8px;background:var(--accent);color:#06100f;font-weight:700;text-decoration:none;cursor:pointer}"
+        "button.warn{background:var(--warn)}.danger{background:var(--danger);color:#180506}code{word-break:break-all;color:#a8f4ec}label{display:block;margin-bottom:7px}"
+        "input{width:100%;padding:11px;border-radius:8px;border:1px solid #3a444d;background:#0f1317;color:#fff}form{margin:0}footer{margin:14px 0 0;color:var(--muted);font-size:13px}"
+        "@media(max-width:620px){main{padding:18px}.top{display:block}.badges{justify-content:flex-start;margin-top:12px}.counts{text-align:left}.card-head{display:block}}"
+        "</style></head><body><main>");
     appendf(
         html,
-        8192,
+        html_size,
         &used,
-        "<div class=\"card\"><div class=\"k\">Task</div><div class=\"v\">%s</div><div class=\"k\">active %d, done %d</div></div>",
+        "<header class=\"top\"><div><h1>Codex Ornament</h1><p class=\"sub\">%s</p></div>"
+        "<div class=\"badges\"><span class=\"badge\">Bridge %s</span><span class=\"badge\">age %lld ms</span></div></header>",
+        device_identity_hostname(),
+        esp_err_to_name(fetch_error),
+        (long long)age_ms);
+    append(html, html_size, &used, "<section class=\"urls\">");
+    appendf(html, html_size, &used, "<div class=\"urlbox\"><div class=\"k\">Local URL</div><code>%s</code></div>", device_identity_mdns_url());
+    appendf(html, html_size, &used, "<div class=\"urlbox\"><div class=\"k\">Bridge URL</div><code>%s</code></div>", bridge_url);
+    append(html, html_size, &used, "</section>");
+    append(html, html_size, &used, "<section class=\"grid\">");
+    appendf(html, html_size, &used, "<div class=\"card\"><div class=\"k\">Wi-Fi</div><div class=\"v\">%s</div><div class=\"k\">%ddBm</div></div>", state.wifi_connected ? wifi_ssid : "OFF", state.wifi_rssi);
+    appendf(html, html_size, &used, "<div class=\"card\"><div class=\"k\">Time</div><div class=\"v\">%s</div><div class=\"k\">%s</div></div>", state.local_time, state.local_date);
+    appendf(html, html_size, &used, "<div class=\"card\"><div class=\"k\">Quota</div><div class=\"v\">%d%% / %d%%</div><div class=\"k\">primary / weekly</div></div>", state.primary_remaining_percent, state.secondary_remaining_percent);
+    append(html, html_size, &used, "</section>");
+    append(html, html_size, &used, "<h2>Tasks</h2><section class=\"task-grid\">");
+    appendf(
+        html,
+        html_size,
+        &used,
+        "<div class=\"card\"><div class=\"card-head\"><div><div class=\"k\">Task</div><div class=\"v\">%s</div></div><div class=\"counts\">active <b>%d</b><br>done <b>%d</b></div></div></div>",
         state.has_codex_summary ? codex_status : status,
         state.has_codex_summary ? state.codex_active_task_count : state.active_task_count,
         state.has_codex_summary ? state.codex_done_seq : state.done_seq);
     appendf(
         html,
-        8192,
+        html_size,
         &used,
-        "<div class=\"card claude\"><div class=\"k\">Claude Task</div><div class=\"v\">%s</div><div class=\"k\">active %d, done %d</div></div>",
+        "<div class=\"card claude\"><div class=\"card-head\"><div><div class=\"k\">Claude Task</div><div class=\"v\">%s</div></div><div class=\"counts\">active <b>%d</b><br>done <b>%d</b></div></div></div>",
         state.has_claude_summary ? claude_status : "idle",
         state.claude_active_task_count,
         state.claude_done_seq);
-    append(html, 8192, &used, "</div>");
+    append(html, html_size, &used, "</section>");
     append(
         html,
-        8192,
+        html_size,
         &used,
-        "<div class=\"task-grid\">");
+        "<section class=\"task-grid\">");
     appendf(
         html,
-        8192,
+        html_size,
         &used,
-        "<p class=\"task-detail\"><b>%s</b><br>%s</p>",
+        "<div class=\"task-detail\"><div class=\"k\">Task detail</div><b>%s</b><p>%s</p></div>",
         task_title_or_default(state.has_codex_task, codex_title, title[0] != '\0' ? title : "No task title"),
         state.has_codex_task ? codex_message : "");
     appendf(
         html,
-        8192,
+        html_size,
         &used,
-        "<p class=\"task-detail claude\"><b>%s</b><br>%s</p>",
+        "<div class=\"task-detail claude\"><div class=\"k\">Claude detail</div><b>%s</b><p>%s</p></div>",
         task_title_or_default(state.has_claude_task, claude_title, "No Claude task"),
         state.has_claude_task ? claude_message : "");
-    append(html, 8192, &used, "</div>");
-    appendf(html, 8192, &used, "<p class=\"k\">Last fetch: %s, age: %lld ms</p>", esp_err_to_name(fetch_error), (long long)age_ms);
+    append(html, html_size, &used, "</section>");
     append(
         html,
-        8192,
+        html_size,
         &used,
-        "<h2>Network Debug</h2><div class=\"grid\">");
-    appendf(html, 8192, &used, "<div class=\"card\"><div class=\"k\">IP</div><div class=\"v\">%s</div></div>", wifi_debug.ip[0] != '\0' ? wifi_debug.ip : "0.0.0.0");
-    appendf(html, 8192, &used, "<div class=\"card\"><div class=\"k\">Gateway</div><div class=\"v\">%s</div></div>", wifi_debug.gateway[0] != '\0' ? wifi_debug.gateway : "0.0.0.0");
-    appendf(html, 8192, &used, "<div class=\"card\"><div class=\"k\">Channel</div><div class=\"v\">%d</div></div>", wifi_debug.channel);
-    appendf(html, 8192, &used, "<div class=\"card\"><div class=\"k\">BSSID</div><div class=\"v\">%s</div></div>", wifi_debug.bssid[0] != '\0' ? wifi_debug.bssid : "--");
-    appendf(html, 8192, &used, "<div class=\"card\"><div class=\"k\">Disconnect</div><div class=\"v\">%u %s</div><div class=\"k\">rssi %d retries %d</div></div>", wifi_debug.last_disconnect_reason, wifi_debug.last_disconnect_name, wifi_debug.last_disconnect_rssi, wifi_debug.retry_count);
-    appendf(html, 8192, &used, "<div class=\"card\"><div class=\"k\">Bridge Fetch</div><div class=\"v\">%s</div><div class=\"k\">age %lld ms</div></div>", esp_err_to_name(fetch_error), (long long)age_ms);
-    append(html, 8192, &used, "</div>");
+        "<h2>Network</h2><section class=\"grid\">");
+    appendf(html, html_size, &used, "<div class=\"card\"><div class=\"k\">IP</div><div class=\"v\">%s</div></div>", wifi_debug.ip[0] != '\0' ? wifi_debug.ip : "0.0.0.0");
+    appendf(html, html_size, &used, "<div class=\"card\"><div class=\"k\">Gateway</div><div class=\"v\">%s</div></div>", wifi_debug.gateway[0] != '\0' ? wifi_debug.gateway : "0.0.0.0");
+    appendf(html, html_size, &used, "<div class=\"card\"><div class=\"k\">Channel</div><div class=\"v\">%d</div></div>", wifi_debug.channel);
+    appendf(html, html_size, &used, "<div class=\"card\"><div class=\"k\">BSSID</div><div class=\"v\">%s</div></div>", wifi_debug.bssid[0] != '\0' ? wifi_debug.bssid : "--");
+    appendf(html, html_size, &used, "<div class=\"card\"><div class=\"k\">Disconnect</div><div class=\"v\">%u %s</div><div class=\"k\">rssi %d retries %d</div></div>", wifi_debug.last_disconnect_reason, wifi_debug.last_disconnect_name, wifi_debug.last_disconnect_rssi, wifi_debug.retry_count);
+    appendf(html, html_size, &used, "<div class=\"card\"><div class=\"k\">Bridge Fetch</div><div class=\"v\">%s</div><div class=\"k\">age %lld ms</div></div>", esp_err_to_name(fetch_error), (long long)age_ms);
+    append(html, html_size, &used, "</section>");
     append(
         html,
-        8192,
+        html_size,
         &used,
-        "<form method=\"post\" action=\"/test-bridge\"><label class=\"k\">Test Bridge URL</label>"
+        "<section class=\"ops\"><form method=\"post\" action=\"/test-bridge\"><label class=\"k\">Test Bridge URL</label>"
         "<input name=\"bridge_url\" maxlength=\"159\" value=\"");
-    append(html, 8192, &used, bridge_url);
+    append(html, html_size, &used, bridge_url);
     append(
         html,
-        8192,
+        html_size,
         &used,
-        "\"><button type=\"submit\">Test</button>"
-        "<button class=\"warn\" type=\"submit\" formaction=\"/save-bridge\">Save</button></form>"
+        "\"><div class=\"actions\"><button type=\"submit\">Test</button>"
+        "<button class=\"warn\" type=\"submit\" formaction=\"/save-bridge\">Save</button></div></form>"
         "<form id=\"autoBridge\" method=\"post\" action=\"/auto-bridge\"><input type=\"hidden\" name=\"bridge_url\" id=\"autoBridgeUrl\">"
-        "<button type=\"submit\">Auto Match This PC Bridge</button></form>"
-        "<p><a class=\"btn\" href=\"/status\">JSON Status</a></p>"
-        "<form method=\"post\" action=\"/reboot\"><button class=\"warn\" type=\"submit\">Reboot</button></form>"
-        "<form method=\"post\" action=\"/clear-config\"><button class=\"danger\" type=\"submit\">Clear Wi-Fi and Bridge Config</button></form>"
+        "<div class=\"actions\"><button type=\"submit\">Auto Match This PC Bridge</button><a class=\"btn\" href=\"/status\">JSON Status</a></div></form>"
+        "<div class=\"actions\"><form method=\"post\" action=\"/reboot\"><button class=\"warn\" type=\"submit\">Reboot</button></form>"
+        "<form method=\"post\" action=\"/clear-config\"><button class=\"danger\" type=\"submit\">Clear Wi-Fi and Bridge Config</button></form></div></section>"
+        "<footer>Refreshes every 10 seconds</footer>"
         "<script>"
         "document.getElementById('autoBridge').addEventListener('submit',async e=>{"
         "const input=document.getElementById('autoBridgeUrl');"
