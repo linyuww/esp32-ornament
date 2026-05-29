@@ -22,6 +22,8 @@ typedef struct {
     char quota_status[32];
     int primary_remaining_percent;
     int secondary_remaining_percent;
+    int active_task_count;
+    int done_seq;
     char primary_resets_at[ORNAMENT_TIME_MAX];
     char secondary_resets_at[ORNAMENT_TIME_MAX];
     char bridge_observed_at[ORNAMENT_TIME_MAX];
@@ -35,6 +37,7 @@ typedef struct {
     bool wifi_connected;
     bool done_flash_active;
     bool done_flash_on;
+    uint8_t active_dot_phase;
 } ornament_state_t;
 
 void ornament_state_init(ornament_state_t *state);

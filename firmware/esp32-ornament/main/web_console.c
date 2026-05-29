@@ -193,8 +193,6 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     char quota_status[64];
     char wifi_ssid[80];
     char bridge_url[ORNAMENT_BRIDGE_URL_MAX * 2];
-    char hostname[ORNAMENT_HOSTNAME_MAX];
-    char mdns_url[64];
 
     ornament_state_init(&state);
     state_snapshot(&state, &fetch_error, &age_ms);
@@ -204,9 +202,8 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     json_escape(state.task_message, task_message, sizeof(task_message));
     json_escape(state.quota_status, quota_status, sizeof(quota_status));
     json_escape(state.wifi_ssid, wifi_ssid, sizeof(wifi_ssid));
+
     json_escape(settings_bridge_url_or_default(&console_settings), bridge_url, sizeof(bridge_url));
-    device_identity_hostname(hostname, sizeof(hostname));
-    snprintf(mdns_url, sizeof(mdns_url), "http://%s.local/", hostname);
 
     const size_t json_size = 4096;
     char *json = calloc(1, json_size);
@@ -231,14 +228,14 @@ static esp_err_t status_get_handler(httpd_req_t *req)
         "\"last_disconnect_name\":\"%s\",\"last_disconnect_rssi\":%d},"
         "\"time\":{\"synced\":%s,\"local_time\":\"%s\",\"local_date\":\"%s\"},"
         "\"quota\":{\"has\":%s,\"status\":\"%s\",\"primary\":%d,\"weekly\":%d},"
-        "\"task\":{\"has\":%s,\"status\":\"%s\",\"title\":\"%s\",\"message\":\"%s\"},"
+        "\"task\":{\"has\":%s,\"active_count\":%d,\"done_seq\":%d,\"status\":\"%s\",\"title\":\"%s\",\"message\":\"%s\"},"
         "\"heap\":{\"free\":%u,\"min_free\":%u,\"largest_free_block\":%u}"
         "}",
         (long long)(esp_timer_get_time() / 1000),
         (long long)age_ms,
         esp_err_to_name(fetch_error),
-        hostname,
-        mdns_url,
+        device_identity_hostname(),
+        device_identity_mdns_url(),
         bridge_url,
         state.wifi_connected ? "true" : "false",
         wifi_ssid,
@@ -262,6 +259,8 @@ static esp_err_t status_get_handler(httpd_req_t *req)
         state.primary_remaining_percent,
         state.secondary_remaining_percent,
         state.has_task ? "true" : "false",
+        state.active_task_count,
+        state.done_seq,
         status,
         task_title,
         task_message,
@@ -286,8 +285,6 @@ static esp_err_t root_get_handler(httpd_req_t *req)
     char title[ORNAMENT_TEXT_MAX * 2];
     char message[ORNAMENT_TEXT_MAX * 2];
     char status[16];
-    char hostname[ORNAMENT_HOSTNAME_MAX];
-    char mdns_url[64];
 
     ornament_state_init(&state);
     state_snapshot(&state, &fetch_error, &age_ms);
@@ -297,8 +294,6 @@ static esp_err_t root_get_handler(httpd_req_t *req)
     html_escape(state.task_title, title, sizeof(title));
     html_escape(state.task_message, message, sizeof(message));
     status_label(state.status, status, sizeof(status));
-    device_identity_hostname(hostname, sizeof(hostname));
-    snprintf(mdns_url, sizeof(mdns_url), "http://%s.local/", hostname);
 
     char *html = calloc(1, 8192);
     if (html == NULL) {
@@ -321,13 +316,13 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "input{box-sizing:border-box;width:100%;padding:10px;border-radius:8px;border:1px solid #344a58;background:#0e171e;color:#fff}"
         "pre{white-space:pre-wrap;word-break:break-word;background:#070b0e;border-radius:8px;padding:10px;color:#b9cbd6}"
         "</style></head><body><main><h1>Codex Ornament Console</h1>");
-    appendf(html, 8192, &used, "<p class=\"k\">Local URL</p><p><code>%s</code></p>", mdns_url);
+    appendf(html, 8192, &used, "<p class=\"k\">Local URL</p><p><code>%s</code></p>", device_identity_mdns_url());
     appendf(html, 8192, &used, "<p class=\"k\">Bridge URL</p><p><code>%s</code></p>", bridge_url);
     append(html, 8192, &used, "<div class=\"grid\">");
     appendf(html, 8192, &used, "<div class=\"card\"><div class=\"k\">Wi-Fi</div><div class=\"v\">%s %ddBm</div></div>", state.wifi_connected ? wifi_ssid : "OFF", state.wifi_rssi);
     appendf(html, 8192, &used, "<div class=\"card\"><div class=\"k\">Time</div><div class=\"v\">%s %s</div></div>", state.local_time, state.local_date);
     appendf(html, 8192, &used, "<div class=\"card\"><div class=\"k\">Quota</div><div class=\"v\">%d%% / %d%%</div></div>", state.primary_remaining_percent, state.secondary_remaining_percent);
-    appendf(html, 8192, &used, "<div class=\"card\"><div class=\"k\">Task</div><div class=\"v\">%s</div></div>", status);
+    appendf(html, 8192, &used, "<div class=\"card\"><div class=\"k\">Task</div><div class=\"v\">%s</div><div class=\"k\">active %d, done %d</div></div>", status, state.active_task_count, state.done_seq);
     append(html, 8192, &used, "</div>");
     appendf(html, 8192, &used, "<p><b>%s</b><br>%s</p>", title[0] != '\0' ? title : "No task title", message[0] != '\0' ? message : "");
     appendf(html, 8192, &used, "<p class=\"k\">Last fetch: %s, age: %lld ms</p>", esp_err_to_name(fetch_error), (long long)age_ms);
@@ -347,7 +342,7 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         html,
         8192,
         &used,
-        "<form id=\"bridgeForm\" method=\"post\" action=\"/test-bridge\"><label class=\"k\">Test Bridge URL</label>"
+        "<form method=\"post\" action=\"/test-bridge\"><label class=\"k\">Test Bridge URL</label>"
         "<input name=\"bridge_url\" maxlength=\"159\" value=\"");
     append(html, 8192, &used, bridge_url);
     append(
@@ -671,10 +666,9 @@ esp_err_t web_console_start(void)
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
-    config.task_priority = 6;
-    config.stack_size = 16384;
     config.lru_purge_enable = true;
     config.max_uri_handlers = 10;
+    config.stack_size = 16384;
 
     esp_err_t err = httpd_start(&server, &config);
     if (err != ESP_OK) {

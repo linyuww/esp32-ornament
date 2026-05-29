@@ -6,7 +6,16 @@ from pathlib import Path
 
 from PIL import Image
 
-PREVIEW_NAMES = ["normal", "warn", "critical", "done-flash", "unsynced", "clock"]
+PREVIEW_NAMES = [
+    "normal",
+    "running-bright",
+    "running-dim",
+    "warn",
+    "critical",
+    "done-flash",
+    "unsynced",
+    "clock",
+]
 
 
 def run(cmd: list[str], cwd: Path) -> None:

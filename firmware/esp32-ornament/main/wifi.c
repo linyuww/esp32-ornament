@@ -154,6 +154,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
             return;
         }
         ESP_LOGI(TAG, "STA got IP: " IPSTR, IP2STR(&event->ip_info.ip));
+        ESP_ERROR_CHECK_WITHOUT_ABORT(device_identity_start_mdns());
         xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
     }
 }
@@ -166,14 +167,9 @@ static esp_err_t wifi_runtime_init(void)
 
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
+    ESP_ERROR_CHECK(device_identity_init());
     sta_netif = esp_netif_create_default_wifi_sta();
-    if (sta_netif == NULL) {
-        return ESP_ERR_NO_MEM;
-    }
-    char hostname[ORNAMENT_HOSTNAME_MAX];
-    device_identity_hostname(hostname, sizeof(hostname));
-    ESP_ERROR_CHECK(esp_netif_set_hostname(sta_netif, hostname));
-    ESP_LOGI(TAG, "STA hostname: %s.local", hostname);
+    ESP_ERROR_CHECK(esp_netif_set_hostname(sta_netif, device_identity_hostname()));
     esp_netif_create_default_wifi_ap();
 
     wifi_init_config_t init_config = WIFI_INIT_CONFIG_DEFAULT();
@@ -233,7 +229,6 @@ esp_err_t wifi_connect(void)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
-    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
     ESP_LOGI(
         TAG,
         "connecting to Wi-Fi SSID=%s password_len=%u timeout_ms=%d",
