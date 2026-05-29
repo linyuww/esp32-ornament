@@ -1,6 +1,7 @@
 #include "wifi.h"
 
 #include "config_portal.h"
+#include "device_identity.h"
 #include "esp_check.h"
 #include "esp_event.h"
 #include "esp_log.h"
@@ -22,6 +23,7 @@ static bool wifi_runtime_ready;
 static bool sta_connect_active;
 static uint8_t last_disconnect_reason;
 static int8_t last_disconnect_rssi;
+static esp_netif_t *sta_netif;
 
 static const char *wifi_disconnect_reason_name(uint8_t reason)
 {
@@ -156,7 +158,14 @@ static esp_err_t wifi_runtime_init(void)
 
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_sta();
+    sta_netif = esp_netif_create_default_wifi_sta();
+    if (sta_netif == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    char hostname[ORNAMENT_HOSTNAME_MAX];
+    device_identity_hostname(hostname, sizeof(hostname));
+    ESP_ERROR_CHECK(esp_netif_set_hostname(sta_netif, hostname));
+    ESP_LOGI(TAG, "STA hostname: %s.local", hostname);
     esp_netif_create_default_wifi_ap();
 
     wifi_init_config_t init_config = WIFI_INIT_CONFIG_DEFAULT();
@@ -216,6 +225,7 @@ esp_err_t wifi_connect(void)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
     ESP_LOGI(
         TAG,
         "connecting to Wi-Fi SSID=%s password_len=%u timeout_ms=%d",

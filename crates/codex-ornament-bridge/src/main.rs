@@ -6,7 +6,7 @@ use std::{
     collections::HashMap,
     env,
     io::{self, BufRead, BufReader, Read, Write},
-    net::{IpAddr, SocketAddr, TcpListener, TcpStream},
+    net::{IpAddr, SocketAddr, TcpListener, TcpStream, UdpSocket},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -75,6 +75,15 @@ struct BridgeInfo {
     observed_at: String,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DiscoveryInfo {
+    service: &'static str,
+    local_ip: String,
+    state_url: String,
+    health_url: String,
+}
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("{error}");
@@ -124,6 +133,7 @@ fn handle_connection(
         ("GET", "/health") => {
             write_response(&mut stream, 200, "text/plain; charset=utf-8", b"ok\n")
         }
+        ("GET", "/discover") => write_json(&mut stream, 200, &discover_info(&config)),
         ("GET", "/quota") => {
             let quota = cached_or_refresh_quota(&state);
             write_json(&mut stream, 200, &quota)
@@ -215,6 +225,32 @@ fn read_request(stream: &mut TcpStream) -> io::Result<HttpRequest> {
         headers,
         body,
     })
+}
+
+fn discover_info(config: &BridgeConfig) -> DiscoveryInfo {
+    let port = bind_port(&config.bind).unwrap_or(8787);
+    let local_ip = local_lan_ip().unwrap_or_else(|| "127.0.0.1".to_string());
+    DiscoveryInfo {
+        service: "codex-ornament-bridge",
+        local_ip: local_ip.clone(),
+        state_url: format!("http://{local_ip}:{port}/state"),
+        health_url: format!("http://{local_ip}:{port}/health"),
+    }
+}
+
+fn bind_port(bind: &str) -> Option<u16> {
+    bind.rsplit_once(':')
+        .and_then(|(_, port)| port.parse::<u16>().ok())
+}
+
+fn local_lan_ip() -> Option<String> {
+    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    let ip = socket.local_addr().ok()?.ip();
+    match ip {
+        IpAddr::V4(ip) if !ip.is_loopback() && !ip.is_unspecified() => Some(ip.to_string()),
+        _ => None,
+    }
 }
 
 fn post_allowed(peer: Option<SocketAddr>, request: &HttpRequest, config: &BridgeConfig) -> bool {
@@ -342,7 +378,7 @@ fn write_response(
     };
     write!(
         stream,
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: Content-Type, X-Codex-Ornament-Token\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: Content-Type, X-Codex-Ornament-Token, Access-Control-Request-Private-Network\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Private-Network: true\r\nConnection: close\r\n\r\n",
         body.len()
     )?;
     stream.write_all(body)

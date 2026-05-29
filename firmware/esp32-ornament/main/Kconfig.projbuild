@@ -74,6 +74,33 @@ config ORNAMENT_STANDBY_CLOCK_MS
     help
         Set 0 to disable the dedicated standby clock page. Idle status switches to clock after this duration.
 
+config ORNAMENT_AUDIO_ENABLED
+    bool "Enable task done voice reminder"
+    default y
+    help
+        Play the embedded task_done.pcm clip once when bridge status changes to done.
+
+config ORNAMENT_AUDIO_PIN_BCLK
+    int "MAX98357A I2S BCLK GPIO"
+    default 4
+    depends on ORNAMENT_AUDIO_ENABLED
+
+config ORNAMENT_AUDIO_PIN_LRC
+    int "MAX98357A I2S LRC/WS GPIO"
+    default 5
+    depends on ORNAMENT_AUDIO_ENABLED
+
+config ORNAMENT_AUDIO_PIN_DIN
+    int "MAX98357A I2S DIN GPIO"
+    default 6
+    depends on ORNAMENT_AUDIO_ENABLED
+
+config ORNAMENT_AUDIO_VOLUME_PERCENT
+    int "Task done voice volume percent"
+    default 70
+    range 0 100
+    depends on ORNAMENT_AUDIO_ENABLED
+
 config ORNAMENT_DISPLAY_DRIVER
     string "Display driver variant"
     default "st77916_qspi"

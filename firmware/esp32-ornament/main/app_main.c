@@ -1,8 +1,10 @@
 #include "bridge_client.h"
 #include "config_portal.h"
 #include "display.h"
+#include "ornament_mdns.h"
 #include "ornament_state.h"
 #include "system_status.h"
+#include "task_audio.h"
 #include "web_console.h"
 #include "wifi.h"
 
@@ -29,6 +31,7 @@ static void poll_task(void *arg)
             TickType_t now = xTaskGetTickCount();
             if (state.status == ORNAMENT_STATUS_DONE && previous_status != ORNAMENT_STATUS_DONE) {
                 last_done_tick = now;
+                task_audio_play_done();
             }
             if (state.status == ORNAMENT_STATUS_IDLE) {
                 if (previous_status != ORNAMENT_STATUS_IDLE || idle_since_tick == 0) {
@@ -86,6 +89,11 @@ void app_main(void)
     display_init();
     display_render_boot();
 
+    esp_err_t audio_err = task_audio_start();
+    if (audio_err != ESP_OK) {
+        ESP_LOGW(TAG, "task done audio unavailable: %s", esp_err_to_name(audio_err));
+    }
+
     if (wifi_connect() != ESP_OK) {
         ESP_LOGW(TAG, "provisioning mode active: SSID=%s URL=http://192.168.4.1", config_portal_ssid());
         display_render_status("Setup AP: 192.168.4.1");
@@ -95,6 +103,10 @@ void app_main(void)
     }
     display_render_status("Wi-Fi connected");
     system_status_start_time_sync();
+    esp_err_t mdns_err = ornament_mdns_start();
+    if (mdns_err != ESP_OK) {
+        ESP_LOGW(TAG, "mDNS unavailable: %s", esp_err_to_name(mdns_err));
+    }
     ESP_ERROR_CHECK(web_console_start());
 
     xTaskCreate(poll_task, "bridge_poll", 8192, NULL, 5, NULL);

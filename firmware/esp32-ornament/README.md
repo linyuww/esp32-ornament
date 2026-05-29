@@ -8,6 +8,7 @@
 - SNTP 本地时钟小组件，显示 `HH:MM`、`MM-DD`、`WiFi -62dBm`。
 - 低额度告警：当前额度或周额度低于 `25%` 显示橙色，低于 `10%` 显示红色。
 - 任务完成后圆环闪烁约 `10 秒`，文字和额度条不闪烁。
+- 任务完成后通过 MAX98357A I2S 功放播放上传的语音提醒。
 - 手机连接 ESP32 热点配网，自动扫描 Wi-Fi SSID，只需要选择 SSID 并填写密码。
 - 连接 Wi-Fi 后提供 ESP32 本地 Web 控制台，可查看状态 JSON、测试 Bridge URL、重启、清空配置。
 - 空闲一段时间后自动切换到待机时钟页，显示大号时间、日期、Wi-Fi 和额度摘要。
@@ -25,6 +26,7 @@
 
 - 主控：ESP32-S3-N16R8，16 MB Flash，8 MB PSRAM。
 - 屏幕：1.5 寸 360x360 ST77916 TFT 圆屏，QSPI，16P FPC。
+- 语音提醒：MAX98357A I2S 数字功放模块 + 4Ω/8Ω 小喇叭。
 - 逻辑电平：3.3 V。
 - 桥接服务：PC 局域网地址上的 `http://<PC-LAN-IP>:8787/state`。
 - 配网方式：ESP32 SoftAP 热点 + 手机浏览器。
@@ -94,6 +96,23 @@ ESP32-S3 GND -> 屏幕 GND / MOSFET Source 共地
 ```
 
 不要把屏幕背光 `A` 或 `K` 直接接到 ESP32 GPIO 当作供电路径。
+
+### MAX98357A I2S 功放接法
+
+默认固件使用下面 3 个未被屏幕占用的 GPIO 输出 I2S：
+
+| MAX98357A 引脚 | ESP32-S3 接法 | 说明 |
+| --- | --- | --- |
+| `VCC` | `3V3` | 模块支持 2.5V~5.5V；ESP32-S3 IO 是 3.3V，建议先用 3V3 |
+| `GND` | `GND` | 必须和 ESP32-S3 共地 |
+| `BCLK` | `GPIO4` | I2S bit clock |
+| `LRC` | `GPIO5` | I2S word select / LR clock |
+| `DIN` | `GPIO6` | I2S data out |
+| `GAIN` | 悬空 | 默认增益；需要更大音量时再按模块说明调整 |
+| `SD` | 悬空或接 `3V3` | 悬空通常可工作；若无声可接 3V3 保持使能 |
+| `+`/`-` | 接喇叭两端 | 不要把喇叭任一端接 GND |
+
+如果你的 ESP32-S3 开发板已经占用了 `GPIO4/5/6`，先在 `main/Kconfig.projbuild` 或 `idf.py menuconfig` 修改 `ORNAMENT_AUDIO_PIN_BCLK`、`ORNAMENT_AUDIO_PIN_LRC`、`ORNAMENT_AUDIO_PIN_DIN` 后重新构建。
 
 ## 烧录固件
 
@@ -257,6 +276,11 @@ Invoke-RestMethod http://<ESP32-IP>/status
 | `ORNAMENT_DONE_FLASH_MS` | `10000` | 任务完成后圆环闪烁时长 |
 | `ORNAMENT_POLL_INTERVAL_MS` | `3000` | ESP32 轮询桥接服务间隔 |
 | `ORNAMENT_STANDBY_CLOCK_MS` | `120000` | idle 后切到待机时钟页的等待时间，设为 `0` 可关闭 |
+| `ORNAMENT_AUDIO_ENABLED` | `y` | 启用任务完成语音提醒 |
+| `ORNAMENT_AUDIO_PIN_BCLK` | `4` | MAX98357A `BCLK` 引脚 |
+| `ORNAMENT_AUDIO_PIN_LRC` | `5` | MAX98357A `LRC` 引脚 |
+| `ORNAMENT_AUDIO_PIN_DIN` | `6` | MAX98357A `DIN` 引脚 |
+| `ORNAMENT_AUDIO_VOLUME_PERCENT` | `70` | 语音提醒音量缩放 |
 
 修改后重新构建：
 

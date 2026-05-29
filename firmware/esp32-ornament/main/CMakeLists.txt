@@ -3,16 +3,22 @@ idf_component_register(
     "app_main.c"
     "bridge_client.c"
     "config_portal.c"
+    "device_identity.c"
+    "ornament_mdns.c"
     "ornament_state.c"
     "settings.c"
     "system_status.c"
+    "task_audio.c"
     "web_console.c"
     "display.c"
     "display_core.c"
     "wifi.c"
   INCLUDE_DIRS "."
+  EMBED_FILES
+    "assets/task_done.pcm"
   REQUIRES
     driver
+    esp_driver_i2s
     esp_http_client
     esp_http_server
     esp_lcd
@@ -21,5 +27,6 @@ idf_component_register(
     esp_wifi
     json
     lwip
+    mdns
     nvs_flash
 )

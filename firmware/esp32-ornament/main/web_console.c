@@ -1,6 +1,7 @@
 #include "web_console.h"
 
 #include "bridge_client.h"
+#include "device_identity.h"
 #include "esp_heap_caps.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
@@ -12,6 +13,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "lwip/inet.h"
+#include "lwip/sockets.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -24,6 +27,14 @@ static SemaphoreHandle_t state_mutex;
 static ornament_state_t last_state;
 static esp_err_t last_fetch_error = ESP_ERR_INVALID_STATE;
 static int64_t last_state_us;
+static ornament_settings_t console_settings;
+
+static void refresh_console_settings(void)
+{
+    if (settings_load(&console_settings) != ESP_OK) {
+        memset(&console_settings, 0, sizeof(console_settings));
+    }
+}
 
 static void append(char *text, size_t text_size, size_t *used, const char *chunk)
 {
@@ -181,7 +192,8 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     char quota_status[64];
     char wifi_ssid[80];
     char bridge_url[ORNAMENT_BRIDGE_URL_MAX * 2];
-    ornament_settings_t settings;
+    char hostname[ORNAMENT_HOSTNAME_MAX];
+    char mdns_url[64];
 
     ornament_state_init(&state);
     state_snapshot(&state, &fetch_error, &age_ms);
@@ -190,13 +202,12 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     json_escape(state.task_message, task_message, sizeof(task_message));
     json_escape(state.quota_status, quota_status, sizeof(quota_status));
     json_escape(state.wifi_ssid, wifi_ssid, sizeof(wifi_ssid));
+    json_escape(settings_bridge_url_or_default(&console_settings), bridge_url, sizeof(bridge_url));
+    device_identity_hostname(hostname, sizeof(hostname));
+    snprintf(mdns_url, sizeof(mdns_url), "http://%s.local/", hostname);
 
-    if (settings_load(&settings) != ESP_OK) {
-        memset(&settings, 0, sizeof(settings));
-    }
-    json_escape(settings_bridge_url_or_default(&settings), bridge_url, sizeof(bridge_url));
-
-    char *json = calloc(1, 2048);
+    const size_t json_size = 3072;
+    char *json = calloc(1, json_size);
     if (json == NULL) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
         return ESP_FAIL;
@@ -204,11 +215,13 @@ static esp_err_t status_get_handler(httpd_req_t *req)
 
     snprintf(
         json,
-        2048,
+        json_size,
         "{"
         "\"uptime_ms\":%lld,"
         "\"last_state_age_ms\":%lld,"
         "\"fetch_error\":\"%s\","
+        "\"hostname\":\"%s\","
+        "\"mdns_url\":\"%s\","
         "\"bridge_url\":\"%s\","
         "\"wifi\":{\"connected\":%s,\"ssid\":\"%s\",\"rssi\":%d},"
         "\"time\":{\"synced\":%s,\"local_time\":\"%s\",\"local_date\":\"%s\"},"
@@ -219,6 +232,8 @@ static esp_err_t status_get_handler(httpd_req_t *req)
         (long long)(esp_timer_get_time() / 1000),
         (long long)age_ms,
         esp_err_to_name(fetch_error),
+        hostname,
+        mdns_url,
         bridge_url,
         state.wifi_connected ? "true" : "false",
         wifi_ssid,
@@ -249,23 +264,23 @@ static esp_err_t root_get_handler(httpd_req_t *req)
     ornament_state_t state;
     esp_err_t fetch_error = ESP_OK;
     int64_t age_ms = -1;
-    ornament_settings_t settings;
     char bridge_url[ORNAMENT_BRIDGE_URL_MAX * 2];
     char wifi_ssid[80];
     char title[ORNAMENT_TEXT_MAX * 2];
     char message[ORNAMENT_TEXT_MAX * 2];
     char status[16];
+    char hostname[ORNAMENT_HOSTNAME_MAX];
+    char mdns_url[64];
 
     ornament_state_init(&state);
     state_snapshot(&state, &fetch_error, &age_ms);
-    if (settings_load(&settings) != ESP_OK) {
-        memset(&settings, 0, sizeof(settings));
-    }
-    html_escape(settings_bridge_url_or_default(&settings), bridge_url, sizeof(bridge_url));
+    html_escape(settings_bridge_url_or_default(&console_settings), bridge_url, sizeof(bridge_url));
     html_escape(state.wifi_ssid, wifi_ssid, sizeof(wifi_ssid));
     html_escape(state.task_title, title, sizeof(title));
     html_escape(state.task_message, message, sizeof(message));
     status_label(state.status, status, sizeof(status));
+    device_identity_hostname(hostname, sizeof(hostname));
+    snprintf(mdns_url, sizeof(mdns_url), "http://%s.local/", hostname);
 
     char *html = calloc(1, 8192);
     if (html == NULL) {
@@ -288,6 +303,7 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "input{box-sizing:border-box;width:100%;padding:10px;border-radius:8px;border:1px solid #344a58;background:#0e171e;color:#fff}"
         "pre{white-space:pre-wrap;word-break:break-word;background:#070b0e;border-radius:8px;padding:10px;color:#b9cbd6}"
         "</style></head><body><main><h1>Codex Ornament Console</h1>");
+    appendf(html, 8192, &used, "<p class=\"k\">Local URL</p><p><code>%s</code></p>", mdns_url);
     appendf(html, 8192, &used, "<p class=\"k\">Bridge URL</p><p><code>%s</code></p>", bridge_url);
     append(html, 8192, &used, "<div class=\"grid\">");
     appendf(html, 8192, &used, "<div class=\"card\"><div class=\"k\">Wi-Fi</div><div class=\"v\">%s %ddBm</div></div>", state.wifi_connected ? wifi_ssid : "OFF", state.wifi_rssi);
@@ -301,18 +317,35 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         html,
         8192,
         &used,
-        "<form method=\"post\" action=\"/test-bridge\"><label class=\"k\">Test Bridge URL</label>"
+        "<form id=\"bridgeForm\" method=\"post\" action=\"/test-bridge\"><label class=\"k\">Test Bridge URL</label>"
         "<input name=\"bridge_url\" maxlength=\"159\" value=\"");
     append(html, 8192, &used, bridge_url);
     append(
         html,
         8192,
         &used,
-        "\"><button type=\"submit\">Test</button></form>"
+        "\"><button type=\"submit\">Test</button>"
+        "<button class=\"warn\" type=\"submit\" formaction=\"/save-bridge\">Save</button></form>"
+        "<form id=\"autoBridge\" method=\"post\" action=\"/auto-bridge\"><input type=\"hidden\" name=\"bridge_url\" id=\"autoBridgeUrl\">"
+        "<button type=\"submit\">Auto Match This PC Bridge</button></form>"
         "<p><a class=\"btn\" href=\"/status\">JSON Status</a></p>"
         "<form method=\"post\" action=\"/reboot\"><button class=\"warn\" type=\"submit\">Reboot</button></form>"
         "<form method=\"post\" action=\"/clear-config\"><button class=\"danger\" type=\"submit\">Clear Wi-Fi and Bridge Config</button></form>"
-        "<script>setTimeout(()=>location.reload(),10000)</script>"
+        "<script>"
+        "document.getElementById('autoBridge').addEventListener('submit',async e=>{"
+        "const input=document.getElementById('autoBridgeUrl');"
+        "if(input.value)return;"
+        "e.preventDefault();"
+        "try{const r=await fetch('http://127.0.0.1:8787/discover',{cache:'no-store'});"
+        "if(!r.ok)throw new Error('HTTP '+r.status);"
+        "const data=await r.json();"
+        "input.value=data.stateUrl||'';"
+        "if(!input.value)throw new Error('missing stateUrl');"
+        "e.target.submit();}"
+        "catch(err){alert('Bridge auto-match failed: '+err.message);}"
+        "});"
+        "setTimeout(()=>location.reload(),10000)"
+        "</script>"
         "</main></body></html>");
 
     httpd_resp_set_type(req, "text/html; charset=utf-8");
@@ -399,6 +432,74 @@ static esp_err_t read_form_body(httpd_req_t *req, char *body, size_t body_size)
     return ESP_OK;
 }
 
+static esp_err_t save_bridge_url(const char *url)
+{
+    if (url == NULL || url[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    ornament_settings_t settings;
+    esp_err_t err = settings_load(&settings);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    strlcpy(settings.bridge_url, url, sizeof(settings.bridge_url));
+    settings.has_bridge_url = true;
+    err = settings_save(&settings);
+    if (err == ESP_OK) {
+        console_settings = settings;
+    }
+    return err;
+}
+
+static esp_err_t send_bridge_saved_page(httpd_req_t *req, const char *url, const char *detail)
+{
+    char escaped_url[ORNAMENT_BRIDGE_URL_MAX * 2];
+    char escaped_detail[160];
+    html_escape(url, escaped_url, sizeof(escaped_url));
+    html_escape(detail != NULL ? detail : "The next poll will use this URL.", escaped_detail, sizeof(escaped_detail));
+
+    char html[1024];
+    snprintf(
+        html,
+        sizeof(html),
+        "<!doctype html><html><head><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+        "<style>body{font-family:system-ui;margin:24px;background:#0b1116;color:#edf7fb}a{color:#49d3c8}code{word-break:break-all}</style>"
+        "</head><body><h1>Bridge Saved</h1><p><code>%s</code></p><p>%s</p><p><a href=\"/\">Back</a></p></body></html>",
+        escaped_url,
+        escaped_detail);
+
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
+    return httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t client_ip_from_request(httpd_req_t *req, char *ip, size_t ip_size)
+{
+    if (req == NULL || ip == NULL || ip_size == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    int sockfd = httpd_req_to_sockfd(req);
+    if (sockfd < 0) {
+        return ESP_FAIL;
+    }
+
+    struct sockaddr_storage addr = {0};
+    socklen_t addr_len = sizeof(addr);
+    if (getpeername(sockfd, (struct sockaddr *)&addr, &addr_len) != 0) {
+        return ESP_FAIL;
+    }
+
+    if (addr.ss_family == AF_INET) {
+        const struct sockaddr_in *peer = (const struct sockaddr_in *)&addr;
+        inet_ntoa_r(peer->sin_addr, ip, ip_size);
+        return ip[0] != '\0' ? ESP_OK : ESP_FAIL;
+    }
+
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
 static esp_err_t test_bridge_post_handler(httpd_req_t *req)
 {
     char body[256] = {0};
@@ -432,6 +533,74 @@ static esp_err_t test_bridge_post_handler(httpd_req_t *req)
     return httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
 }
 
+static esp_err_t save_bridge_post_handler(httpd_req_t *req)
+{
+    char body[256] = {0};
+    char url[ORNAMENT_BRIDGE_URL_MAX] = {0};
+    if (read_form_body(req, body, sizeof(body)) != ESP_OK) {
+        return ESP_FAIL;
+    }
+    form_value(body, "bridge_url", url, sizeof(url));
+    if (url[0] == '\0') {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Bridge URL is required");
+        return ESP_FAIL;
+    }
+
+    esp_err_t err = save_bridge_url(url);
+    if (err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, esp_err_to_name(err));
+        return ESP_FAIL;
+    }
+
+    return send_bridge_saved_page(req, url, "The next poll will use this URL.");
+}
+
+static esp_err_t auto_bridge_post_handler(httpd_req_t *req)
+{
+    char url[ORNAMENT_BRIDGE_URL_MAX];
+    char body[256] = {0};
+    if (req->content_len > 0) {
+        if (read_form_body(req, body, sizeof(body)) != ESP_OK) {
+            return ESP_FAIL;
+        }
+        form_value(body, "bridge_url", url, sizeof(url));
+    } else {
+        url[0] = '\0';
+    }
+
+    char client_ip[16] = {0};
+    if (url[0] == '\0') {
+        esp_err_t ip_err = client_ip_from_request(req, client_ip, sizeof(client_ip));
+        if (ip_err != ESP_OK) {
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Could not auto-detect bridge URL");
+            return ESP_FAIL;
+        }
+        snprintf(url, sizeof(url), "http://%s:8787/state", client_ip);
+    }
+
+    bridge_probe_result_t result;
+    esp_err_t err = bridge_client_probe_url(url, &result);
+    if (err != ESP_OK) {
+        char message[256];
+        snprintf(
+            message,
+            sizeof(message),
+            "Bridge test failed for %.159s: %.32s. Start the bridge on this PC first.",
+            url,
+            esp_err_to_name(err));
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, message);
+        return ESP_FAIL;
+    }
+
+    err = save_bridge_url(url);
+    if (err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, esp_err_to_name(err));
+        return ESP_FAIL;
+    }
+
+    return send_bridge_saved_page(req, url, "Auto-detected from this browser and verified.");
+}
+
 static esp_err_t reboot_post_handler(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "text/plain");
@@ -446,6 +615,7 @@ static esp_err_t clear_config_post_handler(httpd_req_t *req)
     esp_err_t err = settings_clear();
     httpd_resp_set_type(req, "text/plain");
     if (err == ESP_OK) {
+        memset(&console_settings, 0, sizeof(console_settings));
         httpd_resp_sendstr(req, "config cleared; rebooting");
         vTaskDelay(pdMS_TO_TICKS(300));
         esp_restart();
@@ -467,11 +637,14 @@ esp_err_t web_console_start(void)
         }
         ornament_state_init(&last_state);
     }
+    refresh_console_settings();
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
+    config.task_priority = 6;
+    config.stack_size = 16384;
     config.lru_purge_enable = true;
-    config.max_uri_handlers = 8;
+    config.max_uri_handlers = 10;
 
     esp_err_t err = httpd_start(&server, &config);
     if (err != ESP_OK) {
@@ -494,6 +667,16 @@ esp_err_t web_console_start(void)
         .method = HTTP_POST,
         .handler = test_bridge_post_handler,
     };
+    const httpd_uri_t save_bridge = {
+        .uri = "/save-bridge",
+        .method = HTTP_POST,
+        .handler = save_bridge_post_handler,
+    };
+    const httpd_uri_t auto_bridge = {
+        .uri = "/auto-bridge",
+        .method = HTTP_POST,
+        .handler = auto_bridge_post_handler,
+    };
     const httpd_uri_t reboot = {
         .uri = "/reboot",
         .method = HTTP_POST,
@@ -508,6 +691,8 @@ esp_err_t web_console_start(void)
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &root));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &status));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &test_bridge));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &save_bridge));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &auto_bridge));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &reboot));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &clear_config));
     ESP_LOGI(TAG, "web console started on http://<device-ip>/");
