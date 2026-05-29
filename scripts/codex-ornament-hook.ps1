@@ -4,6 +4,7 @@ param(
   [string]$EventName = $env:CODEX_HOOK_EVENT_NAME,
   [string]$Endpoint = $env:CODEX_ORNAMENT_ENDPOINT,
   [string]$Token = $env:CODEX_ORNAMENT_TOKEN,
+  [string]$Source = $env:CODEX_ORNAMENT_SOURCE,
   [switch]$DryRun
 )
 
@@ -50,6 +51,13 @@ function Add-MissingTextProperty($Object, $Name, $Value) {
 function Add-HookContext($Object) {
   $Object = Add-MissingTextProperty $Object "session_id" $env:CODEX_THREAD_ID
   $Object = Add-MissingTextProperty $Object "cwd" (Get-Location).Path
+  if (-not [string]::IsNullOrWhiteSpace($Source)) {
+    if ($null -eq $Object.PSObject.Properties["source"]) {
+      $Object | Add-Member -NotePropertyName "source" -NotePropertyValue $Source
+    } else {
+      $Object.source = $Source
+    }
+  }
   return $Object
 }
 

@@ -65,6 +65,39 @@ static int json_nonnegative_int(cJSON *parent, const char *name)
     return 0;
 }
 
+static void parse_source_task(
+    cJSON *source_tasks,
+    const char *name,
+    bool *has_summary,
+    bool *has_task,
+    ornament_status_t *status,
+    int *active_count,
+    int *done_seq,
+    char *title,
+    size_t title_size,
+    char *message,
+    size_t message_size)
+{
+    cJSON *summary = cJSON_GetObjectItemCaseSensitive(source_tasks, name);
+    if (!cJSON_IsObject(summary)) {
+        return;
+    }
+
+    *has_summary = true;
+    char status_text[16] = {0};
+    copy_json_string(summary, "status", status_text, sizeof(status_text));
+    *status = ornament_status_from_text(status_text);
+    *active_count = json_nonnegative_int(summary, "activeCount");
+    *done_seq = json_nonnegative_int(summary, "doneSeq");
+
+    cJSON *task = cJSON_GetObjectItemCaseSensitive(summary, "task");
+    if (cJSON_IsObject(task)) {
+        *has_task = true;
+        copy_json_string(task, "title", title, title_size);
+        copy_json_string(task, "message", message, message_size);
+    }
+}
+
 static esp_err_t parse_state_json(const char *json_text, ornament_state_t *state)
 {
     cJSON *root = cJSON_Parse(json_text);
@@ -84,6 +117,34 @@ static esp_err_t parse_state_json(const char *json_text, ornament_state_t *state
         copy_json_string(task, "title", state->task_title, sizeof(state->task_title));
         copy_json_string(task, "message", state->task_message, sizeof(state->task_message));
         copy_json_string(task, "receivedAt", state->task_received_at, sizeof(state->task_received_at));
+    }
+
+    cJSON *source_tasks = cJSON_GetObjectItemCaseSensitive(root, "sourceTasks");
+    if (cJSON_IsObject(source_tasks)) {
+        parse_source_task(
+            source_tasks,
+            "codex",
+            &state->has_codex_summary,
+            &state->has_codex_task,
+            &state->codex_task_status,
+            &state->codex_active_task_count,
+            &state->codex_done_seq,
+            state->codex_task_title,
+            sizeof(state->codex_task_title),
+            state->codex_task_message,
+            sizeof(state->codex_task_message));
+        parse_source_task(
+            source_tasks,
+            "claude",
+            &state->has_claude_summary,
+            &state->has_claude_task,
+            &state->claude_task_status,
+            &state->claude_active_task_count,
+            &state->claude_done_seq,
+            state->claude_task_title,
+            sizeof(state->claude_task_title),
+            state->claude_task_message,
+            sizeof(state->claude_task_message));
     }
 
     cJSON *quota = cJSON_GetObjectItemCaseSensitive(root, "quota");

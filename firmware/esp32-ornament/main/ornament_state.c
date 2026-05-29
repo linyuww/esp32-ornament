@@ -6,6 +6,8 @@ void ornament_state_init(ornament_state_t *state)
 {
     memset(state, 0, sizeof(*state));
     state->status = ORNAMENT_STATUS_IDLE;
+    state->codex_task_status = ORNAMENT_STATUS_IDLE;
+    state->claude_task_status = ORNAMENT_STATUS_IDLE;
     state->primary_remaining_percent = -1;
     state->secondary_remaining_percent = -1;
     state->active_task_count = 0;

@@ -149,6 +149,58 @@ static void status_label(ornament_status_t status, char *out, size_t out_size)
     strlcpy(out, label, out_size);
 }
 
+static const char *task_title_or_default(bool has_task, const char *title, const char *fallback)
+{
+    return has_task && title != NULL && title[0] != '\0' ? title : fallback;
+}
+
+static bool text_equals_ignore_case(const char *left, const char *right)
+{
+    if (left == NULL || right == NULL) {
+        return false;
+    }
+
+    while (*left != '\0' && *right != '\0') {
+        char left_ch = *left;
+        char right_ch = *right;
+        if (left_ch >= 'a' && left_ch <= 'z') {
+            left_ch = (char)(left_ch - 'a' + 'A');
+        }
+        if (right_ch >= 'a' && right_ch <= 'z') {
+            right_ch = (char)(right_ch - 'a' + 'A');
+        }
+        if (left_ch != right_ch) {
+            return false;
+        }
+        left++;
+        right++;
+    }
+    return *left == '\0' && *right == '\0';
+}
+
+static void task_card_status_label(const ornament_state_t *state, char *out, size_t out_size)
+{
+    if (state == NULL || out_size == 0) {
+        return;
+    }
+
+    if (state->status == ORNAMENT_STATUS_DONE && state->has_task) {
+        if (text_equals_ignore_case(state->task_title, "Claude + Codex done")) {
+            strlcpy(out, "claude + codex done", out_size);
+            return;
+        }
+        if (text_equals_ignore_case(state->task_title, "Claude done")) {
+            strlcpy(out, "claude done", out_size);
+            return;
+        }
+        if (text_equals_ignore_case(state->task_title, "Codex done")) {
+            strlcpy(out, "codex done", out_size);
+            return;
+        }
+    }
+    status_label(state->status, out, out_size);
+}
+
 static void state_snapshot(ornament_state_t *state, esp_err_t *fetch_error, int64_t *age_ms)
 {
     int64_t updated_us = 0;
@@ -284,7 +336,13 @@ static esp_err_t root_get_handler(httpd_req_t *req)
     char wifi_ssid[80];
     char title[ORNAMENT_TEXT_MAX * 2];
     char message[ORNAMENT_TEXT_MAX * 2];
-    char status[16];
+    char codex_title[ORNAMENT_TEXT_MAX * 2];
+    char codex_message[ORNAMENT_TEXT_MAX * 2];
+    char claude_title[ORNAMENT_TEXT_MAX * 2];
+    char claude_message[ORNAMENT_TEXT_MAX * 2];
+    char status[32];
+    char codex_status[32];
+    char claude_status[32];
 
     ornament_state_init(&state);
     state_snapshot(&state, &fetch_error, &age_ms);
@@ -293,7 +351,13 @@ static esp_err_t root_get_handler(httpd_req_t *req)
     html_escape(state.wifi_ssid, wifi_ssid, sizeof(wifi_ssid));
     html_escape(state.task_title, title, sizeof(title));
     html_escape(state.task_message, message, sizeof(message));
-    status_label(state.status, status, sizeof(status));
+    html_escape(state.codex_task_title, codex_title, sizeof(codex_title));
+    html_escape(state.codex_task_message, codex_message, sizeof(codex_message));
+    html_escape(state.claude_task_title, claude_title, sizeof(claude_title));
+    html_escape(state.claude_task_message, claude_message, sizeof(claude_message));
+    task_card_status_label(&state, status, sizeof(status));
+    status_label(state.codex_task_status, codex_status, sizeof(codex_status));
+    status_label(state.claude_task_status, claude_status, sizeof(claude_status));
 
     char *html = calloc(1, 8192);
     if (html == NULL) {
@@ -311,6 +375,8 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:22px;background:#0b1116;color:#edf7fb}"
         "main{max-width:760px;margin:auto}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px}"
         ".card{border:1px solid #263744;border-radius:8px;padding:14px;background:#111a21}.k{color:#8fa3b1;font-size:13px}.v{font-size:22px;margin-top:5px}"
+        ".task-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px;margin-top:12px}"
+        ".task-detail{min-height:56px;overflow:hidden;text-overflow:ellipsis}"
         "button,a.btn{box-sizing:border-box;display:inline-block;margin:8px 8px 0 0;padding:10px 12px;border:0;border-radius:8px;background:#49d3c8;color:#06100f;font-weight:700;text-decoration:none}"
         "button.warn{background:#ffbf45}.danger{background:#ff5b5b}code{word-break:break-all;color:#c6f7ff}"
         "input{box-sizing:border-box;width:100%;padding:10px;border-radius:8px;border:1px solid #344a58;background:#0e171e;color:#fff}"
@@ -322,9 +388,45 @@ static esp_err_t root_get_handler(httpd_req_t *req)
     appendf(html, 8192, &used, "<div class=\"card\"><div class=\"k\">Wi-Fi</div><div class=\"v\">%s %ddBm</div></div>", state.wifi_connected ? wifi_ssid : "OFF", state.wifi_rssi);
     appendf(html, 8192, &used, "<div class=\"card\"><div class=\"k\">Time</div><div class=\"v\">%s %s</div></div>", state.local_time, state.local_date);
     appendf(html, 8192, &used, "<div class=\"card\"><div class=\"k\">Quota</div><div class=\"v\">%d%% / %d%%</div></div>", state.primary_remaining_percent, state.secondary_remaining_percent);
-    appendf(html, 8192, &used, "<div class=\"card\"><div class=\"k\">Task</div><div class=\"v\">%s</div><div class=\"k\">active %d, done %d</div></div>", status, state.active_task_count, state.done_seq);
     append(html, 8192, &used, "</div>");
-    appendf(html, 8192, &used, "<p><b>%s</b><br>%s</p>", title[0] != '\0' ? title : "No task title", message[0] != '\0' ? message : "");
+    append(html, 8192, &used, "<div class=\"task-grid\">");
+    appendf(
+        html,
+        8192,
+        &used,
+        "<div class=\"card\"><div class=\"k\">Task</div><div class=\"v\">%s</div><div class=\"k\">active %d, done %d</div></div>",
+        state.has_codex_summary ? codex_status : status,
+        state.has_codex_summary ? state.codex_active_task_count : state.active_task_count,
+        state.has_codex_summary ? state.codex_done_seq : state.done_seq);
+    appendf(
+        html,
+        8192,
+        &used,
+        "<div class=\"card claude\"><div class=\"k\">Claude Task</div><div class=\"v\">%s</div><div class=\"k\">active %d, done %d</div></div>",
+        state.has_claude_summary ? claude_status : "idle",
+        state.claude_active_task_count,
+        state.claude_done_seq);
+    append(html, 8192, &used, "</div>");
+    append(
+        html,
+        8192,
+        &used,
+        "<div class=\"task-grid\">");
+    appendf(
+        html,
+        8192,
+        &used,
+        "<p class=\"task-detail\"><b>%s</b><br>%s</p>",
+        task_title_or_default(state.has_codex_task, codex_title, title[0] != '\0' ? title : "No task title"),
+        state.has_codex_task ? codex_message : "");
+    appendf(
+        html,
+        8192,
+        &used,
+        "<p class=\"task-detail claude\"><b>%s</b><br>%s</p>",
+        task_title_or_default(state.has_claude_task, claude_title, "No Claude task"),
+        state.has_claude_task ? claude_message : "");
+    append(html, 8192, &used, "</div>");
     appendf(html, 8192, &used, "<p class=\"k\">Last fetch: %s, age: %lld ms</p>", esp_err_to_name(fetch_error), (long long)age_ms);
     append(
         html,
