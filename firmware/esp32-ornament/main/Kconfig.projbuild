@@ -170,7 +170,7 @@ config ORNAMENT_LCD_V_RES
 
 config ORNAMENT_LCD_PIXEL_CLOCK_HZ
     int "LCD pixel clock Hz"
-    default 40000000
+    default 2000000
 
 config ORNAMENT_LCD_PIN_SCLK
     int "LCD SCLK GPIO"
@@ -209,5 +209,44 @@ config ORNAMENT_LCD_PIN_RST
 config ORNAMENT_LCD_PIN_BL
     int "LCD backlight control GPIO"
     default 7
+
+config ORNAMENT_LCD_BL_ACTIVE_LEVEL
+    int "LCD backlight active GPIO level"
+    default 1
+    range 0 1
+    help
+        Set 1 for a low-side N-MOS backlight switch driven from the GPIO gate.
+        Set 0 only for adapter boards with active-low backlight enable.
+
+config ORNAMENT_LCD_BOOT_TEST_MS
+    int "LCD boot test pattern duration in milliseconds"
+    default 8000
+    range 0 10000
+    help
+        Shows a simple color-bar test pattern after LCD initialization. Set 0
+        to skip the panel bring-up test in production builds.
+
+config ORNAMENT_LCD_SWAP_COLOR_BYTES
+    bool "Swap RGB565 color bytes before LCD transfer"
+    default y
+    help
+        ST77916 QSPI panels typically expect RGB565 color data with the high
+        byte first. Enable this when solid colors appear as thin stripes or
+        the main panel is unreadable.
+
+config ORNAMENT_LCD_SWAP_XY
+    bool "Swap LCD X/Y address scan direction"
+    default y
+    help
+        Enable this when full-screen solid colors work but text or graphics
+        appear as vertical bands, which indicates the panel is consuming row
+        chunks as column chunks.
+
+config ORNAMENT_LCD_REFERENCE_TEST_ONLY
+    bool "Hold LCD reference test chart"
+    default y
+    help
+        Draw a fixed 360x360 reference chart and keep it on screen for panel
+        bring-up. Disable after wiring and panel format are verified.
 
 endmenu
