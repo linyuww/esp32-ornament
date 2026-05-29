@@ -84,6 +84,14 @@ static void copy_event_ssid(const uint8_t *ssid, uint8_t ssid_len, char *target,
     target[copy_len] = '\0';
 }
 
+static void format_ip(esp_ip4_addr_t ip, char *target, size_t target_size)
+{
+    if (target == NULL || target_size == 0) {
+        return;
+    }
+    snprintf(target, target_size, IPSTR, IP2STR(&ip));
+}
+
 static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
 {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
@@ -274,5 +282,45 @@ void wifi_status_snapshot(bool *connected, char *ssid, size_t ssid_size, int *rs
     }
     if (rssi != NULL) {
         *rssi = is_connected ? ap_info.rssi : 0;
+    }
+}
+
+void wifi_debug_snapshot(wifi_debug_snapshot_t *snapshot)
+{
+    if (snapshot == NULL) {
+        return;
+    }
+    memset(snapshot, 0, sizeof(*snapshot));
+    snapshot->last_disconnect_reason = last_disconnect_reason;
+    snapshot->last_disconnect_rssi = last_disconnect_rssi;
+    snapshot->last_disconnect_name = wifi_disconnect_reason_name(last_disconnect_reason);
+    snapshot->retry_count = retry_count;
+
+    wifi_ap_record_t ap_info = {0};
+    snapshot->connected = esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK;
+    if (snapshot->connected) {
+        strlcpy(snapshot->ssid, (const char *)ap_info.ssid, sizeof(snapshot->ssid));
+        snprintf(
+            snapshot->bssid,
+            sizeof(snapshot->bssid),
+            "%02x:%02x:%02x:%02x:%02x:%02x",
+            ap_info.bssid[0],
+            ap_info.bssid[1],
+            ap_info.bssid[2],
+            ap_info.bssid[3],
+            ap_info.bssid[4],
+            ap_info.bssid[5]);
+        snapshot->rssi = ap_info.rssi;
+        snapshot->channel = ap_info.primary;
+        snapshot->authmode = ap_info.authmode;
+    }
+
+    if (sta_netif != NULL) {
+        esp_netif_ip_info_t ip_info = {0};
+        if (esp_netif_get_ip_info(sta_netif, &ip_info) == ESP_OK) {
+            format_ip(ip_info.ip, snapshot->ip, sizeof(snapshot->ip));
+            format_ip(ip_info.netmask, snapshot->netmask, sizeof(snapshot->netmask));
+            format_ip(ip_info.gw, snapshot->gateway, sizeof(snapshot->gateway));
+        }
     }
 }

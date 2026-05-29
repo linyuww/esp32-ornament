@@ -184,6 +184,7 @@ void web_console_set_last_state(const ornament_state_t *state, esp_err_t fetch_e
 static esp_err_t status_get_handler(httpd_req_t *req)
 {
     ornament_state_t state;
+    wifi_debug_snapshot_t wifi_debug;
     esp_err_t fetch_error = ESP_OK;
     int64_t age_ms = -1;
     char status[16];
@@ -197,6 +198,7 @@ static esp_err_t status_get_handler(httpd_req_t *req)
 
     ornament_state_init(&state);
     state_snapshot(&state, &fetch_error, &age_ms);
+    wifi_debug_snapshot(&wifi_debug);
     status_label(state.status, status, sizeof(status));
     json_escape(state.task_title, task_title, sizeof(task_title));
     json_escape(state.task_message, task_message, sizeof(task_message));
@@ -206,7 +208,7 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     device_identity_hostname(hostname, sizeof(hostname));
     snprintf(mdns_url, sizeof(mdns_url), "http://%s.local/", hostname);
 
-    const size_t json_size = 3072;
+    const size_t json_size = 4096;
     char *json = calloc(1, json_size);
     if (json == NULL) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
@@ -224,6 +226,9 @@ static esp_err_t status_get_handler(httpd_req_t *req)
         "\"mdns_url\":\"%s\","
         "\"bridge_url\":\"%s\","
         "\"wifi\":{\"connected\":%s,\"ssid\":\"%s\",\"rssi\":%d},"
+        "\"network\":{\"connected\":%s,\"ip\":\"%s\",\"netmask\":\"%s\",\"gateway\":\"%s\",\"bssid\":\"%s\","
+        "\"channel\":%d,\"authmode\":%d,\"retry_count\":%d,\"last_disconnect_reason\":%u,"
+        "\"last_disconnect_name\":\"%s\",\"last_disconnect_rssi\":%d},"
         "\"time\":{\"synced\":%s,\"local_time\":\"%s\",\"local_date\":\"%s\"},"
         "\"quota\":{\"has\":%s,\"status\":\"%s\",\"primary\":%d,\"weekly\":%d},"
         "\"task\":{\"has\":%s,\"status\":\"%s\",\"title\":\"%s\",\"message\":\"%s\"},"
@@ -238,6 +243,17 @@ static esp_err_t status_get_handler(httpd_req_t *req)
         state.wifi_connected ? "true" : "false",
         wifi_ssid,
         state.wifi_rssi,
+        wifi_debug.connected ? "true" : "false",
+        wifi_debug.ip,
+        wifi_debug.netmask,
+        wifi_debug.gateway,
+        wifi_debug.bssid,
+        wifi_debug.channel,
+        wifi_debug.authmode,
+        wifi_debug.retry_count,
+        wifi_debug.last_disconnect_reason,
+        wifi_debug.last_disconnect_name,
+        wifi_debug.last_disconnect_rssi,
         state.time_synced ? "true" : "false",
         state.local_time,
         state.local_date,
@@ -262,6 +278,7 @@ static esp_err_t status_get_handler(httpd_req_t *req)
 static esp_err_t root_get_handler(httpd_req_t *req)
 {
     ornament_state_t state;
+    wifi_debug_snapshot_t wifi_debug;
     esp_err_t fetch_error = ESP_OK;
     int64_t age_ms = -1;
     char bridge_url[ORNAMENT_BRIDGE_URL_MAX * 2];
@@ -274,6 +291,7 @@ static esp_err_t root_get_handler(httpd_req_t *req)
 
     ornament_state_init(&state);
     state_snapshot(&state, &fetch_error, &age_ms);
+    wifi_debug_snapshot(&wifi_debug);
     html_escape(settings_bridge_url_or_default(&console_settings), bridge_url, sizeof(bridge_url));
     html_escape(state.wifi_ssid, wifi_ssid, sizeof(wifi_ssid));
     html_escape(state.task_title, title, sizeof(title));
@@ -313,6 +331,18 @@ static esp_err_t root_get_handler(httpd_req_t *req)
     append(html, 8192, &used, "</div>");
     appendf(html, 8192, &used, "<p><b>%s</b><br>%s</p>", title[0] != '\0' ? title : "No task title", message[0] != '\0' ? message : "");
     appendf(html, 8192, &used, "<p class=\"k\">Last fetch: %s, age: %lld ms</p>", esp_err_to_name(fetch_error), (long long)age_ms);
+    append(
+        html,
+        8192,
+        &used,
+        "<h2>Network Debug</h2><div class=\"grid\">");
+    appendf(html, 8192, &used, "<div class=\"card\"><div class=\"k\">IP</div><div class=\"v\">%s</div></div>", wifi_debug.ip[0] != '\0' ? wifi_debug.ip : "0.0.0.0");
+    appendf(html, 8192, &used, "<div class=\"card\"><div class=\"k\">Gateway</div><div class=\"v\">%s</div></div>", wifi_debug.gateway[0] != '\0' ? wifi_debug.gateway : "0.0.0.0");
+    appendf(html, 8192, &used, "<div class=\"card\"><div class=\"k\">Channel</div><div class=\"v\">%d</div></div>", wifi_debug.channel);
+    appendf(html, 8192, &used, "<div class=\"card\"><div class=\"k\">BSSID</div><div class=\"v\">%s</div></div>", wifi_debug.bssid[0] != '\0' ? wifi_debug.bssid : "--");
+    appendf(html, 8192, &used, "<div class=\"card\"><div class=\"k\">Disconnect</div><div class=\"v\">%u %s</div><div class=\"k\">rssi %d retries %d</div></div>", wifi_debug.last_disconnect_reason, wifi_debug.last_disconnect_name, wifi_debug.last_disconnect_rssi, wifi_debug.retry_count);
+    appendf(html, 8192, &used, "<div class=\"card\"><div class=\"k\">Bridge Fetch</div><div class=\"v\">%s</div><div class=\"k\">age %lld ms</div></div>", esp_err_to_name(fetch_error), (long long)age_ms);
+    append(html, 8192, &used, "</div>");
     append(
         html,
         8192,
