@@ -1,16 +1,11 @@
 #include "display_core.h"
 
-#include <math.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
 
 #ifndef CONFIG_ORNAMENT_QUOTA_CRITICAL_PERCENT
 #define CONFIG_ORNAMENT_QUOTA_CRITICAL_PERCENT 10
@@ -73,16 +68,9 @@ static bool begin_render(display_core_canvas_t *canvas)
     return true;
 }
 
-static bool in_circle(int x, int y)
-{
-    int dx = x - active_canvas->center_x;
-    int dy = y - active_canvas->center_y;
-    return dx * dx + dy * dy <= (int)active_canvas->radius * (int)active_canvas->radius;
-}
-
 static void draw_pixel(int x, int y, uint16_t color)
 {
-    if (x < 0 || y < 0 || x >= active_canvas->width || y >= active_canvas->height || !in_circle(x, y)) {
+    if (x < 0 || y < 0 || x >= active_canvas->width || y >= active_canvas->height) {
         return;
     }
     active_canvas->pixels[y * active_canvas->width + x] = color;
@@ -92,7 +80,7 @@ static void clear_canvas(uint16_t color)
 {
     for (int y = 0; y < active_canvas->height; y++) {
         for (int x = 0; x < active_canvas->width; x++) {
-            active_canvas->pixels[y * active_canvas->width + x] = in_circle(x, y) ? color : HUD_BLACK;
+            active_canvas->pixels[y * active_canvas->width + x] = color;
         }
     }
 }
@@ -127,22 +115,6 @@ static int ts(int value)
 {
     int scaled = ss(value) / 2;
     return scaled > 0 ? scaled : 1;
-}
-
-static void draw_circle_outline(int cx, int cy, int radius, int thickness, uint16_t color)
-{
-    int outer = radius * radius;
-    int inner = (radius - thickness) * (radius - thickness);
-    for (int y = cy - radius; y <= cy + radius; y++) {
-        for (int x = cx - radius; x <= cx + radius; x++) {
-            int dx = x - cx;
-            int dy = y - cy;
-            int d = dx * dx + dy * dy;
-            if (d <= outer && d >= inner) {
-                draw_pixel(x, y, color);
-            }
-        }
-    }
 }
 
 static void draw_hline(int x0, int x1, int y, int thickness, uint16_t color)
@@ -267,21 +239,19 @@ static uint16_t alert_dim_color_for(const ornament_state_t *state)
 
 static void draw_ring_ticks(const ornament_state_t *state)
 {
-    const int cx = active_canvas->center_x;
-    const int cy = active_canvas->center_y;
-    const int radius = ss(158);
     uint16_t ring_color = alert_color_for(state);
     uint16_t dim_color = alert_dim_color_for(state);
 
-    draw_circle_outline(cx, cy, radius, ss(2), dim_color);
-
-    const int arc_radius = ss(155);
-    const int dot_size = ss(5);
-    for (int degree = -60; degree <= 55; degree += 4) {
-        float angle = (float)degree * (float)M_PI / 180.0f;
-        int x = cx + (int)lroundf(cosf(angle) * (float)arc_radius);
-        int y = cy + (int)lroundf(sinf(angle) * (float)arc_radius);
-        fill_rect(x - dot_size / 2, y - dot_size / 2, dot_size, dot_size, ring_color);
+    draw_rect_outline(sx(9), sy(9), sx(342), sy(342), ss(2), dim_color);
+    const int tick = ss(5);
+    const int step = sx(16);
+    for (int x = sx(20); x <= sx(335); x += step) {
+        fill_rect(x, sy(9), tick, tick, ring_color);
+        fill_rect(x, sy(346), tick, tick, ring_color);
+    }
+    for (int y = sy(24); y <= sy(330); y += step) {
+        fill_rect(sx(9), y, tick, tick, ring_color);
+        fill_rect(sx(346), y, tick, tick, ring_color);
     }
 }
 
@@ -402,46 +372,13 @@ static int min_int(int a, int b)
     return a < b ? a : b;
 }
 
-static int integer_sqrt(int value)
+static bool line_band_bounds(int y, int height, int margin, int *left, int *right)
 {
-    int result = 0;
-    while ((result + 1) * (result + 1) <= value) {
-        result++;
-    }
-    return result;
-}
-
-static bool circle_band_bounds(int y, int height, int margin, int *left, int *right)
-{
-    int min_left = 0;
-    int max_right = (int)active_canvas->width - 1;
-    int radius_sq = (int)active_canvas->radius * (int)active_canvas->radius;
-
-    for (int yy = y; yy < y + height; yy++) {
-        if (yy < 0 || yy >= active_canvas->height) {
-            return false;
-        }
-        int dy = yy - (int)active_canvas->center_y;
-        int remain = radius_sq - dy * dy;
-        if (remain < 0) {
-            return false;
-        }
-        int span = integer_sqrt(remain);
-        int row_left = (int)active_canvas->center_x - span + margin;
-        int row_right = (int)active_canvas->center_x + span - margin;
-        if (row_left > min_left) {
-            min_left = row_left;
-        }
-        if (row_right < max_right) {
-            max_right = row_right;
-        }
-    }
-
-    if (min_left > max_right) {
+    if (y < 0 || y + height > active_canvas->height || margin * 2 >= active_canvas->width) {
         return false;
     }
-    *left = min_left;
-    *right = max_right;
+    *left = margin;
+    *right = (int)active_canvas->width - 1 - margin;
     return true;
 }
 
@@ -450,7 +387,7 @@ static int fit_text_scale(const char *text, int y, int preferred_scale, int marg
     for (int scale = preferred_scale; scale > 1; scale--) {
         int left = 0;
         int right = 0;
-        if (circle_band_bounds(y, 7 * scale, margin, &left, &right) &&
+        if (line_band_bounds(y, 7 * scale, margin, &left, &right) &&
             text_width(text, scale) <= right - left + 1) {
             return scale;
         }
@@ -479,7 +416,7 @@ static void fit_text_xy(
     for (int ys = preferred_y_scale; ys >= min_y_scale; ys--) {
         int candidate_left = 0;
         int candidate_right = 0;
-        if (!circle_band_bounds(y, 7 * ys, margin, &candidate_left, &candidate_right)) {
+        if (!line_band_bounds(y, 7 * ys, margin, &candidate_left, &candidate_right)) {
             continue;
         }
         int available = candidate_right - candidate_left + 1;
@@ -510,7 +447,7 @@ static void draw_text_center_fit(int y, const char *text, int preferred_scale, u
     int scale = fit_text_scale(text, y, preferred_scale, margin);
     int left = 0;
     int right = (int)active_canvas->width - 1;
-    if (!circle_band_bounds(y, 7 * scale, margin, &left, &right)) {
+    if (!line_band_bounds(y, 7 * scale, margin, &left, &right)) {
         return;
     }
     int width = text_width(text, scale);
@@ -655,7 +592,7 @@ static void status_label(const ornament_state_t *state, char *out, size_t out_si
         label = "DONE";
         break;
     }
-    strlcpy(out, label, out_size);
+    snprintf(out, out_size, "%s", label);
 }
 
 static uint16_t active_dot_color_for(const ornament_state_t *state, uint16_t status)
@@ -682,7 +619,7 @@ static void draw_status_badge(const ornament_state_t *state)
     uint16_t dot_color = active_dot_color_for(state, color);
     char label[24];
     status_label(state, label, sizeof(label));
-    const int y = sy(292);
+    const int y = sy(312);
     const int dot = ss(10);
     int x_scale = ss(2);
     int y_scale = ss(2);
@@ -697,7 +634,7 @@ static void draw_status_badge(const ornament_state_t *state)
     draw_text_xy(text_x, y, label, x_scale, y_scale, color);
 
     if (state->status == ORNAMENT_STATUS_ERROR) {
-        draw_circle_outline(active_canvas->center_x, active_canvas->center_y, ss(147), ss(2), HUD_RED);
+        draw_rect_outline(sx(18), sy(18), sx(324), sy(324), ss(2), HUD_RED);
     }
 }
 
@@ -713,14 +650,14 @@ static void draw_system_widget(const ornament_state_t *state, uint16_t accent)
         snprintf(wifi_text, sizeof(wifi_text), "WIFI OFF");
     }
 
-    draw_text_xy(sx(67), sy(69), time_text, ss(1), ss(1), accent);
-    draw_text_xy(sx(151), sy(69), date_text, ss(1), ss(1), HUD_MUTED);
-    draw_text_xy(sx(219), sy(69), wifi_text, ss(1), ss(1), state->wifi_connected ? HUD_MUTED : HUD_AMBER);
+    draw_text_xy(sx(34), sy(65), time_text, ss(1), ss(1), accent);
+    draw_text_xy(sx(118), sy(65), date_text, ss(1), ss(1), HUD_MUTED);
+    draw_text_right_fit_xy(active_canvas->width - sx(34), sy(65), wifi_text, ss(1), ss(1), state->wifi_connected ? HUD_MUTED : HUD_AMBER);
 }
 
 static void draw_logo_header(const ornament_state_t *state)
 {
-    draw_text_xy(sx(111), sy(48), "CODEX QUOTA", ss(2), ss(2), HUD_WHITE);
+    draw_text_xy(sx(34), sy(34), "CODEX QUOTA", ss(2), ss(2), HUD_WHITE);
     draw_system_widget(state, ui_accent_color_for(state));
 }
 
@@ -735,12 +672,12 @@ static void draw_quota_panel(
 {
     char percent_text[16];
 
-    draw_rect_outline(sx(60), sy(y), sx(240), sy(76), ss(1), panel_color);
-    draw_text_xy(sx(66), sy(y + 15), label, ss(2), ss(2), HUD_MUTED);
+    draw_rect_outline(sx(28), sy(y), sx(304), sy(82), ss(1), panel_color);
+    draw_text_xy(sx(38), sy(y + 13), label, ss(2), ss(2), HUD_MUTED);
     snprintf(percent_text, sizeof(percent_text), "%d%%", percent);
-    draw_text_right_fit_xy(active_canvas->width - sx(78), sy(y + 8), percent_text, ss(2), ss(3), active_color);
-    draw_segment_bar(sx(66), sy(y + 52), sx(204), ss(7), percent, active_color, inactive_color);
-    draw_text_xy(sx(66), sy(y + 67), reset_text, ss(1), ss(1), HUD_WHITE);
+    draw_text_right_fit_xy(active_canvas->width - sx(38), sy(y + 6), percent_text, ss(2), ss(3), active_color);
+    draw_segment_bar(sx(38), sy(y + 52), sx(284), ss(8), percent, active_color, inactive_color);
+    draw_text_xy(sx(38), sy(y + 68), reset_text, ss(1), ss(1), HUD_WHITE);
 }
 
 static void draw_quota_rows(const ornament_state_t *state)
@@ -751,10 +688,10 @@ static void draw_quota_rows(const ornament_state_t *state)
     char reset_text[32];
 
     reset_in_text(reset_text, sizeof(reset_text), state->primary_resets_at);
-    draw_quota_panel(78, "CURRENT", primary, reset_text, alert, HUD_PANEL_BLUE, HUD_DIM_BLUE);
+    draw_quota_panel(88, "CURRENT", primary, reset_text, alert, HUD_PANEL_BLUE, HUD_DIM_BLUE);
 
     reset_date_text(reset_text, sizeof(reset_text), state->secondary_resets_at);
-    draw_quota_panel(184, "WEEKLY", weekly, reset_text, alert, HUD_PANEL_GREEN, HUD_DIM_GREEN);
+    draw_quota_panel(198, "WEEKLY", weekly, reset_text, alert, HUD_PANEL_GREEN, HUD_DIM_GREEN);
 }
 
 void display_core_render_hud(display_core_canvas_t *canvas, const ornament_state_t *state)
@@ -806,12 +743,12 @@ void display_core_render_clock(display_core_canvas_t *canvas, const ornament_sta
 
     clear_canvas(HUD_BLACK);
     draw_ring_ticks(state);
-    draw_circle_outline(active_canvas->center_x, active_canvas->center_y, ss(126), ss(1), HUD_DIM_BLUE);
-    draw_text_center_fit(sy(78), "CODEX CLOCK", ss(2), HUD_WHITE);
-    draw_text_center_fit(sy(130), time_text, ss(8), accent);
-    draw_text_center_fit(sy(206), date_text, ss(3), HUD_MUTED);
-    draw_text_center_fit(sy(248), wifi_text, ss(2), state->wifi_connected ? HUD_CYAN : HUD_AMBER);
-    draw_text_center_fit(sy(278), quota_text, ss(2), HUD_WHITE);
+    draw_rect_outline(sx(40), sy(78), sx(280), sy(156), ss(1), HUD_DIM_BLUE);
+    draw_text_center_fit(sy(50), "CODEX CLOCK", ss(2), HUD_WHITE);
+    draw_text_center_fit(sy(112), time_text, ss(7), accent);
+    draw_text_center_fit(sy(184), date_text, ss(3), HUD_MUTED);
+    draw_text_center_fit(sy(250), wifi_text, ss(2), state->wifi_connected ? HUD_CYAN : HUD_AMBER);
+    draw_text_center_fit(sy(284), quota_text, ss(2), HUD_WHITE);
 }
 
 static void render_message(display_core_canvas_t *canvas, const char *line1, const char *line2, uint16_t color)
@@ -827,9 +764,9 @@ static void render_message(display_core_canvas_t *canvas, const char *line1, con
     ornament_state_init(&state);
     clear_canvas(HUD_BLACK);
     draw_ring_ticks(&state);
-    draw_text_center_fit(active_canvas->center_y - sy(32), line1, ts(4), color);
+    draw_text_center_fit(active_canvas->center_y - sy(36), line1, ts(4), color);
     if (line2 != NULL) {
-        draw_text_center_fit(active_canvas->center_y + sy(14), line2, ts(2), HUD_WHITE);
+        draw_text_center_fit(active_canvas->center_y + sy(16), line2, ts(2), HUD_WHITE);
     }
 }
 

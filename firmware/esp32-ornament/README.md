@@ -1,13 +1,13 @@
 # ESP32-S3 Codex 桌面摆件固件
 
-这是 Codex 桌面摆件的 ESP-IDF 固件。固件运行在 ESP32-S3 上，驱动 360x360 圆形 ST77916 QSPI 屏幕，通过 Wi-Fi 轮询 PC 上的本地桥接服务，显示 Codex 额度、任务 hook 状态、时间日期和 Wi-Fi 信号。
+这是 Codex 桌面摆件的 ESP-IDF 固件。固件运行在 ESP32-S3 上，驱动 1.54 寸 240x240 ST7789 SPI 方屏，通过 Wi-Fi 轮询 PC 上的本地桥接服务，显示 Codex 额度、任务 hook 状态、时间日期和 Wi-Fi 信号。
 
 当前版本已经加入：
 
-- 屏幕内的软件 RGB 圆环，不需要外接 LED 灯环。
+- 屏幕内的软件 RGB 边框，不需要外接 LED 灯环。
 - SNTP 本地时钟小组件，显示 `HH:MM`、`MM-DD`、`WiFi -62dBm`。
 - 低额度告警：当前额度或周额度低于 `25%` 显示橙色，低于 `10%` 显示红色。
-- 任务完成后圆环闪烁约 `10 秒`，文字和额度条不闪烁。
+- 任务完成后边框闪烁约 `10 秒`，文字和额度条不闪烁。
 - 手机连接 ESP32 热点配网，自动扫描 Wi-Fi SSID，只需要选择 SSID 并填写密码。
 - 连接 Wi-Fi 后提供 ESP32 本地 Web 控制台，可查看状态 JSON、测试 Bridge URL、重启、清空配置。
 - 空闲一段时间后自动切换到待机时钟页，显示大号时间、日期、Wi-Fi 和额度摘要。
@@ -15,7 +15,7 @@
 
 ## 一句话流程
 
-1. 按本文接好 ESP32-S3 和 ST77916 QSPI 圆屏。
+1. 按本文接好 ESP32-S3 和 1.54 寸 ST7789 SPI 方屏。
 2. 烧录 `release/codex_ornament_merged.bin`。
 3. 在 PC 上启动 `codex-ornament-bridge`。
 4. 手机连接 ESP32 热点，打开 `http://192.168.4.1`，选择 Wi-Fi SSID，只填写密码和 PC 桥接地址。
@@ -24,7 +24,7 @@
 ## 目标硬件
 
 - 主控：ESP32-S3-N16R8，16 MB Flash，8 MB PSRAM。
-- 屏幕：1.5 寸 360x360 ST77916 TFT 圆屏，QSPI，16P FPC。
+- 屏幕：1.54 寸 240x240 ST7789 IPS TFT 方屏，SPI，8 针模块。
 - 逻辑电平：3.3 V。
 - 桥接服务：PC 局域网地址上的 `http://<PC-LAN-IP>:8787/state`。
 - 配网方式：ESP32 SoftAP 热点 + 手机浏览器。
@@ -34,30 +34,24 @@
 ### 接线前检查
 
 - ESP32-S3 和屏幕 IO 都按 3.3 V 连接，不要接 5 V 信号。
-- `VCC` 和 `IOVCC` 接 3V3，所有 `GND` 都要和 ESP32 共地。
+- `VCC` 接 3V3，所有 `GND` 都要和 ESP32 共地。
 - 背光电流通常不能由 GPIO 直接供电。`GPIO7` 只适合作为 MOSFET 控制信号。
 - 如果转接板已经集成背光限流和控制电路，优先按转接板丝印；否则按下面的 MOSFET 方案。
 
-### 屏幕 16P 引脚
+### 屏幕 8 针接口
 
-| FPC 引脚 | 符号 | 功能 | 接法 |
-| ---: | --- | --- | --- |
-| 1 | K | 背光阴极 | 建议接 N-MOS Drain；临时常亮可在确认限流后接 GND |
-| 2 | A | 背光阳极 | 3V3，必须确认屏幕或转接板有背光限流 |
-| 3 | GND | 电源地 | GND |
-| 4 | CS | 片选 | ESP32-S3 GPIO10 |
-| 5 | SCL | QSPI 时钟 | ESP32-S3 GPIO12 |
-| 6 | RESET | 显示复位 | ESP32-S3 GPIO8 |
-| 7 | IO3 | QSPI 数据 3 | ESP32-S3 GPIO15 |
-| 8 | IO2 | QSPI 数据 2 | ESP32-S3 GPIO14 |
-| 9 | IO1 | QSPI 数据 1 | ESP32-S3 GPIO13 |
-| 10 | IO0 | QSPI 数据 0 | ESP32-S3 GPIO11 |
-| 11 | TE | 帧同步 | 第一版不接 |
-| 12 | VCC | 屏幕电源 | 3V3 |
-| 13 | IOVCC | IO 电源 | 3V3 |
-| 14 | GND | 电源地 | GND |
-| 15 | GND | 电源地 | GND |
-| 16 | GND | 电源地 | GND |
+参考 `1.54-SPI原理图.pdf`，模块接口定义如下：
+
+| 模块引脚 | 功能 | 接法 |
+| --- | --- | --- |
+| GND | 电源地 | GND |
+| VCC | 3.3 V 电源 | 3V3 |
+| SCL | SPI 时钟 | ESP32-S3 GPIO12 |
+| SDA | SPI MOSI 数据 | ESP32-S3 GPIO11 |
+| RES | 显示复位 | ESP32-S3 GPIO8 |
+| DC | 数据/命令选择 | ESP32-S3 GPIO13 |
+| CS | SPI 片选，低有效 | ESP32-S3 GPIO10 |
+| BLK | 背光开关 | ESP32-S3 GPIO7 |
 
 ### 固件默认 GPIO
 
@@ -68,10 +62,8 @@
 | `CONFIG_ORNAMENT_LCD_PIN_SCLK` | GPIO12 | SCL |
 | `CONFIG_ORNAMENT_LCD_PIN_CS` | GPIO10 | CS |
 | `CONFIG_ORNAMENT_LCD_PIN_RST` | GPIO8 | RESET |
-| `CONFIG_ORNAMENT_LCD_PIN_MOSI` | GPIO11 | IO0 |
-| `CONFIG_ORNAMENT_LCD_PIN_MISO` | GPIO13 | IO1 |
-| `CONFIG_ORNAMENT_LCD_PIN_D2` | GPIO14 | IO2 |
-| `CONFIG_ORNAMENT_LCD_PIN_D3` | GPIO15 | IO3 |
+| `CONFIG_ORNAMENT_LCD_PIN_MOSI` | GPIO11 | SDA |
+| `CONFIG_ORNAMENT_LCD_PIN_DC` | GPIO13 | DC |
 | `CONFIG_ORNAMENT_LCD_PIN_BL` | GPIO7 | 背光控制 |
 
 ### 背光 MOSFET 接法
@@ -79,8 +71,8 @@
 推荐使用一个小信号 N-MOS 做低边开关：
 
 ```text
-屏幕 A       -> 3V3
-屏幕 K       -> N-MOS Drain
+屏幕 VCC     -> 3V3
+屏幕 BLK     -> N-MOS Drain
 N-MOS Source -> GND
 N-MOS Gate   -> ESP32-S3 GPIO7
 ESP32-S3 GND -> 屏幕 GND / MOSFET Source 共地
@@ -89,11 +81,11 @@ ESP32-S3 GND -> 屏幕 GND / MOSFET Source 共地
 如果没有 MOSFET，且转接板已经有背光限流，可以先让背光常亮：
 
 ```text
-屏幕 A -> 3V3
-屏幕 K -> GND
+屏幕 VCC -> 3V3
+屏幕 BLK -> 3V3
 ```
 
-不要把屏幕背光 `A` 或 `K` 直接接到 ESP32 GPIO 当作供电路径。
+不要把屏幕背光 `BLK` 直接接到 ESP32 GPIO 当作供电路径，除非确认模块背光控制脚只是逻辑输入且电流在 GPIO 规格内。
 
 ## 烧录固件
 
@@ -231,13 +223,13 @@ Invoke-RestMethod http://<ESP32-IP>/status
 - 标题下方：`HH:MM`、`MM-DD`、`WiFi -62dBm`；未校时时显示 `--:--`。
 - 中部：`CURRENT` 和 `WEEKLY` 两个额度面板。
 - 底部：`AGENT ACTIVE`、`TASK DONE`、`HOOK ERROR` 等状态；执行中 `AGENT ACTIVE` 前的小圆点会以 4Hz 呼吸闪烁。
-- 右侧弧形软件圆环：模拟 RGB 灯环，不需要真实灯环硬件。
+- 外围软件边框：模拟 RGB 灯环，不需要真实灯环硬件。
 - 待机时钟页：当 Bridge 返回 `idle` 持续默认 `120 秒` 后，自动切到大号时钟页面；一旦出现运行、完成、错误状态，就回到额度/状态页面。
 
 颜色优先级：
 
 1. `status=error`：红色最高优先级。
-2. 任务刚完成：圆环闪烁 10 秒。
+2. 任务刚完成：边框闪烁 10 秒。
 3. 当前额度或周额度低于 `10%`：红色告警。
 4. 当前额度或周额度低于 `25%`：橙色告警。
 5. 正常：青色。
@@ -254,7 +246,7 @@ Invoke-RestMethod http://<ESP32-IP>/status
 | `ORNAMENT_TIMEZONE` | `CST-8` | POSIX 时区，`CST-8` 表示 UTC+8 |
 | `ORNAMENT_QUOTA_WARN_PERCENT` | `25` | 低额度橙色阈值 |
 | `ORNAMENT_QUOTA_CRITICAL_PERCENT` | `10` | 严重低额度红色阈值 |
-| `ORNAMENT_DONE_FLASH_MS` | `10000` | 任务完成后圆环闪烁时长 |
+| `ORNAMENT_DONE_FLASH_MS` | `10000` | 任务完成后边框闪烁时长 |
 | `ORNAMENT_POLL_INTERVAL_MS` | `3000` | ESP32 轮询桥接服务间隔 |
 | `ORNAMENT_UI_FRAME_MS` | `250` | running/完成闪烁等本地 UI 动画刷新间隔 |
 | `ORNAMENT_STANDBY_CLOCK_MS` | `120000` | idle 后切到待机时钟页的等待时间，设为 `0` 可关闭 |
@@ -324,7 +316,7 @@ Invoke-RestMethod http://127.0.0.1:8787/state
 - `/hook/codex` 返回 `ok: true`。
 - `/state` 中 `status` 变成 `done`。
 - ESP32 屏幕底部显示 `TASK DONE`。
-- 软件圆环闪烁约 10 秒，文字和额度条保持稳定。
+- 软件边框闪烁约 10 秒，文字和额度条保持稳定。
 
 ### 4. 低额度告警
 
@@ -406,7 +398,7 @@ QUOTA xx%/xx%
 
 ## UI 预览
 
-预览工具使用和固件相同的 `display_core.c` 渲染核心，能在 PC 上生成圆屏 UI 图。
+预览工具使用和固件相同的 `display_core.c` 渲染核心，能在 PC 上生成 240x240 方屏 UI 图。
 
 生成预览：
 
@@ -419,12 +411,12 @@ python .\docs\render_ui_preview.py
 
 | 文件 | 场景 |
 | --- | --- |
-| `docs\large-ui-preview-normal.png` | 正常额度，青色圆环 |
+| `docs\large-ui-preview-normal.png` | 正常额度，青色边框 |
 | `docs\large-ui-preview-running-bright.png` | `AGENT ACTIVE` 小圆点亮帧 |
 | `docs\large-ui-preview-running-dim.png` | `AGENT ACTIVE` 小圆点暗帧 |
 | `docs\large-ui-preview-warn.png` | 额度低于 25%，橙色 |
 | `docs\large-ui-preview-critical.png` | 额度低于 10%，红色 |
-| `docs\large-ui-preview-done-flash.png` | 任务完成闪烁窗口，绿色圆环 |
+| `docs\large-ui-preview-done-flash.png` | 任务完成闪烁窗口，绿色边框 |
 | `docs\large-ui-preview-unsynced.png` | 未校时，显示 `--:--` |
 | `docs\large-ui-preview-clock.png` | 待机时钟页 |
 
@@ -460,7 +452,7 @@ ESP-IDF: v5.4.1
 target: esp32s3
 flash: 16MB
 PSRAM: Octal 80MHz
-display component: espressif/esp_lcd_st77916 2.0.2
+display driver: ESP-IDF built-in ST7789 SPI panel
 ```
 
 ## 构建故障处理
@@ -488,17 +480,17 @@ idf.py build
 ## 常见问题
 
 - 找不到串口：检查设备管理器串口号，换数据线，必要时按住 BOOT 再点 EN/RESET。
-- 屏幕不亮：先查 3V3/GND/背光 A/K，再查 SCL/CS/RESET/IO0-IO3。
+- 屏幕不亮：先查 3V3/GND/BLK，再查 SCL/SDA/CS/DC/RES。
 - 显示 `Bridge offline`：确认 PC 桥接服务运行、`Bridge State URL` 是 PC 局域网 IP、Windows 防火墙放行 `8787`。
 - 看不到配网热点：如果设备已经连上保存的 Wi-Fi，就不会停留在配置热点；需要重配时可先擦除 flash 后重烧。
 - 时间一直 `--:--`：确认 Wi-Fi 可访问公网 DNS/NTP，或把 `ORNAMENT_SNTP_SERVER` 改成局域网可访问的 NTP 服务器。
 
 ## 本版验证记录
 
-- `python .\docs\render_ui_preview.py`：通过，生成 6 类预览图。
+- `python .\docs\render_ui_preview.py`：通过，生成 8 类预览图。
 - `gcc -std=c11 -O2 -Wall -Wextra -Werror` 编译显示核心预览：通过。
 - `idf.py build`：通过。
 - `release\codex_ornament_merged.bin`：已重新合并，可从 `0x0` 单文件烧录。
 - `ESP32 本地 Web 控制台`、`Bridge URL 测试按钮`、`待机时钟页`：源码已实现并通过 `idf.py build`。
 
-硬件实机显示、触摸和电源稳定性仍需要在你的 ESP32-S3 + 圆屏实物上验证。
+硬件实机显示和电源稳定性仍需要在你的 ESP32-S3 + ST7789 方屏实物上验证。

@@ -6,8 +6,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define PREVIEW_WIDTH 360
-#define PREVIEW_HEIGHT 360
+#define PREVIEW_WIDTH 240
+#define PREVIEW_HEIGHT 240
 
 static void set_text(char *dst, size_t dst_size, const char *src)
 {

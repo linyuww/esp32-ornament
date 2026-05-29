@@ -176,10 +176,10 @@ config ORNAMENT_STANDBY_CLOCK_MS
 
 config ORNAMENT_DISPLAY_DRIVER
     string "Display driver variant"
-    default "st77916_qspi"
+    default "st7789_spi"
     help
-        Purchased screen is a 1.5 inch 360x360 ST77916 QSPI 16P round TFT.
-        Use st77916_qspi by default.
+        Display module driver. The current target is a 1.54 inch 240x240
+        ST7789 SPI square TFT module.
 
 config ORNAMENT_LCD_SPI_HOST
     int "LCD SPI host"
@@ -189,15 +189,15 @@ config ORNAMENT_LCD_SPI_HOST
 
 config ORNAMENT_LCD_H_RES
     int "LCD horizontal resolution"
-    default 360
+    default 240
 
 config ORNAMENT_LCD_V_RES
     int "LCD vertical resolution"
-    default 360
+    default 240
 
 config ORNAMENT_LCD_PIXEL_CLOCK_HZ
     int "LCD pixel clock Hz"
-    default 40000000
+    default 20000000
 
 config ORNAMENT_LCD_PIN_SCLK
     int "LCD SCLK GPIO"
@@ -209,15 +209,15 @@ config ORNAMENT_LCD_PIN_MOSI
 
 config ORNAMENT_LCD_PIN_MISO
     int "LCD IO1 GPIO for QSPI"
-    default 13
+    default -1
 
 config ORNAMENT_LCD_PIN_D2
     int "LCD IO2 GPIO for QSPI"
-    default 14
+    default -1
 
 config ORNAMENT_LCD_PIN_D3
     int "LCD IO3 GPIO for QSPI"
-    default 15
+    default -1
 
 config ORNAMENT_LCD_PIN_CS
     int "LCD CS GPIO"
@@ -225,9 +225,9 @@ config ORNAMENT_LCD_PIN_CS
 
 config ORNAMENT_LCD_PIN_DC
     int "LCD DC GPIO for SPI"
-    default -1
+    default 13
     help
-        Not used by the purchased QSPI panel.
+        1.54 inch ST7789 SPI module DC pin.
 
 config ORNAMENT_LCD_PIN_RST
     int "LCD RST GPIO"

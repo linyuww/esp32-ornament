@@ -8,7 +8,7 @@
 #include "esp_heap_caps.h"
 #include "esp_lcd_io_spi.h"
 #include "esp_lcd_panel_ops.h"
-#include "esp_lcd_st77916.h"
+#include "esp_lcd_panel_st7789.h"
 #include "esp_log.h"
 
 #include <stdbool.h>
@@ -24,80 +24,42 @@ static display_core_canvas_t canvas;
 static uint16_t *flush_buffers[2];
 static int flush_lines;
 
-static esp_err_t display_init_spi(void)
+static esp_err_t display_init_st7789_spi(void)
 {
-    const spi_bus_config_t bus_config = ST77916_PANEL_BUS_SPI_CONFIG(
-        CONFIG_ORNAMENT_LCD_PIN_SCLK,
-        CONFIG_ORNAMENT_LCD_PIN_MOSI,
-        CONFIG_ORNAMENT_LCD_H_RES * 80 * sizeof(uint16_t));
+    const spi_bus_config_t bus_config = {
+        .sclk_io_num = CONFIG_ORNAMENT_LCD_PIN_SCLK,
+        .mosi_io_num = CONFIG_ORNAMENT_LCD_PIN_MOSI,
+        .miso_io_num = -1,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = CONFIG_ORNAMENT_LCD_H_RES * 80 * sizeof(uint16_t),
+    };
     ESP_RETURN_ON_ERROR(
         spi_bus_initialize(CONFIG_ORNAMENT_LCD_SPI_HOST, &bus_config, SPI_DMA_CH_AUTO),
         TAG,
         "spi_bus_initialize failed");
 
     esp_lcd_panel_io_handle_t io_handle = NULL;
-    esp_lcd_panel_io_spi_config_t io_config = ST77916_PANEL_IO_SPI_CONFIG(
-        CONFIG_ORNAMENT_LCD_PIN_CS,
-        CONFIG_ORNAMENT_LCD_PIN_DC,
-        NULL,
-        NULL);
-    io_config.pclk_hz = CONFIG_ORNAMENT_LCD_PIXEL_CLOCK_HZ;
+    const esp_lcd_panel_io_spi_config_t io_config = {
+        .cs_gpio_num = CONFIG_ORNAMENT_LCD_PIN_CS,
+        .dc_gpio_num = CONFIG_ORNAMENT_LCD_PIN_DC,
+        .spi_mode = 0,
+        .pclk_hz = CONFIG_ORNAMENT_LCD_PIXEL_CLOCK_HZ,
+        .trans_queue_depth = 10,
+        .lcd_cmd_bits = 8,
+        .lcd_param_bits = 8,
+    };
     ESP_RETURN_ON_ERROR(
         esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)CONFIG_ORNAMENT_LCD_SPI_HOST, &io_config, &io_handle),
         TAG,
         "esp_lcd_new_panel_io_spi failed");
 
-    st77916_vendor_config_t vendor_config = {
-        .flags = {
-            .use_qspi_interface = 0,
-        },
-    };
     const esp_lcd_panel_dev_config_t panel_config = {
         .reset_gpio_num = CONFIG_ORNAMENT_LCD_PIN_RST,
         .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB,
         .bits_per_pixel = 16,
-        .vendor_config = &vendor_config,
     };
-    return esp_lcd_new_panel_st77916(io_handle, &panel_config, &panel_handle);
-}
-
-static esp_err_t display_init_qspi(void)
-{
-    const spi_bus_config_t bus_config = ST77916_PANEL_BUS_QSPI_CONFIG(
-        CONFIG_ORNAMENT_LCD_PIN_SCLK,
-        CONFIG_ORNAMENT_LCD_PIN_MOSI,
-        CONFIG_ORNAMENT_LCD_PIN_MISO,
-        CONFIG_ORNAMENT_LCD_PIN_D2,
-        CONFIG_ORNAMENT_LCD_PIN_D3,
-        CONFIG_ORNAMENT_LCD_H_RES * 80 * sizeof(uint16_t));
-    ESP_RETURN_ON_ERROR(
-        spi_bus_initialize(CONFIG_ORNAMENT_LCD_SPI_HOST, &bus_config, SPI_DMA_CH_AUTO),
-        TAG,
-        "qspi bus init failed");
-
-    esp_lcd_panel_io_handle_t io_handle = NULL;
-    esp_lcd_panel_io_spi_config_t io_config = ST77916_PANEL_IO_QSPI_CONFIG(
-        CONFIG_ORNAMENT_LCD_PIN_CS,
-        NULL,
-        NULL);
-    io_config.pclk_hz = CONFIG_ORNAMENT_LCD_PIXEL_CLOCK_HZ;
-    ESP_RETURN_ON_ERROR(
-        esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)CONFIG_ORNAMENT_LCD_SPI_HOST, &io_config, &io_handle),
-        TAG,
-        "esp_lcd_new_panel_io_spi qspi failed");
-
-    st77916_vendor_config_t vendor_config = {
-        .flags = {
-            .use_qspi_interface = 1,
-        },
-    };
-    const esp_lcd_panel_dev_config_t panel_config = {
-        .reset_gpio_num = CONFIG_ORNAMENT_LCD_PIN_RST,
-        .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB,
-        .bits_per_pixel = 16,
-        .vendor_config = &vendor_config,
-    };
-    return esp_lcd_new_panel_st77916(io_handle, &panel_config, &panel_handle);
+    return esp_lcd_new_panel_st7789(io_handle, &panel_config, &panel_handle);
 }
 
 static void display_set_backlight(bool enabled)
@@ -177,8 +139,13 @@ static esp_err_t flush_canvas(void)
             lines = canvas.height - y;
         }
 
-        size_t bytes = (size_t)canvas.width * (size_t)lines * sizeof(uint16_t);
-        memcpy(flush_buffers[buffer_index], &canvas.pixels[(size_t)y * canvas.width], bytes);
+        size_t pixel_count = (size_t)canvas.width * (size_t)lines;
+        const uint16_t *src = &canvas.pixels[(size_t)y * canvas.width];
+        uint16_t *dst = flush_buffers[buffer_index];
+        for (size_t i = 0; i < pixel_count; i++) {
+            uint16_t pixel = src[i];
+            dst[i] = (uint16_t)((pixel << 8) | (pixel >> 8));
+        }
 
         esp_err_t err = esp_lcd_panel_draw_bitmap(
             panel_handle,
@@ -248,12 +215,10 @@ static void render_error_message(const char *message)
 
 void display_init(void)
 {
-    ESP_LOGI(TAG, "initializing ST77916 display");
+    ESP_LOGI(TAG, "initializing ST7789 SPI display");
     display_set_backlight(false);
 
-    esp_err_t err = strcmp(CONFIG_ORNAMENT_DISPLAY_DRIVER, "st77916_qspi") == 0
-                        ? display_init_qspi()
-                        : display_init_spi();
+    esp_err_t err = display_init_st7789_spi();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "display init failed: %s", esp_err_to_name(err));
         return;
@@ -261,6 +226,7 @@ void display_init(void)
 
     ESP_ERROR_CHECK(esp_lcd_panel_reset(panel_handle));
     ESP_ERROR_CHECK(esp_lcd_panel_init(panel_handle));
+    ESP_ERROR_CHECK(esp_lcd_panel_invert_color(panel_handle, true));
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel_handle, true));
     ESP_ERROR_CHECK(esp_lcd_panel_mirror(panel_handle, false, false));
     display_set_backlight(true);
