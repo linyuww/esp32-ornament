@@ -24,6 +24,7 @@ const TASK_EVENT_QUEUE_CAPACITY: usize = 64;
 const QUOTA_CACHE_TTL: Duration = Duration::from_secs(60);
 const RECONCILED_DONE_NOTIFY_WINDOW: Duration = Duration::from_secs(120);
 const COMBINED_DONE_SOURCE_WINDOW: Duration = Duration::from_secs(5);
+const DISCOVERY_MAGIC: &str = "codex-ornament-discover-v1";
 
 type SharedBridgeState = Arc<Mutex<BridgeState>>;
 type TaskEventSender = SyncSender<QueuedTaskEvent>;
@@ -199,6 +200,7 @@ fn run() -> io::Result<()> {
     let state = Arc::new(Mutex::new(BridgeState::default()));
     let (task_events, task_event_receiver) = mpsc::sync_channel(TASK_EVENT_QUEUE_CAPACITY);
     spawn_task_event_consumer(Arc::clone(&state), config.clone(), task_event_receiver);
+    spawn_discovery_responder(config.clone());
 
     eprintln!("codex ornament bridge listening on http://{}", config.bind);
     for stream in listener.incoming() {
@@ -310,6 +312,38 @@ fn spawn_task_event_consumer(
     receiver: TaskEventReceiver,
 ) {
     std::thread::spawn(move || consume_task_events(state, config, receiver));
+}
+
+fn spawn_discovery_responder(config: BridgeConfig) {
+    std::thread::spawn(move || {
+        if let Err(error) = run_discovery_responder(config) {
+            eprintln!("discovery responder failed: {error}");
+        }
+    });
+}
+
+fn run_discovery_responder(config: BridgeConfig) -> io::Result<()> {
+    let port = bind_port(&config.bind).unwrap_or(8787);
+    let socket = UdpSocket::bind(("0.0.0.0", port))?;
+    socket.set_broadcast(true)?;
+    eprintln!("codex ornament discovery listening on udp://0.0.0.0:{port}");
+
+    let mut buffer = [0_u8; 256];
+    loop {
+        let (length, peer) = socket.recv_from(&mut buffer)?;
+        let request = String::from_utf8_lossy(&buffer[..length]);
+        if request.trim() != DISCOVERY_MAGIC {
+            continue;
+        }
+
+        let Ok(info) = discover_info_for_peer(&config, peer) else {
+            continue;
+        };
+        let Ok(response) = serde_json::to_vec(&info) else {
+            continue;
+        };
+        let _ = socket.send_to(&response, peer);
+    }
 }
 
 fn consume_task_events(
@@ -912,14 +946,34 @@ fn discover_info(config: &BridgeConfig) -> io::Result<DiscoveryInfo> {
     })
 }
 
+fn discover_info_for_peer(config: &BridgeConfig, peer: SocketAddr) -> io::Result<DiscoveryInfo> {
+    let port = bind_port(&config.bind).unwrap_or(8787);
+    let local_ip = match peer.ip() {
+        IpAddr::V4(ip) if !ip.is_loopback() => local_lan_ip_for_peer(IpAddr::V4(ip)),
+        _ => local_lan_ip(),
+    }
+    .unwrap_or_else(|| "127.0.0.1".to_string());
+
+    Ok(DiscoveryInfo {
+        service: "codex-ornament-bridge",
+        local_ip: local_ip.clone(),
+        state_url: format!("http://{local_ip}:{port}/state"),
+        health_url: format!("http://{local_ip}:{port}/health"),
+    })
+}
+
 fn bind_port(bind: &str) -> Option<u16> {
     bind.rsplit_once(':')
         .and_then(|(_, port)| port.parse::<u16>().ok())
 }
 
 fn local_lan_ip() -> Option<String> {
+    local_lan_ip_for_peer("8.8.8.8:80".parse::<SocketAddr>().ok()?.ip())
+}
+
+fn local_lan_ip_for_peer(peer: IpAddr) -> Option<String> {
     let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
-    socket.connect("8.8.8.8:80").ok()?;
+    socket.connect(SocketAddr::new(peer, 80)).ok()?;
     let ip = socket.local_addr().ok()?.ip();
     match ip {
         IpAddr::V4(ip) if !ip.is_loopback() && !ip.is_unspecified() => Some(ip.to_string()),
@@ -1372,6 +1426,21 @@ mod tests {
             &request,
             &test_config(Some("secret-token"))
         ));
+    }
+
+    #[test]
+    fn discovery_info_for_lan_peer_uses_bridge_port() {
+        let mut config = test_config(None);
+        config.bind = "0.0.0.0:9876".to_string();
+        let peer = "192.168.1.44:50000".parse::<SocketAddr>().unwrap();
+
+        let info = discover_info_for_peer(&config, peer).unwrap();
+
+        assert_eq!(info.service, "codex-ornament-bridge");
+        assert!(info.state_url.starts_with("http://"));
+        assert!(info.state_url.ends_with(":9876/state"));
+        assert!(info.health_url.ends_with(":9876/health"));
+        assert!(!info.local_ip.is_empty());
     }
 
     #[test]

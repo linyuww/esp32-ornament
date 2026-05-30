@@ -6,6 +6,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
+#include "settings.h"
 
 #include <stdint.h>
 #include <string.h>
@@ -23,10 +24,11 @@ static const char *TAG = "task_audio";
 
 static i2s_chan_handle_t s_tx_chan;
 static QueueHandle_t s_play_queue;
+static int s_play_volume_percent = CONFIG_ORNAMENT_AUDIO_VOLUME_PERCENT;
 
 static int16_t apply_volume(int16_t sample)
 {
-    int32_t scaled = ((int32_t)sample * CONFIG_ORNAMENT_AUDIO_VOLUME_PERCENT) / 100;
+    int32_t scaled = ((int32_t)sample * s_play_volume_percent) / 100;
     if (scaled > INT16_MAX) {
         return INT16_MAX;
     }
@@ -74,11 +76,23 @@ static esp_err_t write_stereo_frames(const int16_t *mono_samples, size_t frame_c
 
 static void play_task_done_audio(void)
 {
+    ornament_settings_t settings;
+    if (settings_load(&settings) == ESP_OK) {
+        s_play_volume_percent = settings_audio_volume_percent_or_default(&settings);
+    } else {
+        s_play_volume_percent = CONFIG_ORNAMENT_AUDIO_VOLUME_PERCENT;
+    }
+
     const size_t pcm_bytes = (size_t)(task_done_pcm_end - task_done_pcm_start);
     const size_t sample_count = pcm_bytes / sizeof(int16_t);
     const int16_t *samples = (const int16_t *)task_done_pcm_start;
 
-    ESP_LOGI(TAG, "playing task done voice: %u bytes, %u samples", (unsigned)pcm_bytes, (unsigned)sample_count);
+    ESP_LOGI(
+        TAG,
+        "playing task done voice: %u bytes, %u samples, volume=%d%%",
+        (unsigned)pcm_bytes,
+        (unsigned)sample_count,
+        s_play_volume_percent);
 
     esp_err_t err = i2s_channel_enable(s_tx_chan);
     if (err != ESP_OK) {

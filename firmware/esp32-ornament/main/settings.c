@@ -8,6 +8,7 @@ static const char *NVS_NAMESPACE = "ornament";
 static const char *KEY_SSID = "ssid";
 static const char *KEY_PASSWORD = "password";
 static const char *KEY_BRIDGE_URL = "bridge_url";
+static const char *KEY_AUDIO_VOLUME = "audio_volume";
 
 static void load_default_settings(ornament_settings_t *settings)
 {
@@ -15,6 +16,7 @@ static void load_default_settings(ornament_settings_t *settings)
     strlcpy(settings->ssid, CONFIG_ORNAMENT_WIFI_SSID, sizeof(settings->ssid));
     strlcpy(settings->password, CONFIG_ORNAMENT_WIFI_PASSWORD, sizeof(settings->password));
     strlcpy(settings->bridge_url, CONFIG_ORNAMENT_BRIDGE_URL, sizeof(settings->bridge_url));
+    settings->audio_volume_percent = CONFIG_ORNAMENT_AUDIO_VOLUME_PERCENT;
     settings->has_wifi = settings->ssid[0] != '\0';
     settings->has_bridge_url = settings->bridge_url[0] != '\0';
 }
@@ -44,9 +46,11 @@ esp_err_t settings_load(ornament_settings_t *settings)
     char ssid[sizeof(settings->ssid)] = {0};
     char password[sizeof(settings->password)] = {0};
     char bridge_url[sizeof(settings->bridge_url)] = {0};
+    int32_t audio_volume_percent = settings->audio_volume_percent;
     read_nvs_string(handle, KEY_SSID, ssid, sizeof(ssid));
     read_nvs_string(handle, KEY_PASSWORD, password, sizeof(password));
     read_nvs_string(handle, KEY_BRIDGE_URL, bridge_url, sizeof(bridge_url));
+    (void)nvs_get_i32(handle, KEY_AUDIO_VOLUME, &audio_volume_percent);
     nvs_close(handle);
 
     if (ssid[0] != '\0') {
@@ -57,6 +61,9 @@ esp_err_t settings_load(ornament_settings_t *settings)
     if (bridge_url[0] != '\0') {
         strlcpy(settings->bridge_url, bridge_url, sizeof(settings->bridge_url));
         settings->has_bridge_url = true;
+    }
+    if (audio_volume_percent >= 0 && audio_volume_percent <= 100) {
+        settings->audio_volume_percent = (int)audio_volume_percent;
     }
 
     return ESP_OK;
@@ -76,6 +83,9 @@ esp_err_t settings_save(const ornament_settings_t *settings)
     }
     if (err == ESP_OK) {
         err = nvs_set_str(handle, KEY_BRIDGE_URL, settings_bridge_url_or_default(settings));
+    }
+    if (err == ESP_OK) {
+        err = nvs_set_i32(handle, KEY_AUDIO_VOLUME, settings_audio_volume_percent_or_default(settings));
     }
     if (err == ESP_OK) {
         err = nvs_commit(handle);
@@ -106,4 +116,12 @@ const char *settings_bridge_url_or_default(const ornament_settings_t *settings)
         return settings->bridge_url;
     }
     return CONFIG_ORNAMENT_BRIDGE_URL;
+}
+
+int settings_audio_volume_percent_or_default(const ornament_settings_t *settings)
+{
+    if (settings != NULL && settings->audio_volume_percent >= 0 && settings->audio_volume_percent <= 100) {
+        return settings->audio_volume_percent;
+    }
+    return CONFIG_ORNAMENT_AUDIO_VOLUME_PERCENT;
 }

@@ -12,6 +12,21 @@ config ORNAMENT_BRIDGE_URL
     string "Bridge state URL"
     default "http://192.168.1.100:8787/state"
 
+config ORNAMENT_BRIDGE_AUTO_MATCH_ON_BOOT
+    bool "Auto-match bridge URL on boot"
+    default y
+    help
+        After Wi-Fi connects, the ornament broadcasts a local discovery
+        request and verifies the bridge /state endpoint. A discovered bridge
+        URL is saved to NVS so PC IP changes do not require manual setup.
+
+config ORNAMENT_BRIDGE_AUTO_MATCH_RETRY_MS
+    int "Bridge auto-match retry interval in milliseconds"
+    default 30000
+    range 5000 600000
+    help
+        When bridge polling fails, retry automatic discovery at this cadence.
+
 config ORNAMENT_CONNECT_TIMEOUT_MS
     int "Wi-Fi connect timeout in milliseconds"
     default 60000
@@ -165,7 +180,6 @@ config ORNAMENT_AUDIO_VOLUME_PERCENT
     int "Task done voice volume percent"
     default 70
     range 0 100
-    depends on ORNAMENT_AUDIO_ENABLED
 
 config ORNAMENT_STANDBY_CLOCK_MS
     int "Switch to standby clock page after idle milliseconds"

@@ -62,6 +62,31 @@ static bool is_new_done_event(const ornament_state_t *state, bool have_seen_stat
     return state->done_seq > last_done_seq;
 }
 
+static bool auto_match_bridge(bool verify_current, const char *reason)
+{
+    bridge_auto_match_result_t result;
+    esp_err_t err = bridge_client_auto_match(verify_current, &result);
+    if (err == ESP_OK) {
+        ESP_LOGI(
+            TAG,
+            "bridge auto-match ok: source=%s url=%s saved=%s tested=%d reason=%s",
+            result.source,
+            result.bridge_url,
+            result.saved ? "yes" : "no",
+            result.tested_count,
+            reason);
+        return true;
+    }
+
+    ESP_LOGW(
+        TAG,
+        "bridge auto-match failed: err=%s tested=%d reason=%s",
+        esp_err_to_name(err),
+        result.tested_count,
+        reason);
+    return false;
+}
+
 static void poll_task(void *arg)
 {
     ornament_state_t state;
@@ -74,6 +99,7 @@ static void poll_task(void *arg)
     bool have_state = false;
     bool have_seen_state = false;
     bool last_render_was_error = false;
+    TickType_t next_auto_match = 0;
 
     while (true) {
         TickType_t now = xTaskGetTickCount();
@@ -113,6 +139,16 @@ static void poll_task(void *arg)
                 render_now = true;
             } else {
                 ESP_LOGW(TAG, "failed to fetch bridge state: %s", esp_err_to_name(err));
+                if (now >= next_auto_match) {
+                    next_auto_match = now + pdMS_TO_TICKS(CONFIG_ORNAMENT_BRIDGE_AUTO_MATCH_RETRY_MS);
+                    if (auto_match_bridge(false, "poll failure")) {
+                        next_bridge_poll = now;
+                        last_render_was_error = false;
+                        vTaskDelay(pdMS_TO_TICKS(200));
+                        continue;
+                    }
+                }
+
                 idle_since_tick = 0;
                 previous_status = ORNAMENT_STATUS_ERROR;
                 ornament_state_t error_state;
@@ -163,6 +199,16 @@ void app_main(void)
         }
     }
     display_render_status("Wi-Fi connected");
+    if (CONFIG_ORNAMENT_BRIDGE_AUTO_MATCH_ON_BOOT) {
+        display_render_status("Matching bridge...");
+        if (auto_match_bridge(true, "boot")) {
+            display_render_status("Bridge matched");
+        } else {
+            display_render_status("Bridge search failed");
+        }
+        vTaskDelay(pdMS_TO_TICKS(600));
+    }
+
     esp_err_t asrpro_err = asrpro_link_init();
     if (asrpro_err != ESP_OK) {
         ESP_LOGW(TAG, "ASRPRO done reminder unavailable: %s", esp_err_to_name(asrpro_err));

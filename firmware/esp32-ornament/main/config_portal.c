@@ -164,7 +164,7 @@ static char *render_config_form(void)
         "</style></head>"
         "<body><main>"
         "<h1>Codex Ornament Setup</h1>"
-        "<p>Choose your Wi-Fi, enter its password, and set the PC bridge state URL. Use Test to connect once and verify the bridge before saving.</p>"
+        "<p>Choose your Wi-Fi and enter its password. Bridge URL is optional; the ornament auto-matches the PC bridge after Wi-Fi connects.</p>"
         "<form method=\"post\" action=\"/save\">");
 
     if (count > 0) {
@@ -198,7 +198,7 @@ static char *render_config_form(void)
         html_size,
         &used,
         "<label>Wi-Fi Password</label><input name=\"password\" maxlength=\"64\" type=\"password\">"
-        "<label>Bridge State URL</label><input name=\"bridge_url\" maxlength=\"159\" value=\"http://192.168.1.100:8787/state\" required>"
+        "<label>Bridge State URL</label><input name=\"bridge_url\" maxlength=\"159\" value=\"\" placeholder=\"Auto match after Wi-Fi connects\">"
         "<button type=\"submit\">Save and restart</button>"
         "<button type=\"submit\" formaction=\"/test-bridge\">Test Wi-Fi and Bridge URL</button>"
         "</form>"
@@ -315,8 +315,8 @@ static esp_err_t save_post_handler(httpd_req_t *req)
     settings.has_wifi = settings.ssid[0] != '\0';
     settings.has_bridge_url = settings.bridge_url[0] != '\0';
 
-    if (!settings.has_wifi || !settings.has_bridge_url) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "SSID and bridge URL are required");
+    if (!settings.has_wifi) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "SSID is required");
         return ESP_FAIL;
     }
 
@@ -397,7 +397,16 @@ static esp_err_t test_bridge_post_handler(httpd_req_t *req)
 
     esp_err_t wifi_err = connect_sta_for_probe(ssid, password, CONFIG_ORNAMENT_CONNECT_TIMEOUT_MS);
     bridge_probe_result_t result = {0};
-    esp_err_t bridge_err = wifi_err == ESP_OK ? bridge_client_probe_url(url, &result) : wifi_err;
+    bridge_auto_match_result_t auto_match = {0};
+    esp_err_t bridge_err = wifi_err;
+    if (wifi_err == ESP_OK) {
+        if (url[0] != '\0') {
+            bridge_err = bridge_client_probe_url(url, &result);
+        } else {
+            bridge_err = bridge_client_auto_match(false, &auto_match);
+            strlcpy(url, auto_match.bridge_url, sizeof(url));
+        }
+    }
 
     char escaped[ORNAMENT_BRIDGE_URL_MAX * 2] = {0};
     html_escape(url, escaped, sizeof(escaped));
@@ -408,7 +417,7 @@ static esp_err_t test_bridge_post_handler(httpd_req_t *req)
         "<!doctype html><html><head><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
         "<style>body{font-family:system-ui;margin:24px;background:#101418;color:#eef3f8}a{color:#4fb477}code{word-break:break-all}</style>"
         "</head><body><h1>Bridge Test</h1><p><code>%s</code></p>"
-        "<p>Wi-Fi: %s</p><p>Bridge: %s</p><p>HTTP: %d, bytes: %d, JSON: %s, status: %s</p>"
+        "<p>Wi-Fi: %s</p><p>Bridge: %s</p><p>HTTP: %d, bytes: %d, JSON: %s, status: %s, auto source: %s, tested: %d</p>"
         "<p>If Wi-Fi is ok but Bridge fails, check that the URL uses the PC LAN IP and Windows firewall allows port 8787.</p>"
         "<p><a href=\"/\">Back</a></p></body></html>",
         escaped,
@@ -417,7 +426,9 @@ static esp_err_t test_bridge_post_handler(httpd_req_t *req)
         result.http_status,
         result.response_bytes,
         result.json_ok ? "ok" : "invalid",
-        result.status_text);
+        result.status_text,
+        auto_match.source,
+        auto_match.tested_count);
 
     httpd_resp_set_type(req, "text/html; charset=utf-8");
     return httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);

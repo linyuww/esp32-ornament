@@ -5,6 +5,8 @@
 #include "esp_http_client.h"
 #include "esp_log.h"
 #include "settings.h"
+#include "lwip/inet.h"
+#include "lwip/sockets.h"
 
 #include <limits.h>
 #include <stdlib.h>
@@ -12,6 +14,11 @@
 
 static const char *TAG = "bridge_client";
 static const int MAX_RESPONSE_BYTES = 8192;
+static const int DISCOVERY_UDP_PORT = 8787;
+static const char *DISCOVERY_MAGIC = "codex-ornament-discover-v1";
+static const int DISCOVERY_TIMEOUT_MS = 1200;
+static const int BRIDGE_PROBE_TIMEOUT_MS = 900;
+static const int SUBNET_PROBE_RADIUS = 8;
 
 typedef struct {
     char *data;
@@ -65,6 +72,31 @@ static int json_nonnegative_int(cJSON *parent, const char *name)
     return 0;
 }
 
+static void result_set_error(bridge_auto_match_result_t *result, esp_err_t err)
+{
+    if (result != NULL) {
+        result->last_error = err;
+    }
+}
+
+static void result_set_success(
+    bridge_auto_match_result_t *result,
+    const char *url,
+    const char *source,
+    bool current_ok,
+    bool saved)
+{
+    if (result == NULL) {
+        return;
+    }
+
+    result->last_error = ESP_OK;
+    result->current_ok = current_ok;
+    result->saved = saved;
+    strlcpy(result->bridge_url, url, sizeof(result->bridge_url));
+    strlcpy(result->source, source, sizeof(result->source));
+}
+
 static void parse_source_task(
     cJSON *source_tasks,
     const char *name,
@@ -76,7 +108,11 @@ static void parse_source_task(
     char *title,
     size_t title_size,
     char *message,
-    size_t message_size)
+    size_t message_size,
+    char *session_id,
+    size_t session_id_size,
+    char *turn_id,
+    size_t turn_id_size)
 {
     cJSON *summary = cJSON_GetObjectItemCaseSensitive(source_tasks, name);
     if (!cJSON_IsObject(summary)) {
@@ -95,6 +131,8 @@ static void parse_source_task(
         *has_task = true;
         copy_json_string(task, "title", title, title_size);
         copy_json_string(task, "message", message, message_size);
+        copy_json_string(task, "sessionId", session_id, session_id_size);
+        copy_json_string(task, "turnId", turn_id, turn_id_size);
     }
 }
 
@@ -117,6 +155,8 @@ static esp_err_t parse_state_json(const char *json_text, ornament_state_t *state
         copy_json_string(task, "title", state->task_title, sizeof(state->task_title));
         copy_json_string(task, "message", state->task_message, sizeof(state->task_message));
         copy_json_string(task, "receivedAt", state->task_received_at, sizeof(state->task_received_at));
+        copy_json_string(task, "sessionId", state->task_session_id, sizeof(state->task_session_id));
+        copy_json_string(task, "turnId", state->task_turn_id, sizeof(state->task_turn_id));
     }
 
     cJSON *source_tasks = cJSON_GetObjectItemCaseSensitive(root, "sourceTasks");
@@ -132,7 +172,11 @@ static esp_err_t parse_state_json(const char *json_text, ornament_state_t *state
             state->codex_task_title,
             sizeof(state->codex_task_title),
             state->codex_task_message,
-            sizeof(state->codex_task_message));
+            sizeof(state->codex_task_message),
+            state->codex_task_session_id,
+            sizeof(state->codex_task_session_id),
+            state->codex_task_turn_id,
+            sizeof(state->codex_task_turn_id));
         parse_source_task(
             source_tasks,
             "claude",
@@ -144,7 +188,11 @@ static esp_err_t parse_state_json(const char *json_text, ornament_state_t *state
             state->claude_task_title,
             sizeof(state->claude_task_title),
             state->claude_task_message,
-            sizeof(state->claude_task_message));
+            sizeof(state->claude_task_message),
+            state->claude_task_session_id,
+            sizeof(state->claude_task_session_id),
+            state->claude_task_turn_id,
+            sizeof(state->claude_task_turn_id));
     }
 
     cJSON *quota = cJSON_GetObjectItemCaseSensitive(root, "quota");
@@ -200,6 +248,202 @@ static esp_err_t fetch_url_raw(const char *url, char *response, int response_cap
     return err;
 }
 
+static esp_err_t save_bridge_url(const char *url)
+{
+    if (url == NULL || url[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    ornament_settings_t settings;
+    ESP_RETURN_ON_ERROR(settings_load(&settings), TAG, "settings load failed before bridge save");
+    strlcpy(settings.bridge_url, url, sizeof(settings.bridge_url));
+    settings.has_bridge_url = true;
+    return settings_save(&settings);
+}
+
+static bool bridge_url_is_config_default(const char *url)
+{
+    return url != NULL && strcmp(url, CONFIG_ORNAMENT_BRIDGE_URL) == 0;
+}
+
+static esp_err_t probe_and_maybe_save(
+    const char *url,
+    const char *source,
+    bool save,
+    bridge_auto_match_result_t *result)
+{
+    if (url == NULL || url[0] == '\0') {
+        result_set_error(result, ESP_ERR_INVALID_ARG);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (result != NULL) {
+        result->tested_count++;
+    }
+
+    bridge_probe_result_t probe;
+    esp_err_t err = bridge_client_probe_url(url, &probe);
+    if (err != ESP_OK) {
+        result_set_error(result, err);
+        return err;
+    }
+
+    if (save) {
+        err = save_bridge_url(url);
+        if (err != ESP_OK) {
+            result_set_error(result, err);
+            return err;
+        }
+    }
+
+    result_set_success(result, url, source, !save, save);
+    return ESP_OK;
+}
+
+static esp_err_t parse_discovery_response(const char *response, char *url, size_t url_size)
+{
+    cJSON *root = cJSON_Parse(response);
+    if (root == NULL) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    char service[40] = {0};
+    copy_json_string(root, "service", service, sizeof(service));
+    copy_json_string(root, "stateUrl", url, url_size);
+    cJSON_Delete(root);
+
+    if (strcmp(service, "codex-ornament-bridge") != 0 || url == NULL || url[0] == '\0') {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    return ESP_OK;
+}
+
+static esp_err_t discover_bridge_url(char *url, size_t url_size)
+{
+    if (url == NULL || url_size == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    url[0] = '\0';
+
+    int fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+    if (fd < 0) {
+        return ESP_FAIL;
+    }
+
+    int broadcast = 1;
+    (void)setsockopt(fd, SOL_SOCKET, SO_BROADCAST, &broadcast, sizeof(broadcast));
+
+    struct timeval timeout = {
+        .tv_sec = DISCOVERY_TIMEOUT_MS / 1000,
+        .tv_usec = (DISCOVERY_TIMEOUT_MS % 1000) * 1000,
+    };
+    (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+
+    struct sockaddr_in destination = {0};
+    destination.sin_family = AF_INET;
+    destination.sin_port = htons(DISCOVERY_UDP_PORT);
+    destination.sin_addr.s_addr = htonl(INADDR_BROADCAST);
+
+    ssize_t sent = sendto(
+        fd,
+        DISCOVERY_MAGIC,
+        strlen(DISCOVERY_MAGIC),
+        0,
+        (const struct sockaddr *)&destination,
+        sizeof(destination));
+    if (sent < 0) {
+        close(fd);
+        return ESP_FAIL;
+    }
+
+    char response[256] = {0};
+    struct sockaddr_in source = {0};
+    socklen_t source_len = sizeof(source);
+    ssize_t received = recvfrom(fd, response, sizeof(response) - 1, 0, (struct sockaddr *)&source, &source_len);
+    close(fd);
+
+    if (received <= 0) {
+        return ESP_ERR_TIMEOUT;
+    }
+    response[received] = '\0';
+    return parse_discovery_response(response, url, url_size);
+}
+
+static bool parse_bridge_ipv4(const char *url, uint8_t octets[4], uint16_t *port)
+{
+    int a = 0;
+    int b = 0;
+    int c = 0;
+    int d = 0;
+    int parsed_port = 0;
+    if (url == NULL) {
+        return false;
+    }
+
+    if (sscanf(url, "http://%d.%d.%d.%d:%d/state", &a, &b, &c, &d, &parsed_port) != 5) {
+        return false;
+    }
+    if (a < 1 || a > 223 || b < 0 || b > 255 || c < 0 || c > 255 || d < 1 || d > 254 ||
+        parsed_port < 1 || parsed_port > 65535) {
+        return false;
+    }
+
+    octets[0] = (uint8_t)a;
+    octets[1] = (uint8_t)b;
+    octets[2] = (uint8_t)c;
+    octets[3] = (uint8_t)d;
+    *port = (uint16_t)parsed_port;
+    return true;
+}
+
+static int candidate_last_octet(uint8_t base, int index)
+{
+    if (index == 0) {
+        return base;
+    }
+
+    int offset = (index + 1) / 2;
+    return (index % 2) == 1 ? (int)base - offset : (int)base + offset;
+}
+
+static esp_err_t probe_near_saved_bridge(
+    const char *saved_url,
+    bridge_auto_match_result_t *result)
+{
+    uint8_t octets[4] = {0};
+    uint16_t port = 0;
+    if (!parse_bridge_ipv4(saved_url, octets, &port)) {
+        result_set_error(result, ESP_ERR_NOT_SUPPORTED);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    esp_err_t last_err = ESP_FAIL;
+    char candidate[ORNAMENT_BRIDGE_URL_MAX] = {0};
+    for (int i = 0; i <= SUBNET_PROBE_RADIUS * 2; i++) {
+        int last = candidate_last_octet(octets[3], i);
+        if (last <= 0 || last >= 255 || last == octets[3]) {
+            continue;
+        }
+
+        snprintf(
+            candidate,
+            sizeof(candidate),
+            "http://%u.%u.%u.%d:%u/state",
+            octets[0],
+            octets[1],
+            octets[2],
+            last,
+            port);
+        last_err = probe_and_maybe_save(candidate, "near_saved_subnet", true, result);
+        if (last_err == ESP_OK) {
+            return ESP_OK;
+        }
+    }
+
+    result_set_error(result, last_err);
+    return last_err;
+}
+
 esp_err_t bridge_client_fetch_state(ornament_state_t *state)
 {
     ornament_settings_t settings;
@@ -247,7 +491,7 @@ esp_err_t bridge_client_probe_url(const char *url, bridge_probe_result_t *result
 
     int status_code = 0;
     int response_len = 0;
-    esp_err_t err = fetch_url_raw(url, response, MAX_RESPONSE_BYTES, 2500, &status_code, &response_len);
+    esp_err_t err = fetch_url_raw(url, response, MAX_RESPONSE_BYTES, BRIDGE_PROBE_TIMEOUT_MS, &status_code, &response_len);
     result->error = err;
     result->http_status = status_code;
     result->response_bytes = response_len;
@@ -274,4 +518,55 @@ esp_err_t bridge_client_probe_url(const char *url, bridge_probe_result_t *result
 
     free(response);
     return result->json_ok ? ESP_OK : (err == ESP_OK ? ESP_ERR_INVALID_RESPONSE : err);
+}
+
+esp_err_t bridge_client_auto_match(bool verify_current, bridge_auto_match_result_t *result)
+{
+    if (result == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    memset(result, 0, sizeof(*result));
+    result->last_error = ESP_ERR_NOT_FOUND;
+
+    ornament_settings_t settings;
+    ESP_RETURN_ON_ERROR(settings_load(&settings), TAG, "settings load failed before auto match");
+    const char *current_url = settings_bridge_url_or_default(&settings);
+
+    if (verify_current && current_url[0] != '\0' && !bridge_url_is_config_default(current_url)) {
+        esp_err_t err = probe_and_maybe_save(current_url, "current", false, result);
+        if (err == ESP_OK) {
+            return ESP_OK;
+        }
+    }
+
+    char discovered_url[ORNAMENT_BRIDGE_URL_MAX] = {0};
+    esp_err_t err = discover_bridge_url(discovered_url, sizeof(discovered_url));
+    if (err == ESP_OK) {
+        err = probe_and_maybe_save(discovered_url, "udp_discovery", true, result);
+        if (err == ESP_OK) {
+            return ESP_OK;
+        }
+    } else {
+        result_set_error(result, err);
+        ESP_LOGW(TAG, "bridge UDP discovery failed: %s", esp_err_to_name(err));
+    }
+
+    if (current_url[0] != '\0' && !bridge_url_is_config_default(current_url)) {
+        err = probe_near_saved_bridge(current_url, result);
+        if (err == ESP_OK) {
+            return ESP_OK;
+        }
+    }
+
+    if (!verify_current && current_url[0] != '\0' && !bridge_url_is_config_default(current_url)) {
+        err = probe_and_maybe_save(current_url, "current", false, result);
+        if (err == ESP_OK) {
+            return ESP_OK;
+        }
+    }
+
+    if (result->last_error == ESP_OK) {
+        result->last_error = ESP_ERR_NOT_FOUND;
+    }
+    return result->last_error;
 }

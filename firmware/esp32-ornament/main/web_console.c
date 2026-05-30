@@ -9,12 +9,11 @@
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "settings.h"
+#include "task_audio.h"
 #include "wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
-#include "lwip/inet.h"
-#include "lwip/sockets.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -33,6 +32,7 @@ static void refresh_console_settings(void)
 {
     if (settings_load(&console_settings) != ESP_OK) {
         memset(&console_settings, 0, sizeof(console_settings));
+        console_settings.audio_volume_percent = CONFIG_ORNAMENT_AUDIO_VOLUME_PERCENT;
     }
 }
 
@@ -149,56 +149,64 @@ static void status_label(ornament_status_t status, char *out, size_t out_size)
     strlcpy(out, label, out_size);
 }
 
-static const char *task_title_or_default(bool has_task, const char *title, const char *fallback)
+static void task_panel_status_label(ornament_status_t status, int active_count, char *out, size_t out_size)
 {
-    return has_task && title != NULL && title[0] != '\0' ? title : fallback;
-}
-
-static bool text_equals_ignore_case(const char *left, const char *right)
-{
-    if (left == NULL || right == NULL) {
-        return false;
-    }
-
-    while (*left != '\0' && *right != '\0') {
-        char left_ch = *left;
-        char right_ch = *right;
-        if (left_ch >= 'a' && left_ch <= 'z') {
-            left_ch = (char)(left_ch - 'a' + 'A');
-        }
-        if (right_ch >= 'a' && right_ch <= 'z') {
-            right_ch = (char)(right_ch - 'a' + 'A');
-        }
-        if (left_ch != right_ch) {
-            return false;
-        }
-        left++;
-        right++;
-    }
-    return *left == '\0' && *right == '\0';
-}
-
-static void task_card_status_label(const ornament_state_t *state, char *out, size_t out_size)
-{
-    if (state == NULL || out_size == 0) {
+    if (out_size == 0) {
         return;
     }
-
-    if (state->status == ORNAMENT_STATUS_DONE && state->has_task) {
-        if (text_equals_ignore_case(state->task_title, "Claude + Codex done")) {
-            strlcpy(out, "claude + codex done", out_size);
-            return;
-        }
-        if (text_equals_ignore_case(state->task_title, "Claude done")) {
-            strlcpy(out, "claude done", out_size);
-            return;
-        }
-        if (text_equals_ignore_case(state->task_title, "Codex done")) {
-            strlcpy(out, "codex done", out_size);
-            return;
-        }
+    if (active_count > 0 || status == ORNAMENT_STATUS_RUNNING) {
+        strlcpy(out, "running", out_size);
+    } else {
+        strlcpy(out, "done", out_size);
     }
-    status_label(state->status, out, out_size);
+}
+
+static const char *display_id_or_dash(const char *value)
+{
+    return value != NULL && value[0] != '\0' ? value : "--";
+}
+
+static void append_task_card(
+    char *html,
+    size_t html_size,
+    size_t *used,
+    const char *label,
+    const char *status,
+    int active_count,
+    int done_seq)
+{
+    appendf(
+        html,
+        html_size,
+        used,
+        "<div class=\"card task-card\"><div class=\"card-head\"><div><div class=\"k\">%s</div>"
+        "<div class=\"v\">%s</div></div><div class=\"counts\">active <b>%d</b><br>done <b>%d</b></div></div></div>",
+        label,
+        status,
+        active_count,
+        done_seq);
+}
+
+static void append_task_detail(
+    char *html,
+    size_t html_size,
+    size_t *used,
+    const char *label,
+    const char *status,
+    const char *session_id,
+    const char *turn_id)
+{
+    appendf(
+        html,
+        html_size,
+        used,
+        "<div class=\"task-detail\"><div class=\"k\">%s</div><b>%s</b>"
+        "<div class=\"detail-lines\"><div class=\"detail-row\"><span>session_id</span><code>%s</code></div>"
+        "<div class=\"detail-row\"><span>turn_id</span><code>%s</code></div></div></div>",
+        label,
+        status,
+        display_id_or_dash(session_id),
+        display_id_or_dash(turn_id));
 }
 
 static void state_snapshot(ornament_state_t *state, esp_err_t *fetch_error, int64_t *age_ms)
@@ -281,6 +289,7 @@ static esp_err_t status_get_handler(httpd_req_t *req)
         "\"time\":{\"synced\":%s,\"local_time\":\"%s\",\"local_date\":\"%s\"},"
         "\"quota\":{\"has\":%s,\"status\":\"%s\",\"primary\":%d,\"weekly\":%d},"
         "\"task\":{\"has\":%s,\"active_count\":%d,\"done_seq\":%d,\"status\":\"%s\",\"title\":\"%s\",\"message\":\"%s\"},"
+        "\"audio\":{\"enabled\":%s,\"volume_percent\":%d},"
         "\"heap\":{\"free\":%u,\"min_free\":%u,\"largest_free_block\":%u}"
         "}",
         (long long)(esp_timer_get_time() / 1000),
@@ -316,6 +325,8 @@ static esp_err_t status_get_handler(httpd_req_t *req)
         status,
         task_title,
         task_message,
+        CONFIG_ORNAMENT_AUDIO_ENABLED ? "true" : "false",
+        settings_audio_volume_percent_or_default(&console_settings),
         (unsigned int)esp_get_free_heap_size(),
         (unsigned int)esp_get_minimum_free_heap_size(),
         (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
@@ -334,30 +345,33 @@ static esp_err_t root_get_handler(httpd_req_t *req)
     int64_t age_ms = -1;
     char bridge_url[ORNAMENT_BRIDGE_URL_MAX * 2];
     char wifi_ssid[80];
-    char title[ORNAMENT_TEXT_MAX * 2];
-    char message[ORNAMENT_TEXT_MAX * 2];
-    char codex_title[ORNAMENT_TEXT_MAX * 2];
-    char codex_message[ORNAMENT_TEXT_MAX * 2];
-    char claude_title[ORNAMENT_TEXT_MAX * 2];
-    char claude_message[ORNAMENT_TEXT_MAX * 2];
-    char status[32];
+    char codex_session_id[ORNAMENT_TIME_MAX * 2];
+    char codex_turn_id[ORNAMENT_TIME_MAX * 2];
+    char claude_session_id[ORNAMENT_TIME_MAX * 2];
+    char claude_turn_id[ORNAMENT_TIME_MAX * 2];
     char codex_status[32];
     char claude_status[32];
+    int audio_volume_percent = settings_audio_volume_percent_or_default(&console_settings);
 
     ornament_state_init(&state);
     state_snapshot(&state, &fetch_error, &age_ms);
     wifi_debug_snapshot(&wifi_debug);
+    int codex_active_count = state.has_codex_summary ? state.codex_active_task_count : state.active_task_count;
+    int codex_done_seq = state.has_codex_summary ? state.codex_done_seq : state.done_seq;
     html_escape(settings_bridge_url_or_default(&console_settings), bridge_url, sizeof(bridge_url));
     html_escape(state.wifi_ssid, wifi_ssid, sizeof(wifi_ssid));
-    html_escape(state.task_title, title, sizeof(title));
-    html_escape(state.task_message, message, sizeof(message));
-    html_escape(state.codex_task_title, codex_title, sizeof(codex_title));
-    html_escape(state.codex_task_message, codex_message, sizeof(codex_message));
-    html_escape(state.claude_task_title, claude_title, sizeof(claude_title));
-    html_escape(state.claude_task_message, claude_message, sizeof(claude_message));
-    task_card_status_label(&state, status, sizeof(status));
-    status_label(state.codex_task_status, codex_status, sizeof(codex_status));
-    status_label(state.claude_task_status, claude_status, sizeof(claude_status));
+    html_escape(
+        state.has_codex_task ? state.codex_task_session_id : state.task_session_id,
+        codex_session_id,
+        sizeof(codex_session_id));
+    html_escape(
+        state.has_codex_task ? state.codex_task_turn_id : state.task_turn_id,
+        codex_turn_id,
+        sizeof(codex_turn_id));
+    html_escape(state.claude_task_session_id, claude_session_id, sizeof(claude_session_id));
+    html_escape(state.claude_task_turn_id, claude_turn_id, sizeof(claude_turn_id));
+    task_panel_status_label(state.has_codex_summary ? state.codex_task_status : state.status, codex_active_count, codex_status, sizeof(codex_status));
+    task_panel_status_label(state.claude_task_status, state.claude_active_task_count, claude_status, sizeof(claude_status));
 
     const size_t html_size = 12288;
     char *html = calloc(1, html_size);
@@ -379,15 +393,15 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         ".top{display:flex;justify-content:space-between;gap:16px;align-items:flex-start;margin-bottom:18px}.sub{margin:6px 0 0;color:var(--muted);font-size:13px}"
         ".badges{display:flex;flex-wrap:wrap;gap:8px;justify-content:flex-end}.badge{border:1px solid var(--line);border-radius:8px;padding:7px 9px;background:var(--panel);color:#d9e2e8;font-size:13px}"
         ".urls{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:10px;margin-bottom:12px}.urlbox{border:1px solid var(--line);border-radius:8px;background:#13171b;padding:10px 12px}"
-        ".grid,.task-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px}.task-grid{margin-top:12px}"
+        ".grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px}.task-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin-top:12px}"
         ".card{border:1px solid var(--line);border-radius:8px;padding:14px;background:var(--panel);box-shadow:0 8px 22px rgba(0,0,0,.18)}"
         ".card-head{display:flex;justify-content:space-between;gap:12px;align-items:flex-start}.k{color:var(--muted);font-size:13px}.v{font-size:22px;line-height:1.2;margin-top:5px;color:var(--text)}"
-        ".counts{text-align:right;color:var(--muted);font-size:13px;line-height:1.55}.counts b{color:var(--text);font-size:15px}.task-detail{min-height:72px;border:1px solid var(--line);border-radius:8px;background:#13171b;padding:12px;overflow:hidden}"
-        ".task-detail b{display:block;margin:5px 0;color:#f4f7fa}.task-detail p{margin:0;color:#b9c5ce;word-break:break-word}.ops{border:1px solid var(--line);border-radius:8px;background:var(--panel);padding:14px;margin-top:16px}"
+        ".counts{text-align:right;color:var(--muted);font-size:13px;line-height:1.55}.counts b{color:var(--text);font-size:15px}.task-card{min-height:78px}.task-detail{min-height:118px;border:1px solid var(--line);border-radius:8px;background:#13171b;padding:14px;overflow:hidden}"
+        ".task-detail b{display:block;margin:6px 0 12px;color:#f4f7fa;font-size:20px}.detail-lines{display:grid;gap:7px}.detail-row{display:grid;grid-template-columns:76px minmax(0,1fr);gap:9px;align-items:baseline}.detail-row span{color:var(--muted);font-size:13px}.ops{border:1px solid var(--line);border-radius:8px;background:var(--panel);padding:14px;margin-top:16px}"
         ".actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}button,a.btn{display:inline-block;padding:10px 12px;border:0;border-radius:8px;background:var(--accent);color:#06100f;font-weight:700;text-decoration:none;cursor:pointer}"
         "button.warn{background:var(--warn)}.danger{background:var(--danger);color:#180506}code{word-break:break-all;color:#a8f4ec}label{display:block;margin-bottom:7px}"
-        "input{width:100%;padding:11px;border-radius:8px;border:1px solid #3a444d;background:#0f1317;color:#fff}form{margin:0}footer{margin:14px 0 0;color:var(--muted);font-size:13px}"
-        "@media(max-width:620px){main{padding:18px}.top{display:block}.badges{justify-content:flex-start;margin-top:12px}.counts{text-align:left}.card-head{display:block}}"
+        "input{width:100%;padding:11px;border-radius:8px;border:1px solid #3a444d;background:#0f1317;color:#fff}input[type=range]{padding:0;accent-color:var(--accent)}form{margin:0}footer{margin:14px 0 0;color:var(--muted);font-size:13px}"
+        "@media(max-width:620px){main{padding:18px}.top{display:block}.badges{justify-content:flex-start;margin-top:12px}.task-grid{grid-template-columns:1fr}.counts{text-align:left}.card-head{display:block}.detail-row{grid-template-columns:1fr;gap:2px}}"
         "</style></head><body><main>");
     appendf(
         html,
@@ -408,42 +422,16 @@ static esp_err_t root_get_handler(httpd_req_t *req)
     appendf(html, html_size, &used, "<div class=\"card\"><div class=\"k\">Quota</div><div class=\"v\">%d%% / %d%%</div><div class=\"k\">primary / weekly</div></div>", state.primary_remaining_percent, state.secondary_remaining_percent);
     append(html, html_size, &used, "</section>");
     append(html, html_size, &used, "<h2>Tasks</h2><section class=\"task-grid\">");
-    appendf(
-        html,
-        html_size,
-        &used,
-        "<div class=\"card\"><div class=\"card-head\"><div><div class=\"k\">Task</div><div class=\"v\">%s</div></div><div class=\"counts\">active <b>%d</b><br>done <b>%d</b></div></div></div>",
-        state.has_codex_summary ? codex_status : status,
-        state.has_codex_summary ? state.codex_active_task_count : state.active_task_count,
-        state.has_codex_summary ? state.codex_done_seq : state.done_seq);
-    appendf(
-        html,
-        html_size,
-        &used,
-        "<div class=\"card claude\"><div class=\"card-head\"><div><div class=\"k\">Claude Task</div><div class=\"v\">%s</div></div><div class=\"counts\">active <b>%d</b><br>done <b>%d</b></div></div></div>",
-        state.has_claude_summary ? claude_status : "idle",
-        state.claude_active_task_count,
-        state.claude_done_seq);
+    append_task_card(html, html_size, &used, "Codex Task", codex_status, codex_active_count, codex_done_seq);
+    append_task_card(html, html_size, &used, "Claude Task", claude_status, state.claude_active_task_count, state.claude_done_seq);
     append(html, html_size, &used, "</section>");
     append(
         html,
         html_size,
         &used,
         "<section class=\"task-grid\">");
-    appendf(
-        html,
-        html_size,
-        &used,
-        "<div class=\"task-detail\"><div class=\"k\">Task detail</div><b>%s</b><p>%s</p></div>",
-        task_title_or_default(state.has_codex_task, codex_title, title[0] != '\0' ? title : "No task title"),
-        state.has_codex_task ? codex_message : "");
-    appendf(
-        html,
-        html_size,
-        &used,
-        "<div class=\"task-detail claude\"><div class=\"k\">Claude detail</div><b>%s</b><p>%s</p></div>",
-        task_title_or_default(state.has_claude_task, claude_title, "No Claude task"),
-        state.has_claude_task ? claude_message : "");
+    append_task_detail(html, html_size, &used, "Codex detail", codex_status, codex_session_id, codex_turn_id);
+    append_task_detail(html, html_size, &used, "Claude detail", claude_status, claude_session_id, claude_turn_id);
     append(html, html_size, &used, "</section>");
     append(
         html,
@@ -457,6 +445,17 @@ static esp_err_t root_get_handler(httpd_req_t *req)
     appendf(html, html_size, &used, "<div class=\"card\"><div class=\"k\">Disconnect</div><div class=\"v\">%u %s</div><div class=\"k\">rssi %d retries %d</div></div>", wifi_debug.last_disconnect_reason, wifi_debug.last_disconnect_name, wifi_debug.last_disconnect_rssi, wifi_debug.retry_count);
     appendf(html, html_size, &used, "<div class=\"card\"><div class=\"k\">Bridge Fetch</div><div class=\"v\">%s</div><div class=\"k\">age %lld ms</div></div>", esp_err_to_name(fetch_error), (long long)age_ms);
     append(html, html_size, &used, "</section>");
+    appendf(
+        html,
+        html_size,
+        &used,
+        "<section class=\"ops\"><form method=\"post\" action=\"/save-audio\"><label class=\"k\">Voice Volume</label>"
+        "<input type=\"range\" name=\"audio_volume\" min=\"0\" max=\"100\" step=\"5\" value=\"%d\" oninput=\"audioVol.value=this.value\">"
+        "<div class=\"v\"><output id=\"audioVol\">%d</output>%%</div>"
+        "<div class=\"actions\"><button type=\"submit\">Save Volume</button>"
+        "<button class=\"warn\" type=\"submit\" formaction=\"/test-audio\">Test Voice</button></div></form></section>",
+        audio_volume_percent,
+        audio_volume_percent);
     append(
         html,
         html_size,
@@ -470,24 +469,12 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         &used,
         "\"><div class=\"actions\"><button type=\"submit\">Test</button>"
         "<button class=\"warn\" type=\"submit\" formaction=\"/save-bridge\">Save</button></div></form>"
-        "<form id=\"autoBridge\" method=\"post\" action=\"/auto-bridge\"><input type=\"hidden\" name=\"bridge_url\" id=\"autoBridgeUrl\">"
+        "<form method=\"post\" action=\"/auto-bridge\">"
         "<div class=\"actions\"><button type=\"submit\">Auto Match This PC Bridge</button><a class=\"btn\" href=\"/status\">JSON Status</a></div></form>"
         "<div class=\"actions\"><form method=\"post\" action=\"/reboot\"><button class=\"warn\" type=\"submit\">Reboot</button></form>"
         "<form method=\"post\" action=\"/clear-config\"><button class=\"danger\" type=\"submit\">Clear Wi-Fi and Bridge Config</button></form></div></section>"
         "<footer>Refreshes every 10 seconds</footer>"
         "<script>"
-        "document.getElementById('autoBridge').addEventListener('submit',async e=>{"
-        "const input=document.getElementById('autoBridgeUrl');"
-        "if(input.value)return;"
-        "e.preventDefault();"
-        "try{const r=await fetch('http://127.0.0.1:8787/discover',{cache:'no-store'});"
-        "if(!r.ok)throw new Error('HTTP '+r.status);"
-        "const data=await r.json();"
-        "input.value=data.stateUrl||'';"
-        "if(!input.value)throw new Error('missing stateUrl');"
-        "e.target.submit();}"
-        "catch(err){alert('Bridge auto-match failed: '+err.message);}"
-        "});"
         "setTimeout(()=>location.reload(),10000)"
         "</script>"
         "</main></body></html>");
@@ -618,30 +605,61 @@ static esp_err_t send_bridge_saved_page(httpd_req_t *req, const char *url, const
     return httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
 }
 
-static esp_err_t client_ip_from_request(httpd_req_t *req, char *ip, size_t ip_size)
+static esp_err_t save_audio_volume(int volume_percent)
 {
-    if (req == NULL || ip == NULL || ip_size == 0) {
+    if (volume_percent < 0 || volume_percent > 100) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    int sockfd = httpd_req_to_sockfd(req);
-    if (sockfd < 0) {
-        return ESP_FAIL;
+    ornament_settings_t settings;
+    esp_err_t err = settings_load(&settings);
+    if (err != ESP_OK) {
+        return err;
     }
 
-    struct sockaddr_storage addr = {0};
-    socklen_t addr_len = sizeof(addr);
-    if (getpeername(sockfd, (struct sockaddr *)&addr, &addr_len) != 0) {
-        return ESP_FAIL;
+    settings.audio_volume_percent = volume_percent;
+    err = settings_save(&settings);
+    if (err == ESP_OK) {
+        console_settings = settings;
+    }
+    return err;
+}
+
+static esp_err_t parse_audio_volume_percent(const char *value, int *volume_percent)
+{
+    if (value == NULL || volume_percent == NULL || value[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
     }
 
-    if (addr.ss_family == AF_INET) {
-        const struct sockaddr_in *peer = (const struct sockaddr_in *)&addr;
-        inet_ntoa_r(peer->sin_addr, ip, ip_size);
-        return ip[0] != '\0' ? ESP_OK : ESP_FAIL;
+    int parsed = 0;
+    for (const char *cursor = value; *cursor != '\0'; cursor++) {
+        if (*cursor < '0' || *cursor > '9') {
+            return ESP_ERR_INVALID_ARG;
+        }
+        parsed = parsed * 10 + (*cursor - '0');
+        if (parsed > 100) {
+            return ESP_ERR_INVALID_ARG;
+        }
     }
 
-    return ESP_ERR_NOT_SUPPORTED;
+    *volume_percent = parsed;
+    return ESP_OK;
+}
+
+static esp_err_t send_audio_saved_page(httpd_req_t *req, int volume_percent, bool played)
+{
+    char html[768];
+    snprintf(
+        html,
+        sizeof(html),
+        "<!doctype html><html><head><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+        "<style>body{font-family:system-ui;margin:24px;background:#0b1116;color:#edf7fb}a{color:#49d3c8}</style>"
+        "</head><body><h1>Voice Volume</h1><p>Volume: %d%%</p><p>%s</p><p><a href=\"/\">Back</a></p></body></html>",
+        volume_percent,
+        played ? "Test voice queued." : "Saved for the next voice reminder.");
+
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
+    return httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
 }
 
 static esp_err_t test_bridge_post_handler(httpd_req_t *req)
@@ -699,50 +717,82 @@ static esp_err_t save_bridge_post_handler(httpd_req_t *req)
     return send_bridge_saved_page(req, url, "The next poll will use this URL.");
 }
 
+static esp_err_t save_audio_post_handler(httpd_req_t *req)
+{
+    char body[128] = {0};
+    char value[8] = {0};
+    if (read_form_body(req, body, sizeof(body)) != ESP_OK) {
+        return ESP_FAIL;
+    }
+    form_value(body, "audio_volume", value, sizeof(value));
+    int volume_percent = 0;
+    if (parse_audio_volume_percent(value, &volume_percent) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Audio volume must be 0..100");
+        return ESP_FAIL;
+    }
+
+    esp_err_t err = save_audio_volume(volume_percent);
+    if (err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, esp_err_to_name(err));
+        return ESP_FAIL;
+    }
+
+    return send_audio_saved_page(req, volume_percent, false);
+}
+
+static esp_err_t test_audio_post_handler(httpd_req_t *req)
+{
+    char body[128] = {0};
+    char value[8] = {0};
+    int volume_percent = settings_audio_volume_percent_or_default(&console_settings);
+    if (req->content_len > 0 && read_form_body(req, body, sizeof(body)) == ESP_OK) {
+        form_value(body, "audio_volume", value, sizeof(value));
+        if (value[0] != '\0' && parse_audio_volume_percent(value, &volume_percent) != ESP_OK) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Audio volume must be 0..100");
+            return ESP_FAIL;
+        }
+    }
+
+    esp_err_t err = save_audio_volume(volume_percent);
+    if (err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, esp_err_to_name(err));
+        return ESP_FAIL;
+    }
+
+    task_audio_play_done();
+    return send_audio_saved_page(req, volume_percent, true);
+}
+
 static esp_err_t auto_bridge_post_handler(httpd_req_t *req)
 {
-    char url[ORNAMENT_BRIDGE_URL_MAX];
-    char body[256] = {0};
     if (req->content_len > 0) {
-        if (read_form_body(req, body, sizeof(body)) != ESP_OK) {
-            return ESP_FAIL;
-        }
-        form_value(body, "bridge_url", url, sizeof(url));
-    } else {
-        url[0] = '\0';
+        char body[16] = {0};
+        (void)read_form_body(req, body, sizeof(body));
     }
 
-    char client_ip[16] = {0};
-    if (url[0] == '\0') {
-        esp_err_t ip_err = client_ip_from_request(req, client_ip, sizeof(client_ip));
-        if (ip_err != ESP_OK) {
-            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Could not auto-detect bridge URL");
-            return ESP_FAIL;
-        }
-        snprintf(url, sizeof(url), "http://%s:8787/state", client_ip);
-    }
-
-    bridge_probe_result_t result;
-    esp_err_t err = bridge_client_probe_url(url, &result);
+    bridge_auto_match_result_t result;
+    esp_err_t err = bridge_client_auto_match(true, &result);
     if (err != ESP_OK) {
         char message[256];
         snprintf(
             message,
             sizeof(message),
-            "Bridge test failed for %.159s: %.32s. Start the bridge on this PC first.",
-            url,
+            "Bridge auto-match failed after %d probes: %.32s. Start the bridge on this PC first.",
+            result.tested_count,
             esp_err_to_name(err));
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, message);
         return ESP_FAIL;
     }
 
-    err = save_bridge_url(url);
-    if (err != ESP_OK) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, esp_err_to_name(err));
-        return ESP_FAIL;
-    }
-
-    return send_bridge_saved_page(req, url, "Auto-detected from this browser and verified.");
+    refresh_console_settings();
+    char detail[160];
+    snprintf(
+        detail,
+        sizeof(detail),
+        "Auto-matched by the ESP over %s after %d probe(s).",
+        result.source,
+        result.tested_count);
+    return send_bridge_saved_page(req, result.bridge_url, detail);
 }
 
 static esp_err_t reboot_post_handler(httpd_req_t *req)
@@ -786,7 +836,7 @@ esp_err_t web_console_start(void)
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
     config.lru_purge_enable = true;
-    config.max_uri_handlers = 10;
+    config.max_uri_handlers = 12;
     config.stack_size = 16384;
 
     esp_err_t err = httpd_start(&server, &config);
@@ -815,6 +865,16 @@ esp_err_t web_console_start(void)
         .method = HTTP_POST,
         .handler = save_bridge_post_handler,
     };
+    const httpd_uri_t save_audio = {
+        .uri = "/save-audio",
+        .method = HTTP_POST,
+        .handler = save_audio_post_handler,
+    };
+    const httpd_uri_t test_audio = {
+        .uri = "/test-audio",
+        .method = HTTP_POST,
+        .handler = test_audio_post_handler,
+    };
     const httpd_uri_t auto_bridge = {
         .uri = "/auto-bridge",
         .method = HTTP_POST,
@@ -835,6 +895,8 @@ esp_err_t web_console_start(void)
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &status));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &test_bridge));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &save_bridge));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &save_audio));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &test_audio));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &auto_bridge));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &reboot));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &clear_config));

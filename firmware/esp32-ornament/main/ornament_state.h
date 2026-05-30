@@ -19,10 +19,16 @@ typedef struct {
     char task_title[ORNAMENT_TEXT_MAX];
     char task_message[ORNAMENT_TEXT_MAX];
     char task_received_at[ORNAMENT_TIME_MAX];
+    char task_session_id[ORNAMENT_TIME_MAX];
+    char task_turn_id[ORNAMENT_TIME_MAX];
     char codex_task_title[ORNAMENT_TEXT_MAX];
     char codex_task_message[ORNAMENT_TEXT_MAX];
+    char codex_task_session_id[ORNAMENT_TIME_MAX];
+    char codex_task_turn_id[ORNAMENT_TIME_MAX];
     char claude_task_title[ORNAMENT_TEXT_MAX];
     char claude_task_message[ORNAMENT_TEXT_MAX];
+    char claude_task_session_id[ORNAMENT_TIME_MAX];
+    char claude_task_turn_id[ORNAMENT_TIME_MAX];
     ornament_status_t codex_task_status;
     ornament_status_t claude_task_status;
     char quota_status[32];
