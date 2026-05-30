@@ -442,10 +442,19 @@ fn apply_task_event(state: &mut BridgeState, event: TaskEvent) {
         }
         "done" => {
             let matched_active_task = finish_active_task(state, &event);
-            if matched_active_task || state.active_tasks.is_empty() {
+            if matched_active_task {
                 remember_done_task(state, event.clone());
                 state.task = Some(event);
-            } else if active_task_count_for_source(state, &event) == 1 {
+            } else if state.active_tasks.is_empty() {
+                if event_has_task_identity(&event) {
+                    remember_unmatched_stop(state, event);
+                } else {
+                    remember_done_task(state, event.clone());
+                    state.task = Some(event);
+                }
+            } else if !event_has_task_identity(&event)
+                && active_task_count_for_source(state, &event) == 1
+            {
                 remove_recent_active_task_for_source(state, &event);
                 remember_done_task(state, event.clone());
                 remember_unmatched_stop(state, event.clone());
@@ -458,6 +467,10 @@ fn apply_task_event(state: &mut BridgeState, event: TaskEvent) {
             state.task = Some(event);
         }
     }
+}
+
+fn event_has_task_identity(event: &TaskEvent) -> bool {
+    event.session_id.is_some() || event.turn_id.is_some()
 }
 
 fn active_task_key_for_start(state: &mut BridgeState, event: &TaskEvent) -> String {
@@ -1578,6 +1591,46 @@ mod tests {
     }
 
     #[test]
+    fn identified_stop_without_active_task_is_unmatched() {
+        let state = Arc::new(Mutex::new(BridgeState::default()));
+        {
+            let mut state = state.lock().unwrap();
+            apply_task_event(
+                &mut state,
+                normalize_event(&json!({
+                    "hook_event_name": "UserPromptSubmit",
+                    "source": "Claude",
+                    "session_id": "claude-session",
+                    "turn_id": "turn-1"
+                })),
+            );
+            apply_task_event(
+                &mut state,
+                normalize_event(&json!({
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": "codex-session",
+                    "turn_id": "turn-1"
+                })),
+            );
+            apply_task_event(
+                &mut state,
+                normalize_event(&json!({
+                    "hook_event_name": "Stop",
+                    "session_id": "foreign-session",
+                    "turn_id": "foreign-turn",
+                    "cwd": "C:\\Program Files\\WindowsApps\\OpenAI.Codex\\app"
+                })),
+            );
+        }
+
+        let snapshot = task_snapshot(&state, &test_config(None));
+        assert_eq!(snapshot.done_seq, 0);
+        assert_eq!(snapshot.done_task_count, 0);
+        assert_eq!(snapshot.unmatched_stop_count, 1);
+        assert_eq!(snapshot.source_tasks.codex.done_seq, 0);
+    }
+
+    #[test]
     fn claude_fallback_start_and_stop_update_claude_summary() {
         let state = Arc::new(Mutex::new(BridgeState::default()));
         {
@@ -1629,7 +1682,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_stop_without_active_task_counts_done() {
+    fn claude_stop_without_active_task_is_unmatched() {
         let state = Arc::new(Mutex::new(BridgeState::default()));
         {
             let mut state = state.lock().unwrap();
@@ -1645,11 +1698,12 @@ mod tests {
 
         let snapshot = task_snapshot(&state, &test_config(None));
         assert_eq!(snapshot.active_task_count, 0);
-        assert_eq!(snapshot.done_seq, 1);
+        assert_eq!(snapshot.done_seq, 0);
         assert_eq!(snapshot.source_tasks.claude.status, "done");
         assert_eq!(snapshot.source_tasks.claude.active_count, 0);
-        assert_eq!(snapshot.source_tasks.claude.done_seq, 1);
+        assert_eq!(snapshot.source_tasks.claude.done_seq, 0);
         assert_eq!(snapshot.source_tasks.codex.done_seq, 0);
+        assert_eq!(snapshot.unmatched_stop_count, 1);
     }
 
     #[test]
@@ -1956,6 +2010,23 @@ mod tests {
             apply_task_event(
                 &mut state,
                 normalize_event(&json!({
+                    "hook_event_name": "UserPromptSubmit",
+                    "source": "Claude",
+                    "session_id": "claude-session",
+                    "turn_id": "turn-1"
+                })),
+            );
+            apply_task_event(
+                &mut state,
+                normalize_event(&json!({
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": "codex-session",
+                    "turn_id": "turn-1"
+                })),
+            );
+            apply_task_event(
+                &mut state,
+                normalize_event(&json!({
                     "hook_event_name": "Stop",
                     "source": "Claude",
                     "session_id": "claude-session",
@@ -2052,6 +2123,23 @@ mod tests {
         let state = Arc::new(Mutex::new(BridgeState::default()));
         {
             let mut state = state.lock().unwrap();
+            apply_task_event(
+                &mut state,
+                normalize_event(&json!({
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": "codex-session",
+                    "turn_id": "turn-1"
+                })),
+            );
+            apply_task_event(
+                &mut state,
+                normalize_event(&json!({
+                    "hook_event_name": "UserPromptSubmit",
+                    "source": "Claude",
+                    "session_id": "claude-session",
+                    "turn_id": "turn-1"
+                })),
+            );
             apply_task_event(
                 &mut state,
                 normalize_event(&json!({
