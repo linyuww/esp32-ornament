@@ -10,6 +10,7 @@
 
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "nvs_flash.h"
 
@@ -17,15 +18,36 @@
 
 static const char *TAG = "ornament";
 
+typedef struct {
+    ornament_state_t state;
+    esp_err_t fetch_error;
+    TickType_t last_done_tick;
+    bool have_state;
+    bool have_last_done_tick;
+} ornament_shared_state_t;
+
+static SemaphoreHandle_t shared_state_mutex;
+static ornament_shared_state_t shared_state;
+
 static bool ui_needs_animation(const ornament_state_t *state)
 {
     return ornament_state_panel_status(state) == ORNAMENT_STATUS_RUNNING || state->done_flash_active;
 }
 
+static bool standby_timer_eligible(const ornament_state_t *state)
+{
+    if (state == NULL || state->active_task_count > 0) {
+        return false;
+    }
+    ornament_status_t status = ornament_state_panel_status(state);
+    return status != ORNAMENT_STATUS_RUNNING && status != ORNAMENT_STATUS_ERROR;
+}
+
 static bool should_show_standby_clock(const ornament_state_t *state, TickType_t idle_since_tick, TickType_t now)
 {
     return CONFIG_ORNAMENT_STANDBY_CLOCK_MS > 0 &&
-           ornament_state_panel_status(state) == ORNAMENT_STATUS_IDLE &&
+           standby_timer_eligible(state) &&
+           !state->done_flash_active &&
            idle_since_tick != 0 &&
            (now - idle_since_tick) >= pdMS_TO_TICKS(CONFIG_ORNAMENT_STANDBY_CLOCK_MS);
 }
@@ -61,6 +83,50 @@ static bool is_new_done_event(const ornament_state_t *state, bool have_seen_stat
     return state->done_seq > last_done_seq;
 }
 
+static void publish_state(
+    const ornament_state_t *state,
+    esp_err_t fetch_error,
+    TickType_t last_done_tick,
+    bool have_last_done_tick,
+    bool have_state)
+{
+    if (shared_state_mutex == NULL || state == NULL) {
+        return;
+    }
+    if (xSemaphoreTake(shared_state_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        ESP_LOGW(TAG, "shared state publish skipped: mutex timeout");
+        return;
+    }
+    shared_state.state = *state;
+    shared_state.fetch_error = fetch_error;
+    shared_state.last_done_tick = last_done_tick;
+    shared_state.have_last_done_tick = have_last_done_tick;
+    shared_state.have_state = have_state;
+    xSemaphoreGive(shared_state_mutex);
+}
+
+static bool snapshot_state(
+    ornament_state_t *state,
+    esp_err_t *fetch_error,
+    TickType_t *last_done_tick,
+    bool *have_last_done_tick)
+{
+    if (shared_state_mutex == NULL || state == NULL || fetch_error == NULL ||
+        last_done_tick == NULL || have_last_done_tick == NULL) {
+        return false;
+    }
+    if (xSemaphoreTake(shared_state_mutex, pdMS_TO_TICKS(20)) != pdTRUE) {
+        return false;
+    }
+    bool have_state = shared_state.have_state;
+    *state = shared_state.state;
+    *fetch_error = shared_state.fetch_error;
+    *last_done_tick = shared_state.last_done_tick;
+    *have_last_done_tick = shared_state.have_last_done_tick;
+    xSemaphoreGive(shared_state_mutex);
+    return have_state;
+}
+
 static bool auto_match_bridge(bool verify_current, const char *reason)
 {
     bridge_auto_match_result_t result;
@@ -88,92 +154,103 @@ static bool auto_match_bridge(bool verify_current, const char *reason)
 
 static void poll_task(void *arg)
 {
-    ornament_state_t state;
-    ornament_state_init(&state);
-    ornament_status_t previous_status = ORNAMENT_STATUS_IDLE;
+    (void)arg;
+    ornament_state_t fetched_state;
+    ornament_state_init(&fetched_state);
     TickType_t last_done_tick = 0;
-    TickType_t idle_since_tick = 0;
     TickType_t next_bridge_poll = 0;
     int last_done_seq = 0;
-    bool have_state = false;
     bool have_seen_state = false;
     bool have_last_done_tick = false;
-    bool last_render_was_error = false;
     TickType_t next_auto_match = 0;
 
     while (true) {
         TickType_t now = xTaskGetTickCount();
-        bool render_now = false;
 
         if (now >= next_bridge_poll) {
             next_bridge_poll = now + pdMS_TO_TICKS(CONFIG_ORNAMENT_POLL_INTERVAL_MS);
-            esp_err_t err = bridge_client_fetch_state(&state);
+            esp_err_t err = bridge_client_fetch_state(&fetched_state);
             if (err == ESP_OK) {
-                have_state = true;
-                last_render_was_error = false;
-
-                if (state.done_seq < last_done_seq) {
-                    last_done_seq = state.done_seq;
+                if (fetched_state.done_seq < last_done_seq) {
+                    last_done_seq = fetched_state.done_seq;
                 }
-                if (is_new_done_event(&state, have_seen_state, last_done_seq)) {
+                if (is_new_done_event(&fetched_state, have_seen_state, last_done_seq)) {
                     last_done_tick = now;
                     have_last_done_tick = true;
                     asrpro_link_notify_done();
                     task_audio_play_done();
                 }
-                if (state.done_seq > last_done_seq) {
-                    last_done_seq = state.done_seq;
+                if (fetched_state.done_seq > last_done_seq) {
+                    last_done_seq = fetched_state.done_seq;
                 }
-                if (state.status == ORNAMENT_STATUS_IDLE) {
-                    if (previous_status != ORNAMENT_STATUS_IDLE || idle_since_tick == 0) {
-                        idle_since_tick = now;
-                    }
-                } else {
-                    idle_since_tick = 0;
-                }
-                previous_status = state.status;
                 have_seen_state = true;
-
-                update_local_animation(&state, now, last_done_tick, have_last_done_tick);
-                system_status_update(&state);
-                web_console_set_last_state(&state, err);
-                render_now = true;
+                publish_state(&fetched_state, err, last_done_tick, have_last_done_tick, true);
             } else {
                 ESP_LOGW(TAG, "failed to fetch bridge state: %s", esp_err_to_name(err));
                 if (now >= next_auto_match) {
                     next_auto_match = now + pdMS_TO_TICKS(CONFIG_ORNAMENT_BRIDGE_AUTO_MATCH_RETRY_MS);
                     if (auto_match_bridge(false, "poll failure")) {
                         next_bridge_poll = now;
-                        last_render_was_error = false;
                         vTaskDelay(pdMS_TO_TICKS(200));
                         continue;
                     }
                 }
 
-                idle_since_tick = 0;
-                previous_status = ORNAMENT_STATUS_ERROR;
                 ornament_state_t error_state;
                 ornament_state_init(&error_state);
                 error_state.status = ORNAMENT_STATUS_ERROR;
-                system_status_update(&error_state);
-                web_console_set_last_state(&error_state, err);
-                if (!last_render_was_error) {
-                    display_render_error("Bridge offline");
-                    last_render_was_error = true;
-                }
-                have_state = false;
+                publish_state(&error_state, err, last_done_tick, have_last_done_tick, true);
             }
-        } else if (have_state) {
-            bool was_animating = ui_needs_animation(&state);
-            update_local_animation(&state, now, last_done_tick, have_last_done_tick);
-            system_status_update(&state);
-            render_now = ui_needs_animation(&state) || was_animating;
         }
 
-        if (render_now) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+}
+
+static void ui_render_task(void *arg)
+{
+    (void)arg;
+    ornament_state_t state;
+    TickType_t idle_since_tick = 0;
+    TickType_t last_done_tick = 0;
+    bool have_last_done_tick = false;
+    bool previous_standby_eligible = false;
+    bool last_render_was_error = false;
+    bool have_previous_state = false;
+    esp_err_t fetch_error = ESP_OK;
+
+    while (true) {
+        TickType_t now = xTaskGetTickCount();
+        if (!snapshot_state(&state, &fetch_error, &last_done_tick, &have_last_done_tick)) {
+            vTaskDelay(pdMS_TO_TICKS(CONFIG_ORNAMENT_UI_FRAME_MS));
+            continue;
+        }
+
+        update_local_animation(&state, now, last_done_tick, have_last_done_tick);
+        system_status_update(&state);
+        web_console_set_last_state(&state, fetch_error);
+
+        bool standby_eligible = standby_timer_eligible(&state);
+        if (standby_eligible) {
+            if (!previous_standby_eligible || idle_since_tick == 0) {
+                idle_since_tick = now;
+            }
+        } else {
+            idle_since_tick = 0;
+        }
+        previous_standby_eligible = standby_eligible;
+
+        if (fetch_error == ESP_OK) {
+            last_render_was_error = false;
+            render_current_state(&state, idle_since_tick, now);
+        } else if (!last_render_was_error) {
+            display_render_error("Bridge offline");
+            last_render_was_error = true;
+        } else if (have_previous_state && ui_needs_animation(&state)) {
             render_current_state(&state, idle_since_tick, now);
         }
 
+        have_previous_state = true;
         vTaskDelay(pdMS_TO_TICKS(CONFIG_ORNAMENT_UI_FRAME_MS));
     }
 }
@@ -217,5 +294,12 @@ void app_main(void)
     system_status_start_time_sync();
     ESP_ERROR_CHECK(web_console_start());
 
+    shared_state_mutex = xSemaphoreCreateMutex();
+    ESP_ERROR_CHECK(shared_state_mutex == NULL ? ESP_ERR_NO_MEM : ESP_OK);
+    memset(&shared_state, 0, sizeof(shared_state));
+    ornament_state_init(&shared_state.state);
+    shared_state.fetch_error = ESP_ERR_INVALID_STATE;
+
     xTaskCreate(poll_task, "bridge_poll", 8192, NULL, 5, NULL);
+    xTaskCreate(ui_render_task, "ui_render", 8192, NULL, 4, NULL);
 }

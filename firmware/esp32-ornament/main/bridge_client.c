@@ -10,6 +10,7 @@
 
 #include <limits.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 
 static const char *TAG = "bridge_client";
@@ -70,6 +71,15 @@ static int json_nonnegative_int(cJSON *parent, const char *name)
         return (int)item->valuedouble;
     }
     return 0;
+}
+
+static int json_optional_int(cJSON *parent, const char *name, int fallback)
+{
+    cJSON *item = cJSON_GetObjectItemCaseSensitive(parent, name);
+    if (cJSON_IsNumber(item) && item->valuedouble >= INT_MIN && item->valuedouble <= INT_MAX) {
+        return (int)item->valuedouble;
+    }
+    return fallback;
 }
 
 static void result_set_error(bridge_auto_match_result_t *result, esp_err_t err)
@@ -208,6 +218,19 @@ static esp_err_t parse_state_json(const char *json_text, ornament_state_t *state
     cJSON *bridge = cJSON_GetObjectItemCaseSensitive(root, "bridge");
     if (cJSON_IsObject(bridge)) {
         copy_json_string(bridge, "observedAt", state->bridge_observed_at, sizeof(state->bridge_observed_at));
+    }
+
+    cJSON *weather = cJSON_GetObjectItemCaseSensitive(root, "weather");
+    if (cJSON_IsObject(weather)) {
+        state->has_weather = true;
+        copy_json_string(weather, "status", state->weather_status, sizeof(state->weather_status));
+        copy_json_string(weather, "label", state->weather_label, sizeof(state->weather_label));
+        copy_json_string(weather, "summary", state->weather_summary, sizeof(state->weather_summary));
+        copy_json_string(weather, "icon", state->weather_icon, sizeof(state->weather_icon));
+        copy_json_string(weather, "observedAt", state->weather_observed_at, sizeof(state->weather_observed_at));
+        state->weather_temperature_c = json_optional_int(weather, "temperatureC", INT32_MIN);
+        state->weather_wind_kmh = json_optional_int(weather, "windKmh", -1);
+        state->weather_code = json_optional_int(weather, "weatherCode", -1);
     }
 
     cJSON_Delete(root);

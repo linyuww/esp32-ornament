@@ -15,6 +15,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
+#include <stdint.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -252,6 +253,10 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     char task_message[ORNAMENT_TEXT_MAX * 2];
     char quota_status[64];
     char wifi_ssid[80];
+    char weather_status[48];
+    char weather_label[48];
+    char weather_summary[80];
+    char weather_icon[40];
     char bridge_url[ORNAMENT_BRIDGE_URL_MAX * 2];
 
     ornament_state_init(&state);
@@ -262,6 +267,10 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     json_escape(state.task_message, task_message, sizeof(task_message));
     json_escape(state.quota_status, quota_status, sizeof(quota_status));
     json_escape(state.wifi_ssid, wifi_ssid, sizeof(wifi_ssid));
+    json_escape(state.weather_status, weather_status, sizeof(weather_status));
+    json_escape(state.weather_label, weather_label, sizeof(weather_label));
+    json_escape(state.weather_summary, weather_summary, sizeof(weather_summary));
+    json_escape(state.weather_icon, weather_icon, sizeof(weather_icon));
 
     json_escape(settings_bridge_url_or_default(&console_settings), bridge_url, sizeof(bridge_url));
 
@@ -287,6 +296,7 @@ static esp_err_t status_get_handler(httpd_req_t *req)
         "\"channel\":%d,\"authmode\":%d,\"retry_count\":%d,\"last_disconnect_reason\":%u,"
         "\"last_disconnect_name\":\"%s\",\"last_disconnect_rssi\":%d},"
         "\"time\":{\"synced\":%s,\"local_time\":\"%s\",\"local_date\":\"%s\"},"
+        "\"weather\":{\"has\":%s,\"status\":\"%s\",\"label\":\"%s\",\"summary\":\"%s\",\"icon\":\"%s\",\"temperature_c\":%d,\"wind_kmh\":%d,\"code\":%d},"
         "\"quota\":{\"has\":%s,\"status\":\"%s\",\"primary\":%d,\"weekly\":%d},"
         "\"task\":{\"has\":%s,\"active_count\":%d,\"done_seq\":%d,\"status\":\"%s\",\"title\":\"%s\",\"message\":\"%s\"},"
         "\"audio\":{\"enabled\":%s,\"volume_percent\":%d},"
@@ -315,6 +325,14 @@ static esp_err_t status_get_handler(httpd_req_t *req)
         state.time_synced ? "true" : "false",
         state.local_time,
         state.local_date,
+        state.has_weather ? "true" : "false",
+        weather_status,
+        weather_label,
+        weather_summary,
+        weather_icon,
+        state.weather_temperature_c,
+        state.weather_wind_kmh,
+        state.weather_code,
         state.has_quota ? "true" : "false",
         quota_status,
         state.primary_remaining_percent,
@@ -351,6 +369,11 @@ static esp_err_t root_get_handler(httpd_req_t *req)
     char claude_turn_id[ORNAMENT_TIME_MAX * 2];
     char codex_status[32];
     char claude_status[32];
+    char weather_label[48];
+    char weather_summary[80];
+    char weather_icon[40];
+    char weather_value[96];
+    char weather_detail[128];
     int audio_volume_percent = settings_audio_volume_percent_or_default(&console_settings);
 
     ornament_state_init(&state);
@@ -360,6 +383,9 @@ static esp_err_t root_get_handler(httpd_req_t *req)
     int codex_done_seq = state.has_codex_summary ? state.codex_done_seq : state.done_seq;
     html_escape(settings_bridge_url_or_default(&console_settings), bridge_url, sizeof(bridge_url));
     html_escape(state.wifi_ssid, wifi_ssid, sizeof(wifi_ssid));
+    html_escape(state.weather_label, weather_label, sizeof(weather_label));
+    html_escape(state.weather_summary, weather_summary, sizeof(weather_summary));
+    html_escape(state.weather_icon, weather_icon, sizeof(weather_icon));
     html_escape(
         state.has_codex_task ? state.codex_task_session_id : state.task_session_id,
         codex_session_id,
@@ -372,6 +398,16 @@ static esp_err_t root_get_handler(httpd_req_t *req)
     html_escape(state.claude_task_turn_id, claude_turn_id, sizeof(claude_turn_id));
     task_panel_status_label(state.has_codex_summary ? state.codex_task_status : state.status, codex_active_count, codex_status, sizeof(codex_status));
     task_panel_status_label(state.claude_task_status, state.claude_active_task_count, claude_status, sizeof(claude_status));
+    if (state.has_weather && state.weather_temperature_c != INT32_MIN) {
+        snprintf(weather_value, sizeof(weather_value), "%dC %s", state.weather_temperature_c, weather_summary);
+    } else {
+        snprintf(weather_value, sizeof(weather_value), "%s", state.has_weather ? weather_summary : "--");
+    }
+    if (state.has_weather && state.weather_wind_kmh >= 0) {
+        snprintf(weather_detail, sizeof(weather_detail), "%s %s wind %d", weather_label[0] != '\0' ? weather_label : "WEATHER", weather_icon[0] != '\0' ? weather_icon : "unknown", state.weather_wind_kmh);
+    } else {
+        snprintf(weather_detail, sizeof(weather_detail), "%s", weather_label[0] != '\0' ? weather_label : "--");
+    }
 
     const size_t html_size = 12288;
     char *html = calloc(1, html_size);
@@ -419,6 +455,7 @@ static esp_err_t root_get_handler(httpd_req_t *req)
     append(html, html_size, &used, "<section class=\"grid\">");
     appendf(html, html_size, &used, "<div class=\"card\"><div class=\"k\">Wi-Fi</div><div class=\"v\">%s</div><div class=\"k\">%ddBm</div></div>", state.wifi_connected ? wifi_ssid : "OFF", state.wifi_rssi);
     appendf(html, html_size, &used, "<div class=\"card\"><div class=\"k\">Time</div><div class=\"v\">%s</div><div class=\"k\">%s</div></div>", state.local_time, state.local_date);
+    appendf(html, html_size, &used, "<div class=\"card\"><div class=\"k\">Weather</div><div class=\"v\">%s</div><div class=\"k\">%s</div></div>", weather_value, weather_detail);
     appendf(html, html_size, &used, "<div class=\"card\"><div class=\"k\">Quota</div><div class=\"v\">%d%% / %d%%</div><div class=\"k\">primary / weekly</div></div>", state.primary_remaining_percent, state.secondary_remaining_percent);
     append(html, html_size, &used, "</section>");
     append(html, html_size, &used, "<h2>Tasks</h2><section class=\"task-grid\">");

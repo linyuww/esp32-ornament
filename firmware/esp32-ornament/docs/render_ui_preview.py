@@ -48,6 +48,7 @@ def build_preview_tool(project_root: Path) -> Path:
         str(docs_dir / "preview_native.c"),
         str(main_dir / "display_core.c"),
         str(main_dir / "ornament_state.c"),
+        str(main_dir / "assets" / "standby_wallpaper_rgb565.c"),
         "-lm",
     ]
     run(cmd, project_root)

@@ -85,6 +85,14 @@ static void make_state(
     state->time_synced = time_synced;
     state->has_quota = true;
     state->has_task = status != ORNAMENT_STATUS_IDLE;
+    state->has_weather = true;
+    set_text(state->weather_status, sizeof(state->weather_status), "ok");
+    set_text(state->weather_label, sizeof(state->weather_label), "HAIDIAN");
+    set_text(state->weather_summary, sizeof(state->weather_summary), "PARTLY CLOUDY");
+    set_text(state->weather_icon, sizeof(state->weather_icon), "cloud");
+    state->weather_temperature_c = 34;
+    state->weather_wind_kmh = 8;
+    state->weather_code = 1;
 }
 
 static int render_one(const char *output_dir, const char *name, const ornament_state_t *state, bool clock_page)

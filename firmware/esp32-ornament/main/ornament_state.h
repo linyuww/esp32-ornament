@@ -32,8 +32,16 @@ typedef struct {
     ornament_status_t codex_task_status;
     ornament_status_t claude_task_status;
     char quota_status[32];
+    char weather_status[24];
+    char weather_label[24];
+    char weather_summary[32];
+    char weather_icon[16];
+    char weather_observed_at[ORNAMENT_TIME_MAX];
     int primary_remaining_percent;
     int secondary_remaining_percent;
+    int weather_temperature_c;
+    int weather_wind_kmh;
+    int weather_code;
     int active_task_count;
     int done_seq;
     int codex_active_task_count;
@@ -48,6 +56,7 @@ typedef struct {
     char wifi_ssid[33];
     int wifi_rssi;
     bool has_task;
+    bool has_weather;
     bool has_codex_summary;
     bool has_claude_summary;
     bool has_codex_task;

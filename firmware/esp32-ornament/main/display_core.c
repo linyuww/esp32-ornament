@@ -1,4 +1,5 @@
 #include "display_core.h"
+#include "standby_wallpaper.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -90,6 +91,45 @@ static void fill_rect(int x, int y, int w, int h, uint16_t color)
     for (int yy = y; yy < y + h; yy++) {
         for (int xx = x; xx < x + w; xx++) {
             draw_pixel(xx, yy, color);
+        }
+    }
+}
+
+static uint16_t blend_rgb565(uint16_t source, uint16_t overlay, uint8_t overlay_alpha)
+{
+    uint8_t inverse_alpha = (uint8_t)(255U - overlay_alpha);
+    uint8_t source_r = (uint8_t)(((source >> 11) & 0x1F) << 3);
+    uint8_t source_g = (uint8_t)(((source >> 5) & 0x3F) << 2);
+    uint8_t source_b = (uint8_t)((source & 0x1F) << 3);
+    uint8_t overlay_r = (uint8_t)(((overlay >> 11) & 0x1F) << 3);
+    uint8_t overlay_g = (uint8_t)(((overlay >> 5) & 0x3F) << 2);
+    uint8_t overlay_b = (uint8_t)((overlay & 0x1F) << 3);
+    uint8_t r = (uint8_t)(((uint16_t)source_r * inverse_alpha + (uint16_t)overlay_r * overlay_alpha) / 255U);
+    uint8_t g = (uint8_t)(((uint16_t)source_g * inverse_alpha + (uint16_t)overlay_g * overlay_alpha) / 255U);
+    uint8_t b = (uint8_t)(((uint16_t)source_b * inverse_alpha + (uint16_t)overlay_b * overlay_alpha) / 255U);
+    return display_core_rgb565(r, g, b);
+}
+
+static void blend_rect(int x, int y, int w, int h, uint16_t color, uint8_t alpha)
+{
+    if (active_canvas == NULL || active_canvas->pixels == NULL || alpha == 0) {
+        return;
+    }
+
+    int x0 = x < 0 ? 0 : x;
+    int y0 = y < 0 ? 0 : y;
+    int x1 = x + w;
+    int y1 = y + h;
+    if (x1 > active_canvas->width) {
+        x1 = active_canvas->width;
+    }
+    if (y1 > active_canvas->height) {
+        y1 = active_canvas->height;
+    }
+    for (int yy = y0; yy < y1; yy++) {
+        for (int xx = x0; xx < x1; xx++) {
+            uint16_t *pixel = &active_canvas->pixels[yy * active_canvas->width + xx];
+            *pixel = blend_rgb565(*pixel, color, alpha);
         }
     }
 }
@@ -321,6 +361,7 @@ static const uint8_t *glyph_for(char ch)
         ['.'] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x0C},
         ['-'] = {0x00, 0x00, 0x00, 0x1F, 0x00, 0x00, 0x00},
         ['/'] = {0x01, 0x01, 0x02, 0x04, 0x08, 0x10, 0x10},
+        ['?'] = {0x0E, 0x11, 0x01, 0x02, 0x04, 0x00, 0x04},
         [' '] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
     };
     unsigned char index = (unsigned char)ch;
@@ -582,6 +623,216 @@ static uint16_t status_color(ornament_status_t status)
     }
 }
 
+static void draw_standby_wallpaper(void)
+{
+    if (active_canvas->width != STANDBY_WALLPAPER_WIDTH || active_canvas->height != STANDBY_WALLPAPER_HEIGHT) {
+        clear_canvas(HUD_BLACK);
+        return;
+    }
+    memcpy(
+        active_canvas->pixels,
+        standby_wallpaper_rgb565,
+        (size_t)STANDBY_WALLPAPER_WIDTH * STANDBY_WALLPAPER_HEIGHT * sizeof(uint16_t));
+}
+
+static void standby_temperature_text(const ornament_state_t *state, char *out, size_t out_size)
+{
+    if (out_size == 0) {
+        return;
+    }
+    if (state->has_weather && state->weather_temperature_c != INT32_MIN) {
+        snprintf(out, out_size, "%d", state->weather_temperature_c);
+        return;
+    }
+    snprintf(out, out_size, "--");
+}
+
+static void draw_standby_temperature(int x, int y, const char *value, int x_scale, int y_scale, uint16_t color)
+{
+    draw_text_xy(x, y, value, x_scale, y_scale, color);
+    int value_width = text_width_xy(value, x_scale);
+    int degree_x = x + value_width + ss(4);
+    int degree_y = y + ss(5);
+    fill_circle(degree_x, degree_y, ss(3), color);
+    draw_text_xy(degree_x + ss(8), y, "C", x_scale, y_scale, color);
+}
+
+static int standby_temperature_width(const char *value, int x_scale)
+{
+    return text_width_xy(value, x_scale) + ss(8) + text_width_xy("C", x_scale);
+}
+
+static void standby_reset_text(const ornament_state_t *state, char *out, size_t out_size)
+{
+    if (out_size == 0) {
+        return;
+    }
+    if (state == NULL || !state->has_quota) {
+        snprintf(out, out_size, "RESET --:--");
+        return;
+    }
+    reset_in_text(out, out_size, state->primary_resets_at);
+}
+
+static void draw_weather_cloud(int cx, int cy, int size, uint16_t color)
+{
+    fill_circle(cx - size / 2, cy + size / 8, size / 3, color);
+    fill_circle(cx - size / 10, cy - size / 7, size / 2, color);
+    fill_circle(cx + size / 2, cy + size / 10, size / 3, color);
+    fill_rect(cx - size * 3 / 4, cy + size / 10, size * 3 / 2, size / 3, color);
+}
+
+static void draw_weather_sun(int cx, int cy, int size)
+{
+    int r = size / 3;
+    fill_circle(cx, cy, r, HUD_AMBER);
+    fill_rect(cx - ss(2), cy - size / 2, ss(4), size / 6, HUD_AMBER);
+    fill_rect(cx - ss(2), cy + size / 3, ss(4), size / 6, HUD_AMBER);
+    fill_rect(cx - size / 2, cy - ss(2), size / 6, ss(4), HUD_AMBER);
+    fill_rect(cx + size / 3, cy - ss(2), size / 6, ss(4), HUD_AMBER);
+    fill_rect(cx - size / 3, cy - size / 3, ss(5), ss(5), HUD_AMBER);
+    fill_rect(cx + size / 4, cy - size / 3, ss(5), ss(5), HUD_AMBER);
+    fill_rect(cx - size / 3, cy + size / 4, ss(5), ss(5), HUD_AMBER);
+    fill_rect(cx + size / 4, cy + size / 4, ss(5), ss(5), HUD_AMBER);
+}
+
+static void draw_weather_rain(int cx, int cy, int size)
+{
+    draw_weather_cloud(cx, cy - size / 5, size, HUD_WHITE);
+    for (int i = -1; i <= 1; i++) {
+        int x = cx + i * size / 4;
+        fill_rect(x, cy + size / 4, ss(3), size / 4, HUD_CYAN);
+    }
+}
+
+static void draw_weather_snow(int cx, int cy, int size)
+{
+    draw_weather_cloud(cx, cy - size / 5, size, HUD_WHITE);
+    for (int i = -1; i <= 1; i++) {
+        int x = cx + i * size / 4;
+        int y = cy + size / 3;
+        fill_rect(x - ss(4), y, ss(9), ss(2), HUD_CYAN);
+        fill_rect(x, y - ss(4), ss(2), ss(9), HUD_CYAN);
+    }
+}
+
+static void draw_weather_fog(int cx, int cy, int size)
+{
+    draw_weather_cloud(cx, cy - size / 4, size, HUD_MUTED);
+    for (int i = 0; i < 3; i++) {
+        int y = cy + size / 5 + i * ss(8);
+        draw_hline(cx - size / 2, cx + size / 2, y, ss(2), HUD_CYAN);
+    }
+}
+
+static void draw_weather_storm(int cx, int cy, int size)
+{
+    draw_weather_cloud(cx, cy - size / 5, size, HUD_WHITE);
+    fill_rect(cx - ss(3), cy + size / 6, ss(7), size / 5, HUD_AMBER);
+    fill_rect(cx + ss(2), cy + size / 3, ss(7), size / 5, HUD_AMBER);
+    fill_rect(cx - ss(8), cy + size / 3, ss(13), ss(4), HUD_AMBER);
+}
+
+static void draw_weather_unknown(int cx, int cy, int size)
+{
+    draw_rect_outline(cx - size / 2, cy - size / 2, size, size, ss(2), HUD_MUTED);
+    draw_text(cx - ss(7), cy - ss(12), "?", ss(3), HUD_WHITE);
+}
+
+static void draw_weather_icon(const ornament_state_t *state, int cx, int cy, int size)
+{
+    if (state == NULL || !state->has_weather || strcmp(state->weather_status, "ok") != 0) {
+        draw_weather_unknown(cx, cy, size);
+        return;
+    }
+    if (strcmp(state->weather_icon, "sun") == 0) {
+        draw_weather_sun(cx, cy, size);
+    } else if (strcmp(state->weather_icon, "cloud") == 0) {
+        draw_weather_cloud(cx, cy, size, HUD_WHITE);
+    } else if (strcmp(state->weather_icon, "rain") == 0) {
+        draw_weather_rain(cx, cy, size);
+    } else if (strcmp(state->weather_icon, "snow") == 0) {
+        draw_weather_snow(cx, cy, size);
+    } else if (strcmp(state->weather_icon, "fog") == 0) {
+        draw_weather_fog(cx, cy, size);
+    } else if (strcmp(state->weather_icon, "storm") == 0) {
+        draw_weather_storm(cx, cy, size);
+    } else {
+        draw_weather_unknown(cx, cy, size);
+    }
+}
+
+static int wifi_signal_bars(const ornament_state_t *state)
+{
+    if (state == NULL || !state->wifi_connected) {
+        return 0;
+    }
+    if (state->wifi_rssi >= -67) {
+        return 4;
+    }
+    if (state->wifi_rssi >= -75) {
+        return 3;
+    }
+    if (state->wifi_rssi >= -82) {
+        return 2;
+    }
+    return 1;
+}
+
+static void draw_wifi_signal_icon(int center_x, int center_y, int bars)
+{
+    const uint16_t active = bars > 0 ? HUD_WHITE : HUD_AMBER;
+    const uint16_t inactive = bars > 0 ? HUD_MUTED : HUD_DIM_AMBER;
+    const int bar_width = ss(5);
+    const int gap = ss(4);
+    const int heights[] = {ss(9), ss(15), ss(21), ss(27)};
+    const int total_width = 4 * bar_width + 3 * gap;
+    const int left = center_x - total_width / 2;
+    const int bottom = center_y + ss(10);
+
+    for (int i = 0; i < 4; i++) {
+        uint16_t color = i < bars ? active : inactive;
+        fill_rect(left + i * (bar_width + gap), bottom - heights[i], bar_width, heights[i], color);
+    }
+}
+
+static void draw_standby_background(void)
+{
+    draw_standby_wallpaper();
+    blend_rect(0, 0, active_canvas->width, active_canvas->height, HUD_BLACK, 118);
+}
+
+static void draw_standby_header(const char *time_text, const char *date_text, const char *reset_text)
+{
+    draw_text_center_fit(sy(38), time_text, ss(7), HUD_WHITE);
+    draw_text_center_fit(sy(106), date_text, ss(3), HUD_WHITE);
+    draw_text_center_fit(sy(138), reset_text, ss(2), HUD_WHITE);
+}
+
+static void draw_standby_weather_row(const ornament_state_t *state, const char *temp_text)
+{
+    const int icon_size = ss(42);
+    const int icon_width = icon_size * 3 / 2;
+    const int gap = ss(20);
+    const int temp_x_scale = ss(5);
+    const int temp_y_scale = ss(5);
+    const int temp_width = standby_temperature_width(temp_text, temp_x_scale);
+    const int row_width = icon_width + gap + temp_width;
+    const int row_left = active_canvas->center_x - row_width / 2;
+    const int row_center_y = sy(252);
+    const int temp_y = row_center_y - (7 * temp_y_scale) / 2;
+    const int icon_cx = row_left + icon_width / 2;
+    const int temp_x = row_left + icon_width + gap;
+
+    draw_weather_icon(state, icon_cx, row_center_y, icon_size);
+    draw_standby_temperature(temp_x, temp_y, temp_text, temp_x_scale, temp_y_scale, HUD_WHITE);
+}
+
+static void draw_standby_connectivity(const ornament_state_t *state)
+{
+    draw_wifi_signal_icon(active_canvas->center_x, sy(342), wifi_signal_bars(state));
+}
+
 static void status_label(const ornament_state_t *state, char *out, size_t out_size)
 {
     if (out_size == 0) {
@@ -700,9 +951,9 @@ static void draw_quota_panel(
     draw_rect_outline(sx(28), sy(y), sx(304), sy(82), ss(1), panel_color);
     draw_text_xy(sx(38), sy(y + 13), label, ss(2), ss(2), HUD_MUTED);
     snprintf(percent_text, sizeof(percent_text), "%d%%", percent);
-    draw_text_right_fit_xy(active_canvas->width - sx(38), sy(y + 6), percent_text, ss(2), ss(3), active_color);
+    draw_text_right_fit_xy(active_canvas->width - sx(38), sy(y + 6), percent_text, ss(3), ss(3), active_color);
     draw_segment_bar(sx(38), sy(y + 52), sx(284), ss(8), percent, active_color, inactive_color);
-    draw_text_xy(sx(38), sy(y + 68), reset_text, ss(1), ss(1), HUD_WHITE);
+    draw_text_xy(sx(38), sy(y + 68), reset_text, 1, 1, HUD_WHITE);
 }
 
 static void draw_quota_rows(const ornament_state_t *state)
@@ -711,11 +962,14 @@ static void draw_quota_rows(const ornament_state_t *state)
     int weekly = percent_or_zero(state->secondary_remaining_percent);
     uint16_t alert = ui_accent_color_for(state);
     char reset_text[32];
+    char reset_time[24];
 
-    reset_in_text(reset_text, sizeof(reset_text), state->primary_resets_at);
+    reset_in_text(reset_time, sizeof(reset_time), state->primary_resets_at);
+    snprintf(reset_text, sizeof(reset_text), "CURRENT %s", reset_time);
     draw_quota_panel(88, "CURRENT", primary, reset_text, alert, HUD_PANEL_BLUE, HUD_DIM_BLUE);
 
-    reset_date_text(reset_text, sizeof(reset_text), state->secondary_resets_at);
+    reset_date_text(reset_time, sizeof(reset_time), state->secondary_resets_at);
+    snprintf(reset_text, sizeof(reset_text), "WEEKLY %s", reset_time);
     draw_quota_panel(198, "WEEKLY", weekly, reset_text, alert, HUD_PANEL_GREEN, HUD_DIM_GREEN);
 }
 
@@ -750,30 +1004,16 @@ void display_core_render_clock(display_core_canvas_t *canvas, const ornament_sta
 
     const char *time_text = state->local_time[0] != '\0' ? state->local_time : "--:--";
     const char *date_text = state->local_date[0] != '\0' ? state->local_date : "-- --";
-    char wifi_text[48];
-    char quota_text[32];
-    uint16_t accent = ui_accent_color_for(state);
+    char temp_text[16];
+    char reset_text[32];
 
-    if (state->wifi_connected) {
-        snprintf(wifi_text, sizeof(wifi_text), "WIFI %dDBM", state->wifi_rssi);
-    } else {
-        snprintf(wifi_text, sizeof(wifi_text), "WIFI OFF");
-    }
-    snprintf(
-        quota_text,
-        sizeof(quota_text),
-        "QUOTA %d%%/%d%%",
-        percent_or_zero(state->primary_remaining_percent),
-        percent_or_zero(state->secondary_remaining_percent));
+    standby_temperature_text(state, temp_text, sizeof(temp_text));
+    standby_reset_text(state, reset_text, sizeof(reset_text));
 
-    clear_canvas(HUD_BLACK);
-    draw_ring_ticks(state);
-    draw_rect_outline(sx(40), sy(78), sx(280), sy(156), ss(1), HUD_DIM_BLUE);
-    draw_text_center_fit(sy(50), "CODEX CLOCK", ss(2), HUD_WHITE);
-    draw_text_center_fit(sy(112), time_text, ss(7), accent);
-    draw_text_center_fit(sy(184), date_text, ss(3), HUD_MUTED);
-    draw_text_center_fit(sy(250), wifi_text, ss(2), state->wifi_connected ? HUD_CYAN : HUD_AMBER);
-    draw_text_center_fit(sy(284), quota_text, ss(2), HUD_WHITE);
+    draw_standby_background();
+    draw_standby_header(time_text, date_text, reset_text);
+    draw_standby_weather_row(state, temp_text);
+    draw_standby_connectivity(state);
 }
 
 static void render_message(display_core_canvas_t *canvas, const char *line1, const char *line2, uint16_t color)

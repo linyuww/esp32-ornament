@@ -12,6 +12,7 @@ idf_component_register(
     "web_console.c"
     "display.c"
     "display_core.c"
+    "assets/standby_wallpaper_rgb565.c"
     "wifi.c"
   INCLUDE_DIRS "."
   EMBED_FILES

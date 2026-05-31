@@ -1,5 +1,6 @@
 #include "ornament_state.h"
 
+#include <stdint.h>
 #include <string.h>
 
 #ifndef CONFIG_ORNAMENT_UI_FRAME_MS
@@ -20,6 +21,9 @@ void ornament_state_init(ornament_state_t *state)
     state->claude_task_status = ORNAMENT_STATUS_IDLE;
     state->primary_remaining_percent = -1;
     state->secondary_remaining_percent = -1;
+    state->weather_temperature_c = INT32_MIN;
+    state->weather_wind_kmh = -1;
+    state->weather_code = -1;
     state->active_task_count = 0;
 }
 

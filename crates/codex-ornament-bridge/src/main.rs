@@ -1,9 +1,9 @@
 use chrono::{DateTime, FixedOffset, Local};
 use quota_core::{get_quota_snapshot, state_path, write_state, QuotaSnapshot};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     env,
     fs::{self, File},
     io::{self, BufRead, BufReader, Read, Write},
@@ -22,10 +22,17 @@ const MAX_STATE_TASKS: usize = 8;
 const MAX_TASK_HISTORY: usize = 16;
 const TASK_EVENT_QUEUE_CAPACITY: usize = 64;
 const QUOTA_CACHE_TTL: Duration = Duration::from_secs(60);
+const WEATHER_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
+const WEATHER_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_WEATHER_LATITUDE: f64 = 39.99064;
+const DEFAULT_WEATHER_LONGITUDE: f64 = 116.28868;
+const DEFAULT_WEATHER_LABEL: &str = "HAIDIAN";
 const RECONCILED_DONE_NOTIFY_WINDOW: Duration = Duration::from_secs(120);
 const COMBINED_DONE_SOURCE_WINDOW: Duration = Duration::from_secs(5);
 const RECOVER_ACTIVE_TASK_WINDOW: Duration = Duration::from_secs(12 * 60 * 60);
 const RECOVER_ACTIVE_SESSION_SCAN_LIMIT: usize = 24;
+const ACTIVE_SESSION_FILE_MISSING_GRACE: Duration = Duration::from_secs(30);
+const SESSION_FORK_CHAIN_LIMIT: usize = 8;
 const DISCOVERY_MAGIC: &str = "codex-ornament-discover-v1";
 
 type SharedBridgeState = Arc<Mutex<BridgeState>>;
@@ -44,6 +51,8 @@ struct BridgeState {
     claude_done_seq: u64,
     next_anonymous_task_id: u64,
     quota: Option<CachedQuota>,
+    weather: Option<CachedWeather>,
+    weather_refreshing: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -52,12 +61,15 @@ struct CachedQuota {
     fetched_at: Instant,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 struct BridgeConfig {
     bind: String,
     token: Option<String>,
     tracked_session_id: Option<String>,
     codex_home: PathBuf,
+    weather_latitude: f64,
+    weather_longitude: f64,
+    weather_label: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -101,7 +113,39 @@ struct OrnamentState {
     done_task_count: usize,
     unmatched_stop_count: usize,
     quota: QuotaSnapshot,
+    weather: WeatherSnapshot,
     bridge: BridgeInfo,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct WeatherSnapshot {
+    status: String,
+    label: String,
+    summary: String,
+    icon: String,
+    temperature_c: Option<i32>,
+    wind_kmh: Option<i32>,
+    weather_code: Option<i32>,
+    observed_at: String,
+}
+
+#[derive(Clone, Debug)]
+struct CachedWeather {
+    snapshot: WeatherSnapshot,
+    fetched_at: Instant,
+}
+
+#[derive(Deserialize)]
+struct OpenMeteoResponse {
+    current: Option<OpenMeteoCurrent>,
+}
+
+#[derive(Deserialize)]
+struct OpenMeteoCurrent {
+    temperature_2m: Option<f64>,
+    weather_code: Option<i32>,
+    wind_speed_10m: Option<f64>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -197,6 +241,11 @@ fn run() -> io::Result<()> {
             .filter(|value| !value.trim().is_empty()),
         tracked_session_id: env_text("CODEX_ORNAMENT_SESSION_ID"),
         codex_home: codex_home(),
+        weather_latitude: env_f64("CODEX_ORNAMENT_WEATHER_LAT").unwrap_or(DEFAULT_WEATHER_LATITUDE),
+        weather_longitude: env_f64("CODEX_ORNAMENT_WEATHER_LON")
+            .unwrap_or(DEFAULT_WEATHER_LONGITUDE),
+        weather_label: env_text("CODEX_ORNAMENT_WEATHER_LABEL")
+            .unwrap_or_else(|| DEFAULT_WEATHER_LABEL.to_string()),
     };
     let listener = TcpListener::bind(&config.bind)?;
     let state = Arc::new(Mutex::new(BridgeState::default()));
@@ -256,6 +305,7 @@ fn handle_connection(
                 done_task_count: snapshot.done_task_count,
                 unmatched_stop_count: snapshot.unmatched_stop_count,
                 quota: cached_or_refresh_quota(&state),
+                weather: cached_or_refresh_weather(&state, &config),
                 bridge: BridgeInfo {
                     service: "codex-ornament-bridge",
                     observed_at: now_local(),
@@ -407,6 +457,8 @@ fn task_snapshot(state: &SharedBridgeState, config: &BridgeConfig) -> TaskSnapsh
     };
 
     recover_active_task_if_needed(&mut state, config);
+    dedupe_active_tasks_by_turn(&mut state);
+    dedupe_active_tasks_by_session_forks(&mut state, config);
     reconcile_active_tasks(&mut state, config);
     let active_task_count = state.active_tasks.len();
     let active_tasks = ordered_active_tasks(&state);
@@ -477,6 +529,7 @@ fn event_has_task_identity(event: &TaskEvent) -> bool {
 
 fn active_task_key_for_start(state: &mut BridgeState, event: &TaskEvent) -> String {
     if event.turn_id.is_some() {
+        remove_active_tasks_for_same_turn(state, event);
         if let Some(key) = stable_task_key(event) {
             return key;
         }
@@ -501,10 +554,11 @@ fn insert_active_task(state: &mut BridgeState, key: String, event: TaskEvent) {
 }
 
 fn finish_active_task(state: &mut BridgeState, event: &TaskEvent) -> bool {
-    if stable_task_key(event)
+    let matched_exact = stable_task_key(event)
         .and_then(|key| remove_active_task(state, &key))
-        .is_some()
-    {
+        .is_some();
+    let matched_same_turn = remove_active_tasks_for_same_turn(state, event) > 0;
+    if matched_exact || matched_same_turn {
         return true;
     }
 
@@ -515,6 +569,105 @@ fn finish_active_task(state: &mut BridgeState, event: &TaskEvent) -> bool {
     }
 
     false
+}
+
+fn remove_active_tasks_for_same_turn(state: &mut BridgeState, event: &TaskEvent) -> usize {
+    let Some(turn_id) = event.turn_id.as_deref() else {
+        return 0;
+    };
+
+    let keys = state
+        .active_order
+        .iter()
+        .filter_map(|key| {
+            state.active_tasks.get(key).and_then(|active| {
+                (active.turn_id.as_deref() == Some(turn_id) && task_sources_match(active, event))
+                    .then(|| key.clone())
+            })
+        })
+        .collect::<Vec<_>>();
+    let count = keys.len();
+    for key in keys {
+        remove_active_task(state, &key);
+    }
+    count
+}
+
+fn dedupe_active_tasks_by_turn(state: &mut BridgeState) {
+    let mut latest_by_turn = HashMap::new();
+    for key in state.active_order.iter() {
+        let Some(event) = state.active_tasks.get(key) else {
+            continue;
+        };
+        let Some(turn_id) = event.turn_id.as_deref() else {
+            continue;
+        };
+        latest_by_turn.insert((task_source_key(event), turn_id.to_string()), key.clone());
+    }
+
+    let stale_keys = state
+        .active_order
+        .iter()
+        .filter_map(|key| {
+            let event = state.active_tasks.get(key)?;
+            let turn_id = event.turn_id.as_deref()?;
+            let latest_key = latest_by_turn.get(&(task_source_key(event), turn_id.to_string()))?;
+            (latest_key != key).then(|| key.clone())
+        })
+        .collect::<Vec<_>>();
+
+    for key in stale_keys {
+        clear_active_task(state, &key);
+    }
+}
+
+fn dedupe_active_tasks_by_session_forks(state: &mut BridgeState, config: &BridgeConfig) {
+    let active_sessions = state
+        .active_order
+        .iter()
+        .filter_map(|key| {
+            let event = state.active_tasks.get(key)?;
+            Some((
+                key.clone(),
+                event.clone(),
+                event.session_id.as_deref()?.to_string(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    if active_sessions.len() < 2 {
+        return;
+    }
+
+    let mut ancestor_cache: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut stale_keys = HashSet::new();
+
+    for (descendant_key, descendant_event, descendant_session) in &active_sessions {
+        let ancestors = ancestor_cache
+            .entry(descendant_session.clone())
+            .or_insert_with(|| {
+                session_ancestor_ids(&config.codex_home, descendant_session)
+                    .into_iter()
+                    .collect()
+            });
+        if ancestors.is_empty() {
+            continue;
+        }
+
+        for (candidate_key, candidate_event, candidate_session) in &active_sessions {
+            if candidate_key == descendant_key
+                || !task_sources_match(candidate_event, descendant_event)
+            {
+                continue;
+            }
+            if ancestors.contains(candidate_session) {
+                stale_keys.insert(candidate_key.clone());
+            }
+        }
+    }
+
+    for key in stale_keys {
+        clear_active_task(state, &key);
+    }
 }
 
 fn remove_active_task(state: &mut BridgeState, key: &str) -> Option<TaskEvent> {
@@ -610,6 +763,9 @@ fn reconcile_active_tasks(state: &mut BridgeState, config: &BridgeConfig) {
         }
 
         let Some(terminal) = terminal_turn_for_event(&config.codex_home, &event) else {
+            if active_task_is_stale_against_session_log(&config.codex_home, &event) {
+                clear_active_task(state, &key);
+            }
             continue;
         };
 
@@ -1173,6 +1329,32 @@ fn terminal_turn_for_event(codex_home: &Path, event: &TaskEvent) -> Option<Termi
     terminal_turn_in_file(&session_file, turn_id).ok().flatten()
 }
 
+fn active_task_is_stale_against_session_log(codex_home: &Path, event: &TaskEvent) -> bool {
+    if done_source(event) != DoneSource::Codex {
+        return false;
+    }
+
+    let Some(session_id) = event.session_id.as_deref() else {
+        return false;
+    };
+    let Some(turn_id) = event.turn_id.as_deref() else {
+        return false;
+    };
+
+    let Some(session_file) = find_session_file(codex_home, session_id) else {
+        return timestamp_is_older_than(&event.received_at, ACTIVE_SESSION_FILE_MISSING_GRACE);
+    };
+
+    match active_task_in_session_file(&session_file, session_id) {
+        Ok(Some(active)) => {
+            active.turn_id.as_deref() != Some(turn_id)
+                && timestamp_is_older_than(&event.received_at, ACTIVE_SESSION_FILE_MISSING_GRACE)
+        }
+        Ok(None) => timestamp_is_older_than(&event.received_at, ACTIVE_SESSION_FILE_MISSING_GRACE),
+        Err(_) => false,
+    }
+}
+
 fn find_session_file(codex_home: &Path, session_id: &str) -> Option<PathBuf> {
     for root in [
         codex_home.join("sessions"),
@@ -1186,10 +1368,19 @@ fn find_session_file(codex_home: &Path, session_id: &str) -> Option<PathBuf> {
 }
 
 fn active_task_in_recent_session_files(codex_home: &Path) -> Option<TaskEvent> {
-    recent_session_files(&codex_home.join("sessions"))
+    let files = recent_session_files(&codex_home.join("sessions"));
+    let forked_parent_ids = files
+        .iter()
+        .filter_map(|path| session_fork_parent_id_in_file(path))
+        .collect::<HashSet<_>>();
+
+    files
         .into_iter()
         .filter_map(|path| {
             let session_id = session_id_from_file_name(&path)?;
+            if forked_parent_ids.contains(&session_id) {
+                return None;
+            }
             let active = active_task_in_session_file(&path, &session_id)
                 .ok()
                 .flatten()?;
@@ -1200,6 +1391,50 @@ fn active_task_in_recent_session_files(codex_home: &Path) -> Option<TaskEvent> {
             }
         })
         .next()
+}
+
+fn session_ancestor_ids(codex_home: &Path, session_id: &str) -> Vec<String> {
+    let mut ancestors = Vec::new();
+    let mut current = session_id.to_string();
+
+    for _ in 0..SESSION_FORK_CHAIN_LIMIT {
+        let Some(parent) = session_fork_parent_id(codex_home, &current) else {
+            break;
+        };
+        if parent.is_empty() || ancestors.iter().any(|ancestor| ancestor == &parent) {
+            break;
+        }
+
+        current = parent.clone();
+        ancestors.push(parent);
+    }
+
+    ancestors
+}
+
+fn session_fork_parent_id(codex_home: &Path, session_id: &str) -> Option<String> {
+    let session_file = find_session_file(codex_home, session_id)?;
+    session_fork_parent_id_in_file(&session_file)
+}
+
+fn session_fork_parent_id_in_file(path: &Path) -> Option<String> {
+    let file = File::open(path).ok()?;
+    let reader = BufReader::new(file);
+
+    for line in reader.lines() {
+        let line = line.ok()?;
+        let record = serde_json::from_str::<Value>(&line).ok()?;
+        if record.get("type").and_then(Value::as_str) != Some("session_meta") {
+            continue;
+        }
+        return record["payload"]
+            .get("forked_from_id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .filter(|value| !value.is_empty());
+    }
+
+    None
 }
 
 fn recent_session_files(root: &Path) -> Vec<PathBuf> {
@@ -1386,6 +1621,14 @@ fn timestamp_is_recent(timestamp: &str, window: Duration) -> bool {
     age.to_std().map(|age| age <= window).unwrap_or(false)
 }
 
+fn timestamp_is_older_than(timestamp: &str, window: Duration) -> bool {
+    let Ok(timestamp) = DateTime::parse_from_rfc3339(timestamp) else {
+        return false;
+    };
+    let age = Local::now().signed_duration_since(timestamp.with_timezone(&Local));
+    age.to_std().map(|age| age > window).unwrap_or(false)
+}
+
 fn cached_or_refresh_quota(state: &Arc<Mutex<BridgeState>>) -> QuotaSnapshot {
     if let Ok(state) = state.lock() {
         if let Some(cache) = state.quota.as_ref() {
@@ -1404,6 +1647,166 @@ fn cached_or_refresh_quota(state: &Arc<Mutex<BridgeState>>) -> QuotaSnapshot {
         });
     }
     snapshot
+}
+
+fn cached_or_refresh_weather(
+    state: &Arc<Mutex<BridgeState>>,
+    config: &BridgeConfig,
+) -> WeatherSnapshot {
+    if let Ok(state) = state.lock() {
+        if let Some(cache) = state.weather.as_ref() {
+            if cache.fetched_at.elapsed() < WEATHER_CACHE_TTL {
+                return cache.snapshot.clone();
+            }
+        }
+    }
+
+    maybe_spawn_weather_refresh(Arc::clone(state), config.clone());
+
+    if let Ok(state) = state.lock() {
+        if let Some(cache) = state.weather.as_ref() {
+            return cache.snapshot.clone();
+        }
+    }
+    weather_unavailable(config)
+}
+
+fn maybe_spawn_weather_refresh(state: SharedBridgeState, config: BridgeConfig) {
+    let should_spawn = {
+        let Ok(mut state) = state.lock() else {
+            return;
+        };
+        if state.weather_refreshing {
+            false
+        } else {
+            state.weather_refreshing = true;
+            true
+        }
+    };
+    if !should_spawn {
+        return;
+    }
+
+    std::thread::spawn(move || {
+        let fetched = fetch_weather_snapshot(&config);
+        let Ok(mut state) = state.lock() else {
+            return;
+        };
+        match fetched {
+            Ok(snapshot) => {
+                state.weather = Some(CachedWeather {
+                    snapshot,
+                    fetched_at: Instant::now(),
+                });
+            }
+            Err(error) => {
+                eprintln!("weather fetch failed: {error}");
+            }
+        }
+        state.weather_refreshing = false;
+    });
+}
+
+fn fetch_weather_snapshot(config: &BridgeConfig) -> io::Result<WeatherSnapshot> {
+    let url = open_meteo_url(config.weather_latitude, config.weather_longitude);
+    let client = reqwest::blocking::Client::builder()
+        .timeout(WEATHER_FETCH_TIMEOUT)
+        .build()
+        .map_err(io_other)?;
+    let response = client
+        .get(url)
+        .send()
+        .and_then(|response| response.error_for_status())
+        .map_err(io_other)?
+        .json::<OpenMeteoResponse>()
+        .map_err(io_other)?;
+    let Some(current) = response.current else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Open-Meteo response missing current weather",
+        ));
+    };
+
+    let temperature_c = current.temperature_2m.map(round_f64_to_i32);
+    let wind_kmh = current.wind_speed_10m.map(round_f64_to_i32);
+    let summary = current
+        .weather_code
+        .map(weather_summary_for_code)
+        .unwrap_or("WEATHER")
+        .to_string();
+    let icon = current
+        .weather_code
+        .map(weather_icon_for_code)
+        .unwrap_or("unknown")
+        .to_string();
+
+    Ok(WeatherSnapshot {
+        status: "ok".to_string(),
+        label: config.weather_label.clone(),
+        summary,
+        icon,
+        temperature_c,
+        wind_kmh,
+        weather_code: current.weather_code,
+        observed_at: now_local(),
+    })
+}
+
+fn open_meteo_url(latitude: f64, longitude: f64) -> String {
+    format!(
+        "https://api.open-meteo.com/v1/forecast?latitude={latitude:.4}&longitude={longitude:.4}&current=temperature_2m,weather_code,wind_speed_10m&timezone=auto"
+    )
+}
+
+fn weather_unavailable(config: &BridgeConfig) -> WeatherSnapshot {
+    WeatherSnapshot {
+        status: "unavailable".to_string(),
+        label: config.weather_label.clone(),
+        summary: "WEATHER --".to_string(),
+        icon: "unknown".to_string(),
+        temperature_c: None,
+        wind_kmh: None,
+        weather_code: None,
+        observed_at: now_local(),
+    }
+}
+
+fn round_f64_to_i32(value: f64) -> i32 {
+    if value.is_finite() {
+        value.round() as i32
+    } else {
+        0
+    }
+}
+
+fn weather_summary_for_code(code: i32) -> &'static str {
+    match code {
+        0 => "CLEAR",
+        1 | 2 => "PARTLY CLOUDY",
+        3 => "CLOUDY",
+        45 | 48 => "FOG",
+        51 | 53 | 55 | 56 | 57 => "DRIZZLE",
+        61 | 63 | 65 | 66 | 67 | 80 | 81 | 82 => "RAIN",
+        71 | 73 | 75 | 77 | 85 | 86 => "SNOW",
+        95 | 96 | 99 => "STORM",
+        _ => "WEATHER",
+    }
+}
+
+fn weather_icon_for_code(code: i32) -> &'static str {
+    match code {
+        0 => "sun",
+        1 | 2 | 3 => "cloud",
+        45 | 48 => "fog",
+        51 | 53 | 55 | 56 | 57 | 61 | 63 | 65 | 66 | 67 | 80 | 81 | 82 => "rain",
+        71 | 73 | 75 | 77 | 85 | 86 => "snow",
+        95 | 96 | 99 => "storm",
+        _ => "unknown",
+    }
+}
+
+fn io_other(error: impl std::error::Error + Send + Sync + 'static) -> io::Error {
+    io::Error::new(io::ErrorKind::Other, error)
 }
 
 fn write_json<T: Serialize>(stream: &mut TcpStream, status: u16, value: &T) -> io::Result<()> {
@@ -1446,6 +1849,10 @@ fn env_text(name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn env_f64(name: &str) -> Option<f64> {
+    env_text(name).and_then(|value| value.parse::<f64>().ok())
+}
+
 fn codex_home() -> PathBuf {
     env_text("CODEX_HOME")
         .map(PathBuf::from)
@@ -1475,6 +1882,9 @@ mod tests {
             token: token.map(str::to_string),
             tracked_session_id: None,
             codex_home: PathBuf::from(".codex-test"),
+            weather_latitude: DEFAULT_WEATHER_LATITUDE,
+            weather_longitude: DEFAULT_WEATHER_LONGITUDE,
+            weather_label: DEFAULT_WEATHER_LABEL.to_string(),
         }
     }
 
@@ -1484,7 +1894,66 @@ mod tests {
             token: None,
             tracked_session_id: Some(session_id.to_string()),
             codex_home: codex_home.into(),
+            weather_latitude: DEFAULT_WEATHER_LATITUDE,
+            weather_longitude: DEFAULT_WEATHER_LONGITUDE,
+            weather_label: DEFAULT_WEATHER_LABEL.to_string(),
         }
+    }
+
+    #[test]
+    fn maps_open_meteo_weather_codes_to_compact_display_labels() {
+        assert_eq!(weather_summary_for_code(0), "CLEAR");
+        assert_eq!(weather_summary_for_code(2), "PARTLY CLOUDY");
+        assert_eq!(weather_summary_for_code(45), "FOG");
+        assert_eq!(weather_summary_for_code(65), "RAIN");
+        assert_eq!(weather_summary_for_code(75), "SNOW");
+        assert_eq!(weather_summary_for_code(95), "STORM");
+        assert_eq!(weather_summary_for_code(999), "WEATHER");
+    }
+
+    #[test]
+    fn maps_open_meteo_weather_codes_to_display_icons() {
+        assert_eq!(weather_icon_for_code(0), "sun");
+        assert_eq!(weather_icon_for_code(2), "cloud");
+        assert_eq!(weather_icon_for_code(45), "fog");
+        assert_eq!(weather_icon_for_code(65), "rain");
+        assert_eq!(weather_icon_for_code(75), "snow");
+        assert_eq!(weather_icon_for_code(95), "storm");
+        assert_eq!(weather_icon_for_code(999), "unknown");
+    }
+
+    #[test]
+    fn builds_open_meteo_url_from_configured_coordinates() {
+        let url = open_meteo_url(31.23041, 121.47369);
+        assert!(url.contains("latitude=31.2304"));
+        assert!(url.contains("longitude=121.4737"));
+        assert!(url.contains("current=temperature_2m,weather_code,wind_speed_10m"));
+        assert!(url.contains("timezone=auto"));
+    }
+
+    #[test]
+    fn returns_cached_weather_before_fetching_again() {
+        let state = Arc::new(Mutex::new(BridgeState::default()));
+        let config = test_config(None);
+        let cached = WeatherSnapshot {
+            status: "ok".to_string(),
+            label: "TEST".to_string(),
+            summary: "CLEAR".to_string(),
+            icon: "sun".to_string(),
+            temperature_c: Some(25),
+            wind_kmh: Some(6),
+            weather_code: Some(0),
+            observed_at: "2026-05-31T12:00:00+08:00".to_string(),
+        };
+        {
+            let mut state = state.lock().unwrap();
+            state.weather = Some(CachedWeather {
+                snapshot: cached.clone(),
+                fetched_at: Instant::now(),
+            });
+        }
+
+        assert_eq!(cached_or_refresh_weather(&state, &config), cached);
     }
 
     #[test]
@@ -1648,7 +2117,7 @@ mod tests {
         let second = normalize_event(&json!({
             "hook_event_name": "UserPromptSubmit",
             "session_id": "session-2",
-            "turn_id": "turn-1"
+            "turn_id": "turn-2"
         }));
 
         apply_task_event(&mut state, first);
@@ -1663,8 +2132,67 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 "source:codex:session:session-1:turn:turn-1",
-                "source:codex:session:session-2:turn:turn-1"
+                "source:codex:session:session-2:turn:turn-2"
             ]
+        );
+    }
+
+    #[test]
+    fn reopening_same_turn_in_another_session_replaces_stale_active_task() {
+        let mut state = BridgeState::default();
+        let first = normalize_event(&json!({
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "session-1",
+            "turn_id": "turn-shared"
+        }));
+        let reopened = normalize_event(&json!({
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "session-2",
+            "turn_id": "turn-shared"
+        }));
+
+        apply_task_event(&mut state, first);
+        apply_task_event(&mut state, reopened);
+
+        assert_eq!(state.active_tasks.len(), 1);
+        assert_eq!(
+            state
+                .active_order
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["source:codex:session:session-2:turn:turn-shared"]
+        );
+    }
+
+    #[test]
+    fn stopping_reopened_turn_clears_stale_active_task_from_other_session() {
+        let mut state = BridgeState::default();
+        let first = normalize_event(&json!({
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "session-1",
+            "turn_id": "turn-shared"
+        }));
+        let reopened = normalize_event(&json!({
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "session-2",
+            "turn_id": "turn-shared"
+        }));
+        let stop = normalize_event(&json!({
+            "hook_event_name": "Stop",
+            "session_id": "session-2",
+            "turn_id": "turn-shared"
+        }));
+
+        apply_task_event(&mut state, first);
+        apply_task_event(&mut state, reopened);
+        apply_task_event(&mut state, stop);
+
+        assert_eq!(state.active_tasks.len(), 0);
+        assert_eq!(state.done_tasks.len(), 1);
+        assert_eq!(
+            state.task.as_ref().map(|event| event.status.as_str()),
+            Some("done")
         );
     }
 
@@ -1719,6 +2247,43 @@ mod tests {
         assert_eq!(
             state.task.as_ref().map(|event| event.status.as_str()),
             Some("done")
+        );
+    }
+
+    #[test]
+    fn snapshot_dedupes_existing_duplicate_active_turns() {
+        let state = Arc::new(Mutex::new(BridgeState::default()));
+        {
+            let mut state = state.lock().unwrap();
+            insert_active_task(
+                &mut state,
+                "source:codex:session:session-1:turn:turn-shared".to_string(),
+                normalize_event(&json!({
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": "session-1",
+                    "turn_id": "turn-shared"
+                })),
+            );
+            insert_active_task(
+                &mut state,
+                "source:codex:session:session-2:turn:turn-shared".to_string(),
+                normalize_event(&json!({
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": "session-2",
+                    "turn_id": "turn-shared"
+                })),
+            );
+        }
+
+        let snapshot = task_snapshot(&state, &test_config(None));
+
+        assert_eq!(snapshot.active_task_count, 1);
+        assert_eq!(
+            snapshot
+                .active_tasks
+                .first()
+                .and_then(|event| event.session_id.as_deref()),
+            Some("session-2")
         );
     }
 
@@ -2136,7 +2701,7 @@ mod tests {
                 normalize_event(&json!({
                     "hook_event_name": "UserPromptSubmit",
                     "session_id": "session-2",
-                    "turn_id": "turn-1"
+                    "turn_id": "turn-2"
                 })),
             );
             apply_task_event(
@@ -2414,6 +2979,224 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_drops_completed_active_task_when_session_log_has_terminal_turn() {
+        let codex_home = env::temp_dir().join(format!(
+            "codex-ornament-stale-terminal-{}",
+            std::process::id()
+        ));
+        let session_dir = codex_home
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("31");
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::write(
+            session_dir.join("rollout-2026-05-31T16-59-09-session-1.jsonl"),
+            concat!(
+                "{\"timestamp\":\"2026-05-31T12:00:00+08:00\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"turn-1\"}}\n",
+                "{\"timestamp\":\"2026-05-31T12:00:02+08:00\",\"payload\":{\"type\":\"task_complete\",\"turn_id\":\"turn-1\",\"last_agent_message\":\"done\"}}\n"
+            ),
+        )
+        .unwrap();
+        let state = Arc::new(Mutex::new(BridgeState::default()));
+        {
+            let mut state = state.lock().unwrap();
+            apply_task_event(
+                &mut state,
+                normalize_event(&json!({
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": "session-1",
+                    "turn_id": "turn-1"
+                })),
+            );
+        }
+
+        let snapshot = task_snapshot(&state, &scoped_test_config("session-1", &codex_home));
+        let _ = fs::remove_dir_all(&codex_home);
+
+        assert_eq!(snapshot.active_task_count, 0);
+        assert_eq!(snapshot.status, "done");
+        assert_eq!(snapshot.done_seq, 0);
+    }
+
+    #[test]
+    fn snapshot_drops_stale_active_task_when_session_log_moved_to_new_turn() {
+        let codex_home = env::temp_dir().join(format!(
+            "codex-ornament-stale-active-turn-{}",
+            std::process::id()
+        ));
+        let session_dir = codex_home
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("31");
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::write(
+            session_dir.join("rollout-2026-05-31T16-59-09-session-1.jsonl"),
+            concat!(
+                "{\"timestamp\":\"2026-05-31T12:00:00+08:00\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"turn-old\"}}\n",
+                "{\"timestamp\":\"2026-05-31T12:00:02+08:00\",\"payload\":{\"type\":\"task_complete\",\"turn_id\":\"turn-old\"}}\n",
+                "{\"timestamp\":\"2026-05-31T12:00:03+08:00\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"turn-new\"}}\n"
+            ),
+        )
+        .unwrap();
+        let state = Arc::new(Mutex::new(BridgeState::default()));
+        {
+            let mut state = state.lock().unwrap();
+            apply_task_event(
+                &mut state,
+                normalize_event(&json!({
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": "session-1",
+                    "turn_id": "turn-old"
+                })),
+            );
+        }
+
+        let snapshot = task_snapshot(&state, &scoped_test_config("session-1", &codex_home));
+        let _ = fs::remove_dir_all(&codex_home);
+
+        assert_eq!(snapshot.active_task_count, 0);
+        assert_eq!(snapshot.status, "done");
+    }
+
+    #[test]
+    fn snapshot_keeps_recent_active_task_when_session_file_is_not_written_yet() {
+        let state = Arc::new(Mutex::new(BridgeState::default()));
+        {
+            let mut state = state.lock().unwrap();
+            apply_task_event(
+                &mut state,
+                normalize_event(&json!({
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": "session-with-delayed-log",
+                    "turn_id": "turn-1"
+                })),
+            );
+        }
+
+        let snapshot = task_snapshot(&state, &test_config(None));
+
+        assert_eq!(snapshot.active_task_count, 1);
+        assert_eq!(snapshot.status, "running");
+    }
+
+    #[test]
+    fn snapshot_drops_old_active_task_when_session_file_is_missing() {
+        let state = Arc::new(Mutex::new(BridgeState::default()));
+        {
+            let mut state = state.lock().unwrap();
+            insert_active_task(
+                &mut state,
+                "source:codex:session:missing-session:turn:turn-1".to_string(),
+                TaskEvent {
+                    kind: "UserPromptSubmit".to_string(),
+                    status: "running".to_string(),
+                    title: "Codex running".to_string(),
+                    message: "old missing session".to_string(),
+                    received_at: "2026-05-31T00:00:00+08:00".to_string(),
+                    source: None,
+                    session_id: Some("missing-session".to_string()),
+                    turn_id: Some("turn-1".to_string()),
+                    cwd: None,
+                    model: None,
+                },
+            );
+        }
+
+        let snapshot = task_snapshot(&state, &test_config(None));
+
+        assert_eq!(snapshot.active_task_count, 0);
+        assert_eq!(snapshot.status, "done");
+    }
+
+    #[test]
+    fn snapshot_keeps_claude_task_when_no_codex_session_file_exists() {
+        let state = Arc::new(Mutex::new(BridgeState::default()));
+        {
+            let mut state = state.lock().unwrap();
+            apply_task_event(
+                &mut state,
+                normalize_event(&json!({
+                    "hook_event_name": "UserPromptSubmit",
+                    "source": "Claude",
+                    "session_id": "claude-session",
+                    "turn_id": "turn-1"
+                })),
+            );
+        }
+
+        let snapshot = task_snapshot(&state, &test_config(None));
+
+        assert_eq!(snapshot.active_task_count, 1);
+        assert_eq!(snapshot.source_tasks.claude.active_count, 1);
+        assert_eq!(snapshot.source_tasks.claude.status, "running");
+    }
+
+    #[test]
+    fn snapshot_keeps_child_session_and_drops_forked_parent_session() {
+        let codex_home =
+            env::temp_dir().join(format!("codex-ornament-fork-active-{}", std::process::id()));
+        let session_dir = codex_home
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("31");
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::write(
+            session_dir.join("rollout-2026-05-31T12-17-11-parent-session.jsonl"),
+            "{\"timestamp\":\"2026-05-31T08:00:00+08:00\",\"type\":\"session_meta\",\"payload\":{\"id\":\"parent-session\"}}\n",
+        )
+        .unwrap();
+        fs::write(
+            session_dir.join("rollout-2026-05-31T17-00-13-child-session.jsonl"),
+            "{\"timestamp\":\"2026-05-31T17:00:00+08:00\",\"type\":\"session_meta\",\"payload\":{\"id\":\"child-session\",\"forked_from_id\":\"parent-session\"}}\n",
+        )
+        .unwrap();
+        let state = Arc::new(Mutex::new(BridgeState::default()));
+        {
+            let mut state = state.lock().unwrap();
+            apply_task_event(
+                &mut state,
+                TaskEvent {
+                    kind: "UserPromptSubmit".to_string(),
+                    status: "running".to_string(),
+                    title: "Codex running".to_string(),
+                    message: "parent task".to_string(),
+                    received_at: "2026-05-31T12:00:00+08:00".to_string(),
+                    source: None,
+                    session_id: Some("parent-session".to_string()),
+                    turn_id: Some("parent-turn".to_string()),
+                    cwd: None,
+                    model: None,
+                },
+            );
+            apply_task_event(
+                &mut state,
+                normalize_event(&json!({
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": "child-session",
+                    "turn_id": "child-turn"
+                })),
+            );
+        }
+
+        let mut config = test_config(None);
+        config.codex_home = codex_home.clone();
+        let snapshot = task_snapshot(&state, &config);
+        let _ = fs::remove_dir_all(&codex_home);
+
+        assert_eq!(snapshot.active_task_count, 1);
+        assert_eq!(
+            snapshot
+                .active_tasks
+                .first()
+                .and_then(|event| event.session_id.as_deref()),
+            Some("child-session")
+        );
+    }
+
+    #[test]
     fn scoped_bridge_accepts_only_tracked_session_events() {
         let config = scoped_test_config("session-1", ".codex-test");
         let matching = normalize_event(&json!({
@@ -2459,7 +3242,7 @@ mod tests {
         let second = normalize_event(&json!({
             "hook_event_name": "UserPromptSubmit",
             "session_id": "session-2",
-            "turn_id": "turn-1"
+            "turn_id": "turn-2"
         }));
 
         assert_eq!(
@@ -2481,7 +3264,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 "source:codex:session:session-1:turn:turn-1",
-                "source:codex:session:session-2:turn:turn-1"
+                "source:codex:session:session-2:turn:turn-2"
             ]
         );
     }
@@ -2500,7 +3283,7 @@ mod tests {
                     let event = normalize_event(&json!({
                         "hook_event_name": "UserPromptSubmit",
                         "session_id": format!("session-{index}"),
-                        "turn_id": "turn-1"
+                        "turn_id": format!("turn-{index}")
                     }));
                     dispatch_task_event(&sender, event)
                 })
@@ -2514,9 +3297,9 @@ mod tests {
         let state = state.lock().unwrap();
         assert_eq!(state.active_tasks.len(), 8);
         for index in 0..8 {
-            assert!(state
-                .active_tasks
-                .contains_key(&format!("source:codex:session:session-{index}:turn:turn-1")));
+            assert!(state.active_tasks.contains_key(&format!(
+                "source:codex:session:session-{index}:turn:turn-{index}"
+            )));
         }
     }
 
@@ -2531,7 +3314,7 @@ mod tests {
             let event = normalize_event(&json!({
                 "hook_event_name": "UserPromptSubmit",
                 "session_id": format!("session-{index}"),
-                "turn_id": "turn-1"
+                "turn_id": format!("turn-{index}")
             }));
             assert_eq!(
                 dispatch_task_event(&sender, event),
@@ -2546,7 +3329,7 @@ mod tests {
                     let event = normalize_event(&json!({
                         "hook_event_name": "Stop",
                         "session_id": format!("session-{index}"),
-                        "turn_id": "turn-1",
+                        "turn_id": format!("turn-{index}"),
                         "message": format!("session-{index} done")
                     }));
                     dispatch_task_event(&sender, event)
@@ -2584,7 +3367,7 @@ mod tests {
                     let mut payload = json!({
                         "hook_event_name": "UserPromptSubmit",
                         "session_id": format!("shared-session-{index}"),
-                        "turn_id": "turn-1",
+                        "turn_id": format!("turn-{index}"),
                         "prompt": format!("task-{index}")
                     });
                     if index % 2 == 1 {
@@ -2615,7 +3398,7 @@ mod tests {
                     let mut payload = json!({
                         "hook_event_name": "Stop",
                         "session_id": format!("shared-session-{index}"),
-                        "turn_id": "turn-1",
+                        "turn_id": format!("turn-{index}"),
                         "message": format!("task-{index} done")
                     });
                     if index % 2 == 1 {
