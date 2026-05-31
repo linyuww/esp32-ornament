@@ -24,9 +24,10 @@ const TASK_EVENT_QUEUE_CAPACITY: usize = 64;
 const QUOTA_CACHE_TTL: Duration = Duration::from_secs(60);
 const WEATHER_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
 const WEATHER_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
-const DEFAULT_WEATHER_LATITUDE: f64 = 39.99064;
-const DEFAULT_WEATHER_LONGITUDE: f64 = 116.28868;
+const DEFAULT_WEATHER_LATITUDE: f64 = 39.99540087499999;
+const DEFAULT_WEATHER_LONGITUDE: f64 = 116.34162524999999;
 const DEFAULT_WEATHER_LABEL: &str = "HAIDIAN";
+const DEFAULT_WEATHER_PROVIDER: WeatherProvider = WeatherProvider::Auto;
 const RECONCILED_DONE_NOTIFY_WINDOW: Duration = Duration::from_secs(120);
 const COMBINED_DONE_SOURCE_WINDOW: Duration = Duration::from_secs(5);
 const RECOVER_ACTIVE_TASK_WINDOW: Duration = Duration::from_secs(12 * 60 * 60);
@@ -70,6 +71,18 @@ struct BridgeConfig {
     weather_latitude: f64,
     weather_longitude: f64,
     weather_label: String,
+    weather_provider: WeatherProvider,
+    qweather_host: Option<String>,
+    qweather_token: Option<String>,
+    caiyun_token: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WeatherProvider {
+    Auto,
+    OpenMeteo,
+    QWeather,
+    Caiyun,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -146,6 +159,45 @@ struct OpenMeteoCurrent {
     temperature_2m: Option<f64>,
     weather_code: Option<i32>,
     wind_speed_10m: Option<f64>,
+}
+
+#[derive(Deserialize)]
+struct QWeatherResponse {
+    code: String,
+    now: Option<QWeatherNow>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QWeatherNow {
+    obs_time: Option<String>,
+    temp: Option<String>,
+    icon: Option<String>,
+    text: Option<String>,
+    wind_speed: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CaiyunResponse {
+    status: String,
+    result: Option<CaiyunResult>,
+}
+
+#[derive(Deserialize)]
+struct CaiyunResult {
+    realtime: Option<CaiyunRealtime>,
+}
+
+#[derive(Deserialize)]
+struct CaiyunRealtime {
+    temperature: Option<f64>,
+    skycon: Option<String>,
+    wind: Option<CaiyunWind>,
+}
+
+#[derive(Deserialize)]
+struct CaiyunWind {
+    speed: Option<f64>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -246,6 +298,13 @@ fn run() -> io::Result<()> {
             .unwrap_or(DEFAULT_WEATHER_LONGITUDE),
         weather_label: env_text("CODEX_ORNAMENT_WEATHER_LABEL")
             .unwrap_or_else(|| DEFAULT_WEATHER_LABEL.to_string()),
+        weather_provider: env_weather_provider("CODEX_ORNAMENT_WEATHER_PROVIDER")
+            .unwrap_or(DEFAULT_WEATHER_PROVIDER),
+        qweather_host: env_text("CODEX_ORNAMENT_QWEATHER_HOST"),
+        qweather_token: env_text("CODEX_ORNAMENT_QWEATHER_TOKEN")
+            .or_else(|| env_text("CODEX_ORNAMENT_QWEATHER_KEY")),
+        caiyun_token: env_text("CODEX_ORNAMENT_CAIYUN_TOKEN")
+            .or_else(|| env_text("CODEX_ORNAMENT_CAIYUN_KEY")),
     };
     let listener = TcpListener::bind(&config.bind)?;
     let state = Arc::new(Mutex::new(BridgeState::default()));
@@ -659,7 +718,13 @@ fn dedupe_active_tasks_by_session_forks(state: &mut BridgeState, config: &Bridge
             {
                 continue;
             }
-            if ancestors.contains(candidate_session) {
+            if ancestors.contains(candidate_session)
+                && session_fork_happened_after_event(
+                    &config.codex_home,
+                    descendant_session,
+                    candidate_event,
+                )
+            {
                 stale_keys.insert(candidate_key.clone());
             }
         }
@@ -726,21 +791,20 @@ fn remember_done_task(state: &mut BridgeState, event: TaskEvent) {
 }
 
 fn recover_active_task_if_needed(state: &mut BridgeState, config: &BridgeConfig) {
-    if !state.active_tasks.is_empty() || state.task.is_some() {
-        return;
-    }
-
-    let event = if let Some(session_id) = config.tracked_session_id.as_deref() {
+    let events = if let Some(session_id) = config.tracked_session_id.as_deref() {
         active_task_for_session(&config.codex_home, session_id)
+            .into_iter()
+            .collect::<Vec<_>>()
     } else {
-        active_task_in_recent_session_files(&config.codex_home)
+        active_tasks_in_recent_session_files(&config.codex_home)
     };
 
-    let Some(event) = event else {
-        return;
-    };
-
-    apply_task_event(state, event);
+    for event in events {
+        if !event_in_scope(&event, config) || active_task_is_already_tracked(state, &event) {
+            continue;
+        }
+        apply_task_event(state, event);
+    }
 }
 
 fn active_task_for_session(codex_home: &Path, session_id: &str) -> Option<TaskEvent> {
@@ -748,6 +812,12 @@ fn active_task_for_session(codex_home: &Path, session_id: &str) -> Option<TaskEv
     active_task_in_session_file(&session_file, session_id)
         .ok()
         .flatten()
+}
+
+fn active_task_is_already_tracked(state: &BridgeState, event: &TaskEvent) -> bool {
+    stable_task_key(event)
+        .map(|key| state.active_tasks.contains_key(&key))
+        .unwrap_or(false)
 }
 
 fn reconcile_active_tasks(state: &mut BridgeState, config: &BridgeConfig) {
@@ -1367,30 +1437,17 @@ fn find_session_file(codex_home: &Path, session_id: &str) -> Option<PathBuf> {
     None
 }
 
-fn active_task_in_recent_session_files(codex_home: &Path) -> Option<TaskEvent> {
-    let files = recent_session_files(&codex_home.join("sessions"));
-    let forked_parent_ids = files
-        .iter()
-        .filter_map(|path| session_fork_parent_id_in_file(path))
-        .collect::<HashSet<_>>();
-
-    files
+fn active_tasks_in_recent_session_files(codex_home: &Path) -> Vec<TaskEvent> {
+    recent_session_files(&codex_home.join("sessions"))
         .into_iter()
         .filter_map(|path| {
             let session_id = session_id_from_file_name(&path)?;
-            if forked_parent_ids.contains(&session_id) {
-                return None;
-            }
-            let active = active_task_in_session_file(&path, &session_id)
+            active_task_in_session_file(&path, &session_id)
                 .ok()
-                .flatten()?;
-            if timestamp_is_recent(&active.received_at, RECOVER_ACTIVE_TASK_WINDOW) {
-                Some(active)
-            } else {
-                None
-            }
+                .flatten()
         })
-        .next()
+        .filter(|active| timestamp_is_recent(&active.received_at, RECOVER_ACTIVE_TASK_WINDOW))
+        .collect()
 }
 
 fn session_ancestor_ids(codex_home: &Path, session_id: &str) -> Vec<String> {
@@ -1412,13 +1469,38 @@ fn session_ancestor_ids(codex_home: &Path, session_id: &str) -> Vec<String> {
     ancestors
 }
 
+fn session_fork_happened_after_event(
+    codex_home: &Path,
+    descendant_session_id: &str,
+    event: &TaskEvent,
+) -> bool {
+    let Some(forked_at) = session_timestamp(codex_home, descendant_session_id) else {
+        return false;
+    };
+    timestamp_is_before(&event.received_at, &forked_at)
+}
+
 fn session_fork_parent_id(codex_home: &Path, session_id: &str) -> Option<String> {
     let session_file = find_session_file(codex_home, session_id)?;
     session_fork_parent_id_in_file(&session_file)
 }
 
+fn session_timestamp(codex_home: &Path, session_id: &str) -> Option<String> {
+    let session_file = find_session_file(codex_home, session_id)?;
+    session_metadata_in_file(&session_file).and_then(|metadata| metadata.timestamp)
+}
+
 fn session_fork_parent_id_in_file(path: &Path) -> Option<String> {
-    let file = File::open(path).ok()?;
+    session_metadata_in_file(path).and_then(|metadata| metadata.forked_from_id)
+}
+
+struct SessionMetadata {
+    forked_from_id: Option<String>,
+    timestamp: Option<String>,
+}
+
+fn session_metadata_in_file(path: &Path) -> Option<SessionMetadata> {
+    let file = open_shared_read(path).ok()?;
     let reader = BufReader::new(file);
 
     for line in reader.lines() {
@@ -1427,11 +1509,24 @@ fn session_fork_parent_id_in_file(path: &Path) -> Option<String> {
         if record.get("type").and_then(Value::as_str) != Some("session_meta") {
             continue;
         }
-        return record["payload"]
-            .get("forked_from_id")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .filter(|value| !value.is_empty());
+        let payload = &record["payload"];
+        return Some(SessionMetadata {
+            forked_from_id: payload
+                .get("forked_from_id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .filter(|value| !value.is_empty()),
+            timestamp: payload
+                .get("timestamp")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| {
+                    record
+                        .get("timestamp")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                }),
+        });
     }
 
     None
@@ -1507,10 +1602,35 @@ fn find_file_name_containing(root: &Path, needle: &str) -> Option<PathBuf> {
     None
 }
 
+fn open_shared_read(path: &Path) -> io::Result<File> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 0x00000001;
+        const FILE_SHARE_WRITE: u32 = 0x00000002;
+        const FILE_SHARE_DELETE: u32 = 0x00000004;
+
+        return fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(path);
+    }
+
+    #[cfg(not(windows))]
+    {
+        File::open(path)
+    }
+}
+
 fn active_task_in_session_file(path: &Path, session_id: &str) -> io::Result<Option<TaskEvent>> {
-    let file = File::open(path)?;
+    Ok(active_tasks_in_session_file(path, session_id)?.pop())
+}
+
+fn active_tasks_in_session_file(path: &Path, session_id: &str) -> io::Result<Vec<TaskEvent>> {
+    let file = open_shared_read(path)?;
     let reader = BufReader::new(file);
-    let mut active: Option<TaskEvent> = None;
+    let mut active: HashMap<String, TaskEvent> = HashMap::new();
+    let mut active_order = VecDeque::new();
 
     for line in reader.lines() {
         let line = line?;
@@ -1527,47 +1647,56 @@ fn active_task_in_session_file(path: &Path, session_id: &str) -> io::Result<Opti
                 let Some(turn_id) = payload.get("turn_id").and_then(Value::as_str) else {
                     continue;
                 };
-                active = Some(TaskEvent {
-                    kind: "UserPromptSubmit".to_string(),
-                    status: "running".to_string(),
-                    title: "Codex running".to_string(),
-                    message: "Codex running".to_string(),
-                    received_at: record
-                        .get("timestamp")
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                        .unwrap_or_else(now_local),
-                    source: None,
-                    session_id: Some(session_id.to_string()),
-                    turn_id: Some(turn_id.to_string()),
-                    cwd: None,
-                    model: None,
-                });
+                if !active.contains_key(turn_id) {
+                    active_order.push_back(turn_id.to_string());
+                }
+                active.insert(
+                    turn_id.to_string(),
+                    TaskEvent {
+                        kind: "UserPromptSubmit".to_string(),
+                        status: "running".to_string(),
+                        title: "Codex running".to_string(),
+                        message: "Codex running".to_string(),
+                        received_at: record
+                            .get("timestamp")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                            .unwrap_or_else(now_local),
+                        source: None,
+                        session_id: Some(session_id.to_string()),
+                        turn_id: Some(turn_id.to_string()),
+                        cwd: None,
+                        model: None,
+                    },
+                );
             }
             "turn_context" => {
-                if let Some(event) = active.as_mut() {
-                    if payload.get("turn_id").and_then(Value::as_str) == event.turn_id.as_deref() {
-                        event.cwd = text_field(payload, &["cwd"]).map(|value| clip(&value, 120));
-                        event.model = text_field(payload, &["model"]);
-                    }
+                let Some(turn_id) = payload.get("turn_id").and_then(Value::as_str) else {
+                    continue;
+                };
+                if let Some(event) = active.get_mut(turn_id) {
+                    event.cwd = text_field(payload, &["cwd"]).map(|value| clip(&value, 120));
+                    event.model = text_field(payload, &["model"]);
                 }
             }
             "task_complete" | "turn_aborted" => {
-                if let Some(event) = active.as_ref() {
-                    if payload.get("turn_id").and_then(Value::as_str) == event.turn_id.as_deref() {
-                        active = None;
-                    }
+                if let Some(turn_id) = payload.get("turn_id").and_then(Value::as_str) {
+                    active.remove(turn_id);
+                    active_order.retain(|candidate| candidate != turn_id);
                 }
             }
             _ => {}
         }
     }
 
-    Ok(active)
+    Ok(active_order
+        .into_iter()
+        .filter_map(|turn_id| active.remove(&turn_id))
+        .collect())
 }
 
 fn terminal_turn_in_file(path: &Path, turn_id: &str) -> io::Result<Option<TerminalTurn>> {
-    let file = File::open(path)?;
+    let file = open_shared_read(path)?;
     let reader = BufReader::new(file);
     let mut terminal = None;
 
@@ -1627,6 +1756,16 @@ fn timestamp_is_older_than(timestamp: &str, window: Duration) -> bool {
     };
     let age = Local::now().signed_duration_since(timestamp.with_timezone(&Local));
     age.to_std().map(|age| age > window).unwrap_or(false)
+}
+
+fn timestamp_is_before(left: &str, right: &str) -> bool {
+    let Ok(left) = DateTime::parse_from_rfc3339(left) else {
+        return false;
+    };
+    let Ok(right) = DateTime::parse_from_rfc3339(right) else {
+        return false;
+    };
+    left < right
 }
 
 fn cached_or_refresh_quota(state: &Arc<Mutex<BridgeState>>) -> QuotaSnapshot {
@@ -1708,18 +1847,64 @@ fn maybe_spawn_weather_refresh(state: SharedBridgeState, config: BridgeConfig) {
 }
 
 fn fetch_weather_snapshot(config: &BridgeConfig) -> io::Result<WeatherSnapshot> {
-    let url = open_meteo_url(config.weather_latitude, config.weather_longitude);
     let client = reqwest::blocking::Client::builder()
         .timeout(WEATHER_FETCH_TIMEOUT)
         .build()
         .map_err(io_other)?;
-    let response = client
-        .get(url)
-        .send()
-        .and_then(|response| response.error_for_status())
-        .map_err(io_other)?
-        .json::<OpenMeteoResponse>()
-        .map_err(io_other)?;
+    let mut last_error = None;
+
+    for provider in weather_fetch_order(config) {
+        let fetched = match provider {
+            WeatherProvider::Auto => unreachable!("auto is expanded by weather_fetch_order"),
+            WeatherProvider::OpenMeteo => fetch_open_meteo_weather(&client, config),
+            WeatherProvider::QWeather => fetch_qweather_weather(&client, config),
+            WeatherProvider::Caiyun => fetch_caiyun_weather(&client, config),
+        };
+        match fetched {
+            Ok(snapshot) => return Ok(snapshot),
+            Err(error) => {
+                eprintln!(
+                    "weather provider {} failed: {error}",
+                    weather_provider_name(provider)
+                );
+                last_error = Some(error);
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "no weather provider configured",
+        )
+    }))
+}
+
+fn weather_fetch_order(config: &BridgeConfig) -> Vec<WeatherProvider> {
+    match config.weather_provider {
+        WeatherProvider::Auto => {
+            let mut providers = Vec::new();
+            if config.caiyun_token.is_some() {
+                providers.push(WeatherProvider::Caiyun);
+            }
+            if config.qweather_host.is_some() && config.qweather_token.is_some() {
+                providers.push(WeatherProvider::QWeather);
+            }
+            providers.push(WeatherProvider::OpenMeteo);
+            providers
+        }
+        WeatherProvider::OpenMeteo => vec![WeatherProvider::OpenMeteo],
+        WeatherProvider::QWeather => vec![WeatherProvider::QWeather, WeatherProvider::OpenMeteo],
+        WeatherProvider::Caiyun => vec![WeatherProvider::Caiyun, WeatherProvider::OpenMeteo],
+    }
+}
+
+fn fetch_open_meteo_weather(
+    client: &reqwest::blocking::Client,
+    config: &BridgeConfig,
+) -> io::Result<WeatherSnapshot> {
+    let url = open_meteo_url(config.weather_latitude, config.weather_longitude);
+    let response = get_weather_json::<OpenMeteoResponse>(client, url, WeatherProvider::OpenMeteo)?;
     let Some(current) = response.current else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1731,12 +1916,12 @@ fn fetch_weather_snapshot(config: &BridgeConfig) -> io::Result<WeatherSnapshot> 
     let wind_kmh = current.wind_speed_10m.map(round_f64_to_i32);
     let summary = current
         .weather_code
-        .map(weather_summary_for_code)
+        .map(open_meteo_weather_summary_for_code)
         .unwrap_or("WEATHER")
         .to_string();
     let icon = current
         .weather_code
-        .map(weather_icon_for_code)
+        .map(open_meteo_weather_icon_for_code)
         .unwrap_or("unknown")
         .to_string();
 
@@ -1752,10 +1937,170 @@ fn fetch_weather_snapshot(config: &BridgeConfig) -> io::Result<WeatherSnapshot> 
     })
 }
 
+fn fetch_qweather_weather(
+    client: &reqwest::blocking::Client,
+    config: &BridgeConfig,
+) -> io::Result<WeatherSnapshot> {
+    let host = config.qweather_host.as_deref().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "CODEX_ORNAMENT_QWEATHER_HOST is required for qweather",
+        )
+    })?;
+    let token = config.qweather_token.as_deref().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "CODEX_ORNAMENT_QWEATHER_TOKEN is required for qweather",
+        )
+    })?;
+    let url = qweather_url(host, config.weather_latitude, config.weather_longitude);
+    let response = client
+        .get(url)
+        .bearer_auth(token)
+        .send()
+        .map_err(|error| weather_request_error(WeatherProvider::QWeather, error))?;
+    let response = response
+        .error_for_status()
+        .map_err(|error| weather_status_error(WeatherProvider::QWeather, error))?
+        .json::<QWeatherResponse>()
+        .map_err(|_| weather_parse_error(WeatherProvider::QWeather))?;
+    if response.code != "200" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("QWeather response code {}", response.code),
+        ));
+    };
+    let Some(now) = response.now else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "QWeather response missing now weather",
+        ));
+    };
+
+    let summary = qweather_summary(&now).to_string();
+    let icon = qweather_icon(&summary, now.icon.as_deref()).to_string();
+
+    Ok(WeatherSnapshot {
+        status: "ok".to_string(),
+        label: config.weather_label.clone(),
+        summary,
+        icon,
+        temperature_c: now.temp.as_deref().and_then(parse_i32_text),
+        wind_kmh: now.wind_speed.as_deref().and_then(parse_i32_text),
+        weather_code: now.icon.as_deref().and_then(parse_i32_text),
+        observed_at: now.obs_time.unwrap_or_else(now_local),
+    })
+}
+
+fn fetch_caiyun_weather(
+    client: &reqwest::blocking::Client,
+    config: &BridgeConfig,
+) -> io::Result<WeatherSnapshot> {
+    let token = config.caiyun_token.as_deref().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "CODEX_ORNAMENT_CAIYUN_TOKEN is required for caiyun",
+        )
+    })?;
+    let url = caiyun_realtime_url(token, config.weather_latitude, config.weather_longitude);
+    let response = get_weather_json::<CaiyunResponse>(client, url, WeatherProvider::Caiyun)?;
+    if response.status != "ok" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Caiyun response status {}", response.status),
+        ));
+    }
+    let Some(realtime) = response.result.and_then(|result| result.realtime) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Caiyun response missing realtime weather",
+        ));
+    };
+    let skycon = realtime.skycon.unwrap_or_else(|| "UNKNOWN".to_string());
+
+    Ok(WeatherSnapshot {
+        status: "ok".to_string(),
+        label: config.weather_label.clone(),
+        summary: caiyun_summary_for_skycon(&skycon).to_string(),
+        icon: caiyun_icon_for_skycon(&skycon).to_string(),
+        temperature_c: realtime.temperature.map(round_f64_to_i32),
+        wind_kmh: realtime
+            .wind
+            .and_then(|wind| wind.speed)
+            .map(round_f64_to_i32),
+        weather_code: None,
+        observed_at: now_local(),
+    })
+}
+
 fn open_meteo_url(latitude: f64, longitude: f64) -> String {
     format!(
         "https://api.open-meteo.com/v1/forecast?latitude={latitude:.4}&longitude={longitude:.4}&current=temperature_2m,weather_code,wind_speed_10m&timezone=auto"
     )
+}
+
+fn qweather_url(host: &str, latitude: f64, longitude: f64) -> String {
+    let host = host.trim_end_matches('/');
+    format!("{host}/v7/weather/now?location={longitude:.6},{latitude:.6}")
+}
+
+fn caiyun_realtime_url(token: &str, latitude: f64, longitude: f64) -> String {
+    format!("https://api.caiyunapp.com/v2.6/{token}/{longitude:.6},{latitude:.6}/realtime")
+}
+
+fn get_weather_json<T: for<'de> Deserialize<'de>>(
+    client: &reqwest::blocking::Client,
+    url: String,
+    provider: WeatherProvider,
+) -> io::Result<T> {
+    let response = client
+        .get(url)
+        .send()
+        .map_err(|error| weather_request_error(provider, error))?;
+    response
+        .error_for_status()
+        .map_err(|error| weather_status_error(provider, error))?
+        .json::<T>()
+        .map_err(|_| weather_parse_error(provider))
+}
+
+fn weather_request_error(provider: WeatherProvider, error: reqwest::Error) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Other,
+        format!(
+            "{} weather request failed: {error}",
+            weather_provider_name(provider)
+        ),
+    )
+}
+
+fn weather_status_error(provider: WeatherProvider, error: reqwest::Error) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Other,
+        format!(
+            "{} weather HTTP status failed: {error}",
+            weather_provider_name(provider)
+        ),
+    )
+}
+
+fn weather_parse_error(provider: WeatherProvider) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "{} weather response parse failed",
+            weather_provider_name(provider)
+        ),
+    )
+}
+
+fn weather_provider_name(provider: WeatherProvider) -> &'static str {
+    match provider {
+        WeatherProvider::Auto => "auto",
+        WeatherProvider::OpenMeteo => "openmeteo",
+        WeatherProvider::QWeather => "qweather",
+        WeatherProvider::Caiyun => "caiyun",
+    }
 }
 
 fn weather_unavailable(config: &BridgeConfig) -> WeatherSnapshot {
@@ -1779,7 +2124,7 @@ fn round_f64_to_i32(value: f64) -> i32 {
     }
 }
 
-fn weather_summary_for_code(code: i32) -> &'static str {
+fn open_meteo_weather_summary_for_code(code: i32) -> &'static str {
     match code {
         0 => "CLEAR",
         1 | 2 => "PARTLY CLOUDY",
@@ -1793,7 +2138,7 @@ fn weather_summary_for_code(code: i32) -> &'static str {
     }
 }
 
-fn weather_icon_for_code(code: i32) -> &'static str {
+fn open_meteo_weather_icon_for_code(code: i32) -> &'static str {
     match code {
         0 => "sun",
         1 | 2 | 3 => "cloud",
@@ -1803,6 +2148,73 @@ fn weather_icon_for_code(code: i32) -> &'static str {
         95 | 96 | 99 => "storm",
         _ => "unknown",
     }
+}
+
+fn qweather_summary(now: &QWeatherNow) -> &str {
+    now.text.as_deref().unwrap_or("WEATHER")
+}
+
+fn qweather_icon(summary: &str, icon: Option<&str>) -> &'static str {
+    if let Some(icon) = icon {
+        if let Ok(code) = icon.parse::<i32>() {
+            return match code {
+                100 => "sun",
+                101..=104 => "cloud",
+                150 => "sun",
+                151..=154 => "cloud",
+                300..=399 => "rain",
+                400..=499 => "snow",
+                500..=515 => "fog",
+                _ => "unknown",
+            };
+        }
+    }
+    compact_weather_icon(summary)
+}
+
+fn caiyun_summary_for_skycon(skycon: &str) -> &'static str {
+    match skycon {
+        "CLEAR_DAY" | "CLEAR_NIGHT" => "CLEAR",
+        "PARTLY_CLOUDY_DAY" | "PARTLY_CLOUDY_NIGHT" => "PARTLY CLOUDY",
+        "CLOUDY" => "CLOUDY",
+        "LIGHT_HAZE" | "MODERATE_HAZE" | "HEAVY_HAZE" | "FOG" => "FOG",
+        "LIGHT_RAIN" | "MODERATE_RAIN" | "HEAVY_RAIN" | "STORM_RAIN" => "RAIN",
+        "LIGHT_SNOW" | "MODERATE_SNOW" | "HEAVY_SNOW" | "STORM_SNOW" => "SNOW",
+        "DUST" | "SAND" | "WIND" => "WIND",
+        _ => "WEATHER",
+    }
+}
+
+fn caiyun_icon_for_skycon(skycon: &str) -> &'static str {
+    match skycon {
+        "CLEAR_DAY" | "CLEAR_NIGHT" => "sun",
+        "PARTLY_CLOUDY_DAY" | "PARTLY_CLOUDY_NIGHT" | "CLOUDY" => "cloud",
+        "LIGHT_HAZE" | "MODERATE_HAZE" | "HEAVY_HAZE" | "FOG" => "fog",
+        "LIGHT_RAIN" | "MODERATE_RAIN" | "HEAVY_RAIN" | "STORM_RAIN" => "rain",
+        "LIGHT_SNOW" | "MODERATE_SNOW" | "HEAVY_SNOW" | "STORM_SNOW" => "snow",
+        _ => "unknown",
+    }
+}
+
+fn compact_weather_icon(summary: &str) -> &'static str {
+    let summary = summary.to_ascii_lowercase();
+    if summary.contains("晴") || summary.contains("clear") || summary.contains("sun") {
+        "sun"
+    } else if summary.contains("云") || summary.contains("阴") || summary.contains("cloud") {
+        "cloud"
+    } else if summary.contains("雨") || summary.contains("rain") {
+        "rain"
+    } else if summary.contains("雪") || summary.contains("snow") {
+        "snow"
+    } else if summary.contains("雾") || summary.contains("霾") || summary.contains("fog") {
+        "fog"
+    } else {
+        "unknown"
+    }
+}
+
+fn parse_i32_text(value: &str) -> Option<i32> {
+    value.parse::<f64>().ok().map(round_f64_to_i32)
 }
 
 fn io_other(error: impl std::error::Error + Send + Sync + 'static) -> io::Error {
@@ -1853,6 +2265,20 @@ fn env_f64(name: &str) -> Option<f64> {
     env_text(name).and_then(|value| value.parse::<f64>().ok())
 }
 
+fn env_weather_provider(name: &str) -> Option<WeatherProvider> {
+    env_text(name).and_then(|value| parse_weather_provider(&value))
+}
+
+fn parse_weather_provider(value: &str) -> Option<WeatherProvider> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "auto" => Some(WeatherProvider::Auto),
+        "openmeteo" | "open-meteo" => Some(WeatherProvider::OpenMeteo),
+        "qweather" | "q-weather" | "heweather" => Some(WeatherProvider::QWeather),
+        "caiyun" | "caiyunapp" => Some(WeatherProvider::Caiyun),
+        _ => None,
+    }
+}
+
 fn codex_home() -> PathBuf {
     env_text("CODEX_HOME")
         .map(PathBuf::from)
@@ -1885,6 +2311,10 @@ mod tests {
             weather_latitude: DEFAULT_WEATHER_LATITUDE,
             weather_longitude: DEFAULT_WEATHER_LONGITUDE,
             weather_label: DEFAULT_WEATHER_LABEL.to_string(),
+            weather_provider: DEFAULT_WEATHER_PROVIDER,
+            qweather_host: None,
+            qweather_token: None,
+            caiyun_token: None,
         }
     }
 
@@ -1897,29 +2327,37 @@ mod tests {
             weather_latitude: DEFAULT_WEATHER_LATITUDE,
             weather_longitude: DEFAULT_WEATHER_LONGITUDE,
             weather_label: DEFAULT_WEATHER_LABEL.to_string(),
+            weather_provider: DEFAULT_WEATHER_PROVIDER,
+            qweather_host: None,
+            qweather_token: None,
+            caiyun_token: None,
         }
+    }
+
+    fn recent_timestamp(seconds_ago: i64) -> String {
+        (Local::now() - chrono::Duration::seconds(seconds_ago)).to_rfc3339()
     }
 
     #[test]
     fn maps_open_meteo_weather_codes_to_compact_display_labels() {
-        assert_eq!(weather_summary_for_code(0), "CLEAR");
-        assert_eq!(weather_summary_for_code(2), "PARTLY CLOUDY");
-        assert_eq!(weather_summary_for_code(45), "FOG");
-        assert_eq!(weather_summary_for_code(65), "RAIN");
-        assert_eq!(weather_summary_for_code(75), "SNOW");
-        assert_eq!(weather_summary_for_code(95), "STORM");
-        assert_eq!(weather_summary_for_code(999), "WEATHER");
+        assert_eq!(open_meteo_weather_summary_for_code(0), "CLEAR");
+        assert_eq!(open_meteo_weather_summary_for_code(2), "PARTLY CLOUDY");
+        assert_eq!(open_meteo_weather_summary_for_code(45), "FOG");
+        assert_eq!(open_meteo_weather_summary_for_code(65), "RAIN");
+        assert_eq!(open_meteo_weather_summary_for_code(75), "SNOW");
+        assert_eq!(open_meteo_weather_summary_for_code(95), "STORM");
+        assert_eq!(open_meteo_weather_summary_for_code(999), "WEATHER");
     }
 
     #[test]
     fn maps_open_meteo_weather_codes_to_display_icons() {
-        assert_eq!(weather_icon_for_code(0), "sun");
-        assert_eq!(weather_icon_for_code(2), "cloud");
-        assert_eq!(weather_icon_for_code(45), "fog");
-        assert_eq!(weather_icon_for_code(65), "rain");
-        assert_eq!(weather_icon_for_code(75), "snow");
-        assert_eq!(weather_icon_for_code(95), "storm");
-        assert_eq!(weather_icon_for_code(999), "unknown");
+        assert_eq!(open_meteo_weather_icon_for_code(0), "sun");
+        assert_eq!(open_meteo_weather_icon_for_code(2), "cloud");
+        assert_eq!(open_meteo_weather_icon_for_code(45), "fog");
+        assert_eq!(open_meteo_weather_icon_for_code(65), "rain");
+        assert_eq!(open_meteo_weather_icon_for_code(75), "snow");
+        assert_eq!(open_meteo_weather_icon_for_code(95), "storm");
+        assert_eq!(open_meteo_weather_icon_for_code(999), "unknown");
     }
 
     #[test]
@@ -1929,6 +2367,42 @@ mod tests {
         assert!(url.contains("longitude=121.4737"));
         assert!(url.contains("current=temperature_2m,weather_code,wind_speed_10m"));
         assert!(url.contains("timezone=auto"));
+    }
+
+    #[test]
+    fn builds_caiyun_realtime_url_with_token_in_path_and_lon_lat_order() {
+        let url = caiyun_realtime_url(
+            "token-123",
+            DEFAULT_WEATHER_LATITUDE,
+            DEFAULT_WEATHER_LONGITUDE,
+        );
+        assert_eq!(
+            url,
+            "https://api.caiyunapp.com/v2.6/token-123/116.341625,39.995401/realtime"
+        );
+    }
+
+    #[test]
+    fn auto_weather_prefers_caiyun_when_token_is_configured() {
+        let mut config = test_config(None);
+        config.caiyun_token = Some("token-123".to_string());
+        assert_eq!(
+            weather_fetch_order(&config),
+            vec![WeatherProvider::Caiyun, WeatherProvider::OpenMeteo]
+        );
+    }
+
+    #[test]
+    fn parses_weather_provider_names() {
+        assert_eq!(
+            parse_weather_provider("caiyun"),
+            Some(WeatherProvider::Caiyun)
+        );
+        assert_eq!(
+            parse_weather_provider("open-meteo"),
+            Some(WeatherProvider::OpenMeteo)
+        );
+        assert_eq!(parse_weather_provider("bad-provider"), None);
     }
 
     #[test]
@@ -3020,7 +3494,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_drops_stale_active_task_when_session_log_moved_to_new_turn() {
+    fn snapshot_replaces_stale_active_task_when_session_log_moved_to_new_turn() {
         let codex_home = env::temp_dir().join(format!(
             "codex-ornament-stale-active-turn-{}",
             std::process::id()
@@ -3031,12 +3505,15 @@ mod tests {
             .join("05")
             .join("31");
         fs::create_dir_all(&session_dir).unwrap();
+        let old_started_at = recent_timestamp(3);
+        let old_done_at = recent_timestamp(2);
+        let new_started_at = recent_timestamp(1);
         fs::write(
             session_dir.join("rollout-2026-05-31T16-59-09-session-1.jsonl"),
-            concat!(
-                "{\"timestamp\":\"2026-05-31T12:00:00+08:00\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"turn-old\"}}\n",
-                "{\"timestamp\":\"2026-05-31T12:00:02+08:00\",\"payload\":{\"type\":\"task_complete\",\"turn_id\":\"turn-old\"}}\n",
-                "{\"timestamp\":\"2026-05-31T12:00:03+08:00\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"turn-new\"}}\n"
+            format!(
+                "{{\"timestamp\":\"{old_started_at}\",\"payload\":{{\"type\":\"task_started\",\"turn_id\":\"turn-old\"}}}}\n\
+                 {{\"timestamp\":\"{old_done_at}\",\"payload\":{{\"type\":\"task_complete\",\"turn_id\":\"turn-old\"}}}}\n\
+                 {{\"timestamp\":\"{new_started_at}\",\"payload\":{{\"type\":\"task_started\",\"turn_id\":\"turn-new\"}}}}\n"
             ),
         )
         .unwrap();
@@ -3056,8 +3533,67 @@ mod tests {
         let snapshot = task_snapshot(&state, &scoped_test_config("session-1", &codex_home));
         let _ = fs::remove_dir_all(&codex_home);
 
-        assert_eq!(snapshot.active_task_count, 0);
+        assert_eq!(snapshot.active_task_count, 1);
         assert_eq!(snapshot.status, "done");
+        assert_eq!(
+            snapshot
+                .active_tasks
+                .first()
+                .and_then(|event| event.turn_id.as_deref()),
+            Some("turn-new")
+        );
+    }
+
+    #[test]
+    fn snapshot_recovers_recent_session_task_while_other_task_is_active() {
+        let codex_home = env::temp_dir().join(format!(
+            "codex-ornament-recover-with-active-{}",
+            std::process::id()
+        ));
+        let session_dir = codex_home
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("31");
+        fs::create_dir_all(&session_dir).unwrap();
+        let recovered_at = recent_timestamp(1);
+        fs::write(
+            session_dir.join("rollout-2026-05-31T20-42-42-11111111-1111-1111-1111-111111111111.jsonl"),
+            format!(
+                "{{\"timestamp\":\"{recovered_at}\",\"payload\":{{\"type\":\"task_started\",\"turn_id\":\"recovered-turn\"}}}}\n"
+            ),
+        )
+        .unwrap();
+        let state = Arc::new(Mutex::new(BridgeState::default()));
+        {
+            let mut state = state.lock().unwrap();
+            apply_task_event(
+                &mut state,
+                normalize_event(&json!({
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": "22222222-2222-2222-2222-222222222222",
+                    "turn_id": "memory-turn"
+                })),
+            );
+        }
+
+        let mut config = test_config(None);
+        config.codex_home = codex_home.clone();
+        let snapshot = task_snapshot(&state, &config);
+        let _ = fs::remove_dir_all(&codex_home);
+
+        assert_eq!(snapshot.active_task_count, 2);
+        assert_eq!(
+            snapshot
+                .active_tasks
+                .iter()
+                .filter_map(|event| event.session_id.as_deref())
+                .collect::<Vec<_>>(),
+            vec![
+                "22222222-2222-2222-2222-222222222222",
+                "11111111-1111-1111-1111-111111111111"
+            ]
+        );
     }
 
     #[test]
@@ -3193,6 +3729,84 @@ mod tests {
                 .first()
                 .and_then(|event| event.session_id.as_deref()),
             Some("child-session")
+        );
+    }
+
+    #[test]
+    fn snapshot_keeps_parent_task_started_after_child_session_fork() {
+        let codex_home = env::temp_dir().join(format!(
+            "codex-ornament-fork-parent-new-active-{}",
+            std::process::id()
+        ));
+        let session_dir = codex_home
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("31");
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::write(
+            session_dir.join("rollout-2026-05-31T12-17-11-11111111-1111-1111-1111-111111111111.jsonl"),
+            concat!(
+                "{\"timestamp\":\"2026-05-31T08:00:00+08:00\",\"type\":\"session_meta\",\"payload\":{\"id\":\"11111111-1111-1111-1111-111111111111\"}}\n",
+                "{\"timestamp\":\"2026-05-31T20:42:42+08:00\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"parent-new-turn\"}}\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            session_dir.join("rollout-2026-05-31T17-00-13-22222222-2222-2222-2222-222222222222.jsonl"),
+            concat!(
+                "{\"timestamp\":\"2026-05-31T17:00:00+08:00\",\"type\":\"session_meta\",\"payload\":{\"id\":\"22222222-2222-2222-2222-222222222222\",\"forked_from_id\":\"11111111-1111-1111-1111-111111111111\",\"timestamp\":\"2026-05-31T17:00:00+08:00\"}}\n",
+                "{\"timestamp\":\"2026-05-31T20:46:35+08:00\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"child-turn\"}}\n"
+            ),
+        )
+        .unwrap();
+        let state = Arc::new(Mutex::new(BridgeState::default()));
+
+        let mut config = test_config(None);
+        config.codex_home = codex_home.clone();
+        let snapshot = task_snapshot(&state, &config);
+        let _ = fs::remove_dir_all(&codex_home);
+
+        assert_eq!(snapshot.active_task_count, 2);
+        assert_eq!(
+            snapshot
+                .active_tasks
+                .iter()
+                .filter_map(|event| event.session_id.as_deref())
+                .collect::<Vec<_>>(),
+            vec![
+                "22222222-2222-2222-2222-222222222222",
+                "11111111-1111-1111-1111-111111111111"
+            ]
+        );
+    }
+
+    #[test]
+    fn session_log_parser_keeps_multiple_unfinished_turns() {
+        let path = env::temp_dir().join(format!(
+            "codex-ornament-multiple-active-{}.jsonl",
+            std::process::id()
+        ));
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-05-31T12:00:00+08:00\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"turn-1\"}}\n",
+                "{\"timestamp\":\"2026-05-31T12:00:01+08:00\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"turn-2\"}}\n",
+                "{\"timestamp\":\"2026-05-31T12:00:02+08:00\",\"payload\":{\"type\":\"task_complete\",\"turn_id\":\"turn-1\"}}\n",
+                "{\"timestamp\":\"2026-05-31T12:00:03+08:00\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"turn-3\"}}\n"
+            ),
+        )
+        .unwrap();
+
+        let active = active_tasks_in_session_file(&path, "session-1").unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(
+            active
+                .iter()
+                .filter_map(|event| event.turn_id.as_deref())
+                .collect::<Vec<_>>(),
+            vec!["turn-2", "turn-3"]
         );
     }
 
