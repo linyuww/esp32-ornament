@@ -196,10 +196,14 @@ static void poll_task(void *arg)
                     }
                 }
 
-                ornament_state_t error_state;
-                ornament_state_init(&error_state);
-                error_state.status = ORNAMENT_STATUS_ERROR;
-                publish_state(&error_state, err, last_done_tick, have_last_done_tick, true);
+                if (have_seen_state) {
+                    publish_state(&fetched_state, err, last_done_tick, have_last_done_tick, true);
+                } else {
+                    ornament_state_t error_state;
+                    ornament_state_init(&error_state);
+                    error_state.status = ORNAMENT_STATUS_ERROR;
+                    publish_state(&error_state, err, last_done_tick, have_last_done_tick, true);
+                }
             }
         }
 

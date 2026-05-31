@@ -24,6 +24,7 @@ const TASK_EVENT_QUEUE_CAPACITY: usize = 64;
 const QUOTA_CACHE_TTL: Duration = Duration::from_secs(60);
 const WEATHER_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
 const WEATHER_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
+const ACTIVE_RECOVERY_SCAN_TTL: Duration = Duration::from_secs(5);
 const DEFAULT_WEATHER_LATITUDE: f64 = 39.99540087499999;
 const DEFAULT_WEATHER_LONGITUDE: f64 = 116.34162524999999;
 const DEFAULT_WEATHER_LABEL: &str = "HAIDIAN";
@@ -54,11 +55,18 @@ struct BridgeState {
     quota: Option<CachedQuota>,
     weather: Option<CachedWeather>,
     weather_refreshing: bool,
+    active_recovery: Option<CachedActiveRecovery>,
 }
 
 #[derive(Clone, Debug)]
 struct CachedQuota {
     snapshot: QuotaSnapshot,
+    fetched_at: Instant,
+}
+
+#[derive(Clone, Debug)]
+struct CachedActiveRecovery {
+    events: Vec<TaskEvent>,
     fetched_at: Instant,
 }
 
@@ -740,7 +748,24 @@ fn remove_active_task(state: &mut BridgeState, key: &str) -> Option<TaskEvent> {
     if removed.is_some() {
         state.active_order.retain(|candidate| candidate != key);
     }
+    if let Some(event) = removed.as_ref() {
+        forget_active_recovery_event(state, event);
+    }
     removed
+}
+
+fn forget_active_recovery_event(state: &mut BridgeState, event: &TaskEvent) {
+    let Some(event_key) = stable_task_key(event) else {
+        return;
+    };
+    let Some(cache) = state.active_recovery.as_mut() else {
+        return;
+    };
+    cache.events.retain(|candidate| {
+        stable_task_key(candidate)
+            .map(|candidate_key| candidate_key != event_key)
+            .unwrap_or(true)
+    });
 }
 
 fn remove_recent_active_task_for_session(
@@ -796,7 +821,7 @@ fn recover_active_task_if_needed(state: &mut BridgeState, config: &BridgeConfig)
             .into_iter()
             .collect::<Vec<_>>()
     } else {
-        active_tasks_in_recent_session_files(&config.codex_home)
+        cached_active_recovery_events(state, config)
     };
 
     for event in events {
@@ -805,6 +830,21 @@ fn recover_active_task_if_needed(state: &mut BridgeState, config: &BridgeConfig)
         }
         apply_task_event(state, event);
     }
+}
+
+fn cached_active_recovery_events(state: &mut BridgeState, config: &BridgeConfig) -> Vec<TaskEvent> {
+    if let Some(cache) = state.active_recovery.as_ref() {
+        if cache.fetched_at.elapsed() < ACTIVE_RECOVERY_SCAN_TTL {
+            return cache.events.clone();
+        }
+    }
+
+    let events = active_tasks_in_recent_session_files(&config.codex_home);
+    state.active_recovery = Some(CachedActiveRecovery {
+        events: events.clone(),
+        fetched_at: Instant::now(),
+    });
+    events
 }
 
 fn active_task_for_session(codex_home: &Path, session_id: &str) -> Option<TaskEvent> {
@@ -1415,6 +1455,13 @@ fn active_task_is_stale_against_session_log(codex_home: &Path, event: &TaskEvent
         return timestamp_is_older_than(&event.received_at, ACTIVE_SESSION_FILE_MISSING_GRACE);
     };
 
+    if active_task_has_newer_turn_in_session_file(&session_file, event)
+        .ok()
+        .unwrap_or(false)
+    {
+        return true;
+    }
+
     match active_task_in_session_file(&session_file, session_id) {
         Ok(Some(active)) => {
             active.turn_id.as_deref() != Some(turn_id)
@@ -1442,9 +1489,13 @@ fn active_tasks_in_recent_session_files(codex_home: &Path) -> Vec<TaskEvent> {
         .into_iter()
         .filter_map(|path| {
             let session_id = session_id_from_file_name(&path)?;
-            active_task_in_session_file(&path, &session_id)
+            let active = active_task_in_session_file(&path, &session_id)
                 .ok()
-                .flatten()
+                .flatten()?;
+            let has_newer_turn = active_task_has_newer_turn_in_session_file(&path, &active)
+                .ok()
+                .unwrap_or(false);
+            (!has_newer_turn).then_some(active)
         })
         .filter(|active| timestamp_is_recent(&active.received_at, RECOVER_ACTIVE_TASK_WINDOW))
         .collect()
@@ -1505,6 +1556,9 @@ fn session_metadata_in_file(path: &Path) -> Option<SessionMetadata> {
 
     for line in reader.lines() {
         let line = line.ok()?;
+        if !line.contains("\"session_meta\"") {
+            continue;
+        }
         let record = serde_json::from_str::<Value>(&line).ok()?;
         if record.get("type").and_then(Value::as_str) != Some("session_meta") {
             continue;
@@ -1530,6 +1584,21 @@ fn session_metadata_in_file(path: &Path) -> Option<SessionMetadata> {
     }
 
     None
+}
+
+fn line_may_contain_active_task_record(line: &str) -> bool {
+    line.contains("\"task_started\"")
+        || line.contains("\"turn_context\"")
+        || line.contains("\"task_complete\"")
+        || line.contains("\"turn_aborted\"")
+        || line.contains("\"final_answer\"")
+}
+
+fn line_may_contain_terminal_task_record(line: &str) -> bool {
+    line.contains("\"task_started\"")
+        || line.contains("\"task_complete\"")
+        || line.contains("\"turn_aborted\"")
+        || line.contains("\"final_answer\"")
 }
 
 fn recent_session_files(root: &Path) -> Vec<PathBuf> {
@@ -1610,10 +1679,10 @@ fn open_shared_read(path: &Path) -> io::Result<File> {
         const FILE_SHARE_WRITE: u32 = 0x00000002;
         const FILE_SHARE_DELETE: u32 = 0x00000004;
 
-        return fs::OpenOptions::new()
+        fs::OpenOptions::new()
             .read(true)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-            .open(path);
+            .open(path)
     }
 
     #[cfg(not(windows))]
@@ -1634,10 +1703,18 @@ fn active_tasks_in_session_file(path: &Path, session_id: &str) -> io::Result<Vec
 
     for line in reader.lines() {
         let line = line?;
+        if !line_may_contain_active_task_record(&line) {
+            continue;
+        }
         let Ok(record) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
         let payload = &record["payload"];
+        if record_is_final_answer(&record, payload) {
+            remove_latest_active_turn(&mut active, &mut active_order);
+            continue;
+        }
+
         let Some(kind) = session_record_kind(&record, payload) else {
             continue;
         };
@@ -1699,22 +1776,61 @@ fn terminal_turn_in_file(path: &Path, turn_id: &str) -> io::Result<Option<Termin
     let file = open_shared_read(path)?;
     let reader = BufReader::new(file);
     let mut terminal = None;
+    let mut active_order = VecDeque::new();
 
     for line in reader.lines() {
         let line = line?;
+        if !line_may_contain_terminal_task_record(&line) {
+            continue;
+        }
         let Ok(record) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
         let payload = &record["payload"];
+        if record_is_final_answer(&record, payload) {
+            if active_order.back().map(String::as_str) == Some(turn_id) {
+                terminal = Some(TerminalTurn {
+                    kind: "task_complete".to_string(),
+                    timestamp: record
+                        .get("timestamp")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    message: final_answer_message(payload),
+                });
+            }
+            remove_latest_active_turn_id(&mut active_order);
+            continue;
+        }
+
         let Some(kind) = session_record_kind(&record, payload) else {
             continue;
         };
+
+        if kind == "task_started" {
+            if let Some(started_turn_id) = payload.get("turn_id").and_then(Value::as_str) {
+                remember_active_turn_id(&mut active_order, started_turn_id);
+            }
+            continue;
+        }
+
         if kind != "task_complete" && kind != "turn_aborted" {
             continue;
         }
-        if payload.get("turn_id").and_then(Value::as_str) != Some(turn_id) {
+        let Some(terminal_turn_id) = payload.get("turn_id").and_then(Value::as_str) else {
+            continue;
+        };
+        forget_active_turn_id(&mut active_order, terminal_turn_id);
+        if terminal_turn_id != turn_id {
             continue;
         }
+
+        let previous_message = terminal.as_ref().and_then(|terminal: &TerminalTurn| {
+            terminal
+                .message
+                .as_deref()
+                .filter(|message| !message.is_empty())
+                .map(str::to_string)
+        });
 
         terminal = Some(TerminalTurn {
             kind: kind.to_string(),
@@ -1722,11 +1838,51 @@ fn terminal_turn_in_file(path: &Path, turn_id: &str) -> io::Result<Option<Termin
                 .get("timestamp")
                 .and_then(Value::as_str)
                 .map(str::to_string),
-            message: terminal_message(payload),
+            message: terminal_message(payload).or(previous_message),
         });
     }
 
     Ok(terminal)
+}
+
+fn active_task_has_newer_turn_in_session_file(path: &Path, event: &TaskEvent) -> io::Result<bool> {
+    let Some(turn_id) = event.turn_id.as_deref() else {
+        return Ok(false);
+    };
+
+    let file = open_shared_read(path)?;
+    let reader = BufReader::new(file);
+    let mut saw_event_turn = false;
+
+    for line in reader.lines() {
+        let line = line?;
+        if !line.contains("\"task_started\"") {
+            continue;
+        }
+        let Ok(record) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let payload = &record["payload"];
+        if session_record_kind(&record, payload) != Some("task_started") {
+            continue;
+        }
+        let Some(started_turn_id) = payload.get("turn_id").and_then(Value::as_str) else {
+            continue;
+        };
+        if saw_event_turn && started_turn_id != turn_id {
+            return Ok(true);
+        }
+        if started_turn_id == turn_id {
+            saw_event_turn = true;
+        }
+    }
+
+    Ok(false)
+}
+
+fn record_is_final_answer(record: &Value, payload: &Value) -> bool {
+    record.get("type").and_then(Value::as_str) == Some("response_item")
+        && payload.get("phase").and_then(Value::as_str) == Some("final_answer")
 }
 
 fn session_record_kind<'a>(record: &'a Value, payload: &'a Value) -> Option<&'a str> {
@@ -1740,6 +1896,44 @@ fn terminal_message(payload: &Value) -> Option<String> {
     text_field(payload, &["last_agent_message", "message", "reason"])
         .map(|value| clip(value.trim(), 160))
         .filter(|value| !value.is_empty())
+}
+
+fn final_answer_message(payload: &Value) -> Option<String> {
+    payload
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item.get("text").and_then(Value::as_str))
+        .find_map(|text| {
+            let text = text.trim();
+            (!text.is_empty()).then(|| clip(text, 160))
+        })
+}
+
+fn remove_latest_active_turn(
+    active: &mut HashMap<String, TaskEvent>,
+    active_order: &mut VecDeque<String>,
+) {
+    while let Some(turn_id) = active_order.pop_back() {
+        if active.remove(&turn_id).is_some() {
+            return;
+        }
+    }
+}
+
+fn remember_active_turn_id(active_order: &mut VecDeque<String>, turn_id: &str) {
+    if !active_order.iter().any(|candidate| candidate == turn_id) {
+        active_order.push_back(turn_id.to_string());
+    }
+}
+
+fn forget_active_turn_id(active_order: &mut VecDeque<String>, turn_id: &str) {
+    active_order.retain(|candidate| candidate != turn_id);
+}
+
+fn remove_latest_active_turn_id(active_order: &mut VecDeque<String>) {
+    active_order.pop_back();
 }
 
 fn timestamp_is_recent(timestamp: &str, window: Duration) -> bool {
@@ -2065,23 +2259,17 @@ fn get_weather_json<T: for<'de> Deserialize<'de>>(
 }
 
 fn weather_request_error(provider: WeatherProvider, error: reqwest::Error) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::Other,
-        format!(
-            "{} weather request failed: {error}",
-            weather_provider_name(provider)
-        ),
-    )
+    io::Error::other(format!(
+        "{} weather request failed: {error}",
+        weather_provider_name(provider)
+    ))
 }
 
 fn weather_status_error(provider: WeatherProvider, error: reqwest::Error) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::Other,
-        format!(
-            "{} weather HTTP status failed: {error}",
-            weather_provider_name(provider)
-        ),
-    )
+    io::Error::other(format!(
+        "{} weather HTTP status failed: {error}",
+        weather_provider_name(provider)
+    ))
 }
 
 fn weather_parse_error(provider: WeatherProvider) -> io::Error {
@@ -2141,7 +2329,7 @@ fn open_meteo_weather_summary_for_code(code: i32) -> &'static str {
 fn open_meteo_weather_icon_for_code(code: i32) -> &'static str {
     match code {
         0 => "sun",
-        1 | 2 | 3 => "cloud",
+        1..=3 => "cloud",
         45 | 48 => "fog",
         51 | 53 | 55 | 56 | 57 | 61 | 63 | 65 | 66 | 67 | 80 | 81 | 82 => "rain",
         71 | 73 | 75 | 77 | 85 | 86 => "snow",
@@ -2218,7 +2406,7 @@ fn parse_i32_text(value: &str) -> Option<i32> {
 }
 
 fn io_other(error: impl std::error::Error + Send + Sync + 'static) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, error)
+    io::Error::other(error)
 }
 
 fn write_json<T: Serialize>(stream: &mut TcpStream, status: u16, value: &T) -> io::Result<()> {
@@ -3597,6 +3785,45 @@ mod tests {
     }
 
     #[test]
+    fn recovered_task_completed_during_cache_ttl_is_not_restored_again() {
+        let state = Arc::new(Mutex::new(BridgeState::default()));
+        let event = normalize_event(&json!({
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "session-1",
+            "turn_id": "turn-1"
+        }));
+        {
+            let mut state = state.lock().unwrap();
+            state.active_recovery = Some(CachedActiveRecovery {
+                events: vec![event.clone()],
+                fetched_at: Instant::now(),
+            });
+            apply_task_event(&mut state, event);
+        }
+
+        let config = test_config(None);
+        let first = task_snapshot(&state, &config);
+        assert_eq!(first.active_task_count, 1);
+
+        {
+            let mut state = state.lock().unwrap();
+            apply_task_event(
+                &mut state,
+                normalize_event(&json!({
+                    "hook_event_name": "Stop",
+                    "session_id": "session-1",
+                    "turn_id": "turn-1"
+                })),
+            );
+        }
+
+        let second = task_snapshot(&state, &config);
+        assert_eq!(second.active_task_count, 0);
+        assert_eq!(second.done_seq, 1);
+        assert_eq!(second.status, "done");
+    }
+
+    #[test]
     fn snapshot_keeps_recent_active_task_when_session_file_is_not_written_yet() {
         let state = Arc::new(Mutex::new(BridgeState::default()));
         {
@@ -3808,6 +4035,175 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["turn-2", "turn-3"]
         );
+    }
+
+    #[test]
+    fn session_log_parser_closes_latest_turn_on_final_answer() {
+        let path = env::temp_dir().join(format!(
+            "codex-ornament-final-answer-active-{}.jsonl",
+            std::process::id()
+        ));
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-05-31T12:00:00+08:00\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"turn-1\"}}\n",
+                "{\"timestamp\":\"2026-05-31T12:00:01+08:00\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"phase\":\"final_answer\",\"content\":[{\"type\":\"output_text\",\"text\":\"turn one done\"}]}}\n",
+                "{\"timestamp\":\"2026-05-31T12:00:02+08:00\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"turn-2\"}}\n"
+            ),
+        )
+        .unwrap();
+
+        let active = active_tasks_in_session_file(&path, "session-1").unwrap();
+        let terminal = terminal_turn_in_file(&path, "turn-1").unwrap().unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(
+            active
+                .iter()
+                .filter_map(|event| event.turn_id.as_deref())
+                .collect::<Vec<_>>(),
+            vec!["turn-2"]
+        );
+        assert_eq!(terminal.kind, "task_complete");
+        assert_eq!(terminal.message.as_deref(), Some("turn one done"));
+    }
+
+    #[test]
+    fn recent_recovery_ignores_orphaned_turn_when_newer_turn_started() {
+        let codex_home = env::temp_dir().join(format!(
+            "codex-ornament-orphan-newer-turn-{}",
+            std::process::id()
+        ));
+        let session_dir = codex_home
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("31");
+        fs::create_dir_all(&session_dir).unwrap();
+        let old_started_at = recent_timestamp(4);
+        let new_started_at = recent_timestamp(2);
+        let new_done_at = recent_timestamp(1);
+        fs::write(
+            session_dir.join("rollout-2026-05-31T16-59-09-019e7467-fc36-7750-8418-f2bf0397bd05.jsonl"),
+            format!(
+                "{{\"timestamp\":\"{old_started_at}\",\"payload\":{{\"type\":\"task_started\",\"turn_id\":\"turn-orphan\"}}}}\n\
+                 {{\"timestamp\":\"{new_started_at}\",\"payload\":{{\"type\":\"task_started\",\"turn_id\":\"turn-new\"}}}}\n\
+                 {{\"timestamp\":\"{new_done_at}\",\"payload\":{{\"type\":\"task_complete\",\"turn_id\":\"turn-new\"}}}}\n"
+            ),
+        )
+        .unwrap();
+
+        let active = active_tasks_in_recent_session_files(&codex_home);
+        let _ = fs::remove_dir_all(&codex_home);
+
+        assert!(active.is_empty(), "{active:?}");
+    }
+
+    #[test]
+    fn snapshot_drops_orphaned_turn_after_final_answer_without_hook_complete() {
+        let codex_home = env::temp_dir().join(format!(
+            "codex-ornament-orphan-final-answer-{}",
+            std::process::id()
+        ));
+        let session_dir = codex_home
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("31");
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::write(
+            session_dir.join("rollout-2026-05-31T16-59-09-session-1.jsonl"),
+            concat!(
+                "{\"timestamp\":\"2026-05-31T12:00:00+08:00\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"turn-1\"}}\n",
+                "{\"timestamp\":\"2026-05-31T12:00:10+08:00\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"phase\":\"final_answer\",\"content\":[{\"type\":\"output_text\",\"text\":\"firmware flashed\"}]}}\n"
+            ),
+        )
+        .unwrap();
+        let state = Arc::new(Mutex::new(BridgeState::default()));
+        {
+            let mut state = state.lock().unwrap();
+            apply_task_event(
+                &mut state,
+                normalize_event(&json!({
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": "session-1",
+                    "turn_id": "turn-1"
+                })),
+            );
+        }
+
+        let snapshot = task_snapshot(&state, &scoped_test_config("session-1", &codex_home));
+        let _ = fs::remove_dir_all(&codex_home);
+
+        assert_eq!(snapshot.active_task_count, 0);
+        assert_eq!(snapshot.status, "done");
+    }
+
+    #[test]
+    fn final_answer_reconcile_preserves_other_running_sessions() {
+        let codex_home = env::temp_dir().join(format!(
+            "codex-ornament-orphan-concurrent-{}",
+            std::process::id()
+        ));
+        let session_dir = codex_home
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("31");
+        fs::create_dir_all(&session_dir).unwrap();
+        let first_started_at = recent_timestamp(4);
+        let second_started_at = recent_timestamp(3);
+        let first_done_at = recent_timestamp(2);
+        fs::write(
+            session_dir.join("rollout-2026-05-31T16-59-09-session-1.jsonl"),
+            format!(
+                "{{\"timestamp\":\"{first_started_at}\",\"payload\":{{\"type\":\"task_started\",\"turn_id\":\"turn-1\"}}}}\n\
+                 {{\"timestamp\":\"{first_done_at}\",\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"phase\":\"final_answer\",\"content\":[{{\"type\":\"output_text\",\"text\":\"first done\"}}]}}}}\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            session_dir.join("rollout-2026-05-31T16-59-10-session-2.jsonl"),
+            format!(
+                "{{\"timestamp\":\"{second_started_at}\",\"payload\":{{\"type\":\"task_started\",\"turn_id\":\"turn-2\"}}}}\n"
+            ),
+        )
+        .unwrap();
+        let state = Arc::new(Mutex::new(BridgeState::default()));
+        {
+            let mut state = state.lock().unwrap();
+            apply_task_event(
+                &mut state,
+                normalize_event(&json!({
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": "session-1",
+                    "turn_id": "turn-1"
+                })),
+            );
+            apply_task_event(
+                &mut state,
+                normalize_event(&json!({
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": "session-2",
+                    "turn_id": "turn-2"
+                })),
+            );
+        }
+
+        let mut config = test_config(None);
+        config.codex_home = codex_home.clone();
+        let snapshot = task_snapshot(&state, &config);
+        let _ = fs::remove_dir_all(&codex_home);
+
+        assert_eq!(snapshot.active_task_count, 1);
+        assert_eq!(
+            snapshot
+                .active_tasks
+                .first()
+                .and_then(|event| event.session_id.as_deref()),
+            Some("session-2")
+        );
+        assert_eq!(snapshot.status, "done");
     }
 
     #[test]

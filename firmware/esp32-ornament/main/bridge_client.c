@@ -15,6 +15,7 @@
 
 static const char *TAG = "bridge_client";
 static const int MAX_RESPONSE_BYTES = 8192;
+static const int BRIDGE_FETCH_TIMEOUT_MS = 10000;
 static const int DISCOVERY_UDP_PORT = 8787;
 static const char *DISCOVERY_MAGIC = "codex-ornament-discover-v1";
 static const int DISCOVERY_TIMEOUT_MS = 1200;
@@ -483,7 +484,7 @@ esp_err_t bridge_client_fetch_state(ornament_state_t *state)
         settings_bridge_url_or_default(&settings),
         response,
         MAX_RESPONSE_BYTES,
-        2500,
+        BRIDGE_FETCH_TIMEOUT_MS,
         &status_code,
         &response_len);
     (void)response_len;
