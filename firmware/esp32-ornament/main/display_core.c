@@ -239,7 +239,8 @@ static uint16_t alert_dim_color_for(const ornament_state_t *state)
 
 static void draw_ring_ticks(const ornament_state_t *state)
 {
-    bool marquee = state->status == ORNAMENT_STATUS_RUNNING && !state->done_flash_active;
+    ornament_status_t panel_status = ornament_state_panel_status(state);
+    bool marquee = panel_status == ORNAMENT_STATUS_RUNNING && !state->done_flash_active;
     uint16_t ring_color = alert_color_for(state);
     uint16_t dim_color = alert_dim_color_for(state);
     uint16_t trail_color = marquee ? dim_color : ring_color;
@@ -587,13 +588,13 @@ static void status_label(const ornament_state_t *state, char *out, size_t out_si
         return;
     }
 
-    if (state != NULL && state->status == ORNAMENT_STATUS_RUNNING && state->active_task_count > 1) {
+    ornament_status_t status = ornament_state_panel_status(state);
+    if (state != NULL && status == ORNAMENT_STATUS_RUNNING && state->active_task_count > 1) {
         snprintf(out, out_size, "%d TASKS", state->active_task_count);
         return;
     }
 
     const char *label = "DONE";
-    ornament_status_t status = state != NULL ? state->status : ORNAMENT_STATUS_DONE;
     switch (status) {
     case ORNAMENT_STATUS_RUNNING:
         label = "1 TASK";
@@ -617,7 +618,7 @@ static void status_label(const ornament_state_t *state, char *out, size_t out_si
 
 static uint16_t active_dot_color_for(const ornament_state_t *state, uint16_t status)
 {
-    if (state->status != ORNAMENT_STATUS_RUNNING) {
+    if (ornament_state_panel_status(state) != ORNAMENT_STATUS_RUNNING) {
         return status;
     }
 
@@ -635,7 +636,11 @@ static uint16_t active_dot_color_for(const ornament_state_t *state, uint16_t sta
 
 static void draw_status_badge(const ornament_state_t *state)
 {
-    uint16_t color = status_color(state->status);
+    ornament_status_t panel_status = ornament_state_panel_status(state);
+    uint16_t color = status_color(panel_status);
+    if (state->done_flash_active && panel_status == ORNAMENT_STATUS_DONE) {
+        color = state->done_flash_on ? HUD_GREEN : HUD_DIM_GREEN;
+    }
     uint16_t dot_color = active_dot_color_for(state, color);
     char label[24];
     status_label(state, label, sizeof(label));
@@ -653,7 +658,7 @@ static void draw_status_badge(const ornament_state_t *state)
     fill_circle(dot_x, dot_y + dot / 2, dot / 2, dot_color);
     draw_text_xy(text_x, y, label, x_scale, y_scale, color);
 
-    if (state->status == ORNAMENT_STATUS_ERROR) {
+    if (panel_status == ORNAMENT_STATUS_ERROR) {
         draw_rect_outline(sx(18), sy(18), sx(324), sy(324), ss(2), HUD_RED);
     }
 }

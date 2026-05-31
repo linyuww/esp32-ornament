@@ -19,30 +19,29 @@ static const char *TAG = "ornament";
 
 static bool ui_needs_animation(const ornament_state_t *state)
 {
-    return state->status == ORNAMENT_STATUS_RUNNING || state->done_flash_active;
+    return ornament_state_panel_status(state) == ORNAMENT_STATUS_RUNNING || state->done_flash_active;
 }
 
 static bool should_show_standby_clock(const ornament_state_t *state, TickType_t idle_since_tick, TickType_t now)
 {
     return CONFIG_ORNAMENT_STANDBY_CLOCK_MS > 0 &&
-           state->status == ORNAMENT_STATUS_IDLE &&
+           ornament_state_panel_status(state) == ORNAMENT_STATUS_IDLE &&
            idle_since_tick != 0 &&
            (now - idle_since_tick) >= pdMS_TO_TICKS(CONFIG_ORNAMENT_STANDBY_CLOCK_MS);
 }
 
-static void update_local_animation(ornament_state_t *state, TickType_t now, TickType_t last_done_tick)
+static uint32_t ticks_to_ms(TickType_t ticks)
 {
-    state->active_dot_phase = (uint8_t)((now / pdMS_TO_TICKS(CONFIG_ORNAMENT_UI_FRAME_MS)) & 0x03);
-    state->done_flash_active = false;
-    state->done_flash_on = false;
+    return (uint32_t)(ticks * portTICK_PERIOD_MS);
+}
 
-    if (state->status == ORNAMENT_STATUS_DONE && CONFIG_ORNAMENT_DONE_FLASH_MS > 0) {
-        TickType_t elapsed = now - last_done_tick;
-        TickType_t flash_window = pdMS_TO_TICKS(CONFIG_ORNAMENT_DONE_FLASH_MS);
-        TickType_t flash_step = pdMS_TO_TICKS(400);
-        state->done_flash_active = elapsed < flash_window;
-        state->done_flash_on = flash_step > 0 && ((elapsed / flash_step) % 2) == 0;
-    }
+static void update_local_animation(
+    ornament_state_t *state,
+    TickType_t now,
+    TickType_t last_done_tick,
+    bool have_last_done_tick)
+{
+    ornament_state_update_display_timing(state, ticks_to_ms(now), ticks_to_ms(last_done_tick), have_last_done_tick);
 }
 
 static void render_current_state(const ornament_state_t *state, TickType_t idle_since_tick, TickType_t now)
@@ -98,6 +97,7 @@ static void poll_task(void *arg)
     int last_done_seq = 0;
     bool have_state = false;
     bool have_seen_state = false;
+    bool have_last_done_tick = false;
     bool last_render_was_error = false;
     TickType_t next_auto_match = 0;
 
@@ -117,6 +117,7 @@ static void poll_task(void *arg)
                 }
                 if (is_new_done_event(&state, have_seen_state, last_done_seq)) {
                     last_done_tick = now;
+                    have_last_done_tick = true;
                     asrpro_link_notify_done();
                     task_audio_play_done();
                 }
@@ -133,7 +134,7 @@ static void poll_task(void *arg)
                 previous_status = state.status;
                 have_seen_state = true;
 
-                update_local_animation(&state, now, last_done_tick);
+                update_local_animation(&state, now, last_done_tick, have_last_done_tick);
                 system_status_update(&state);
                 web_console_set_last_state(&state, err);
                 render_now = true;
@@ -164,7 +165,7 @@ static void poll_task(void *arg)
             }
         } else if (have_state) {
             bool was_animating = ui_needs_animation(&state);
-            update_local_animation(&state, now, last_done_tick);
+            update_local_animation(&state, now, last_done_tick, have_last_done_tick);
             system_status_update(&state);
             render_now = ui_needs_animation(&state) || was_animating;
         }

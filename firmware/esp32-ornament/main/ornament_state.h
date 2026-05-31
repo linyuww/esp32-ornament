@@ -62,3 +62,9 @@ typedef struct {
 
 void ornament_state_init(ornament_state_t *state);
 ornament_status_t ornament_status_from_text(const char *value);
+ornament_status_t ornament_state_panel_status(const ornament_state_t *state);
+void ornament_state_update_display_timing(
+    ornament_state_t *state,
+    uint32_t now_ms,
+    uint32_t last_done_ms,
+    bool has_done_event);

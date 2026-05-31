@@ -13,6 +13,7 @@ PREVIEW_NAMES = [
     "warn",
     "critical",
     "done-flash",
+    "done-flash-running",
     "unsynced",
     "clock",
 ]

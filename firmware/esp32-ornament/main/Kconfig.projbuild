@@ -95,7 +95,7 @@ config ORNAMENT_QUOTA_WARN_PERCENT
 
 config ORNAMENT_DONE_FLASH_MS
     int "Task done ring flash duration in milliseconds"
-    default 10000
+    default 5000
     range 0 600000
 
 menu "ASRPRO done reminder"

@@ -119,6 +119,7 @@ int main(int argc, char **argv)
     ornament_state_t warn;
     ornament_state_t critical;
     ornament_state_t done_flash_on;
+    ornament_state_t done_flash_running;
     ornament_state_t unsynced;
     ornament_state_t clock;
 
@@ -176,6 +177,12 @@ int main(int argc, char **argv)
         true);
     done_flash_on.done_flash_active = true;
     done_flash_on.done_flash_on = true;
+    done_flash_running = done_flash_on;
+    done_flash_running.status = ORNAMENT_STATUS_DONE;
+    done_flash_running.active_task_count = 2;
+    done_flash_running.codex_active_task_count = 1;
+    done_flash_running.claude_active_task_count = 1;
+    done_flash_running.done_seq = 3;
     make_state(
         &unsynced,
         ORNAMENT_STATUS_RUNNING,
@@ -217,6 +224,9 @@ int main(int argc, char **argv)
         return 1;
     }
     if (render_one(output_dir, "done-flash", &done_flash_on, false) != 0) {
+        return 1;
+    }
+    if (render_one(output_dir, "done-flash-running", &done_flash_running, false) != 0) {
         return 1;
     }
     if (render_one(output_dir, "unsynced", &unsynced, false) != 0) {
