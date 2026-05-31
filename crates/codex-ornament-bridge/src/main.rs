@@ -24,6 +24,8 @@ const TASK_EVENT_QUEUE_CAPACITY: usize = 64;
 const QUOTA_CACHE_TTL: Duration = Duration::from_secs(60);
 const RECONCILED_DONE_NOTIFY_WINDOW: Duration = Duration::from_secs(120);
 const COMBINED_DONE_SOURCE_WINDOW: Duration = Duration::from_secs(5);
+const RECOVER_ACTIVE_TASK_WINDOW: Duration = Duration::from_secs(12 * 60 * 60);
+const RECOVER_ACTIVE_SESSION_SCAN_LIMIT: usize = 24;
 const DISCOVERY_MAGIC: &str = "codex-ornament-discover-v1";
 
 type SharedBridgeState = Arc<Mutex<BridgeState>>;
@@ -575,17 +577,24 @@ fn recover_active_task_if_needed(state: &mut BridgeState, config: &BridgeConfig)
         return;
     }
 
-    let Some(session_id) = config.tracked_session_id.as_deref() else {
-        return;
+    let event = if let Some(session_id) = config.tracked_session_id.as_deref() {
+        active_task_for_session(&config.codex_home, session_id)
+    } else {
+        active_task_in_recent_session_files(&config.codex_home)
     };
-    let Some(session_file) = find_session_file(&config.codex_home, session_id) else {
-        return;
-    };
-    let Ok(Some(event)) = active_task_in_session_file(&session_file, session_id) else {
+
+    let Some(event) = event else {
         return;
     };
 
     apply_task_event(state, event);
+}
+
+fn active_task_for_session(codex_home: &Path, session_id: &str) -> Option<TaskEvent> {
+    let session_file = find_session_file(codex_home, session_id)?;
+    active_task_in_session_file(&session_file, session_id)
+        .ok()
+        .flatten()
 }
 
 fn reconcile_active_tasks(state: &mut BridgeState, config: &BridgeConfig) {
@@ -1037,13 +1046,13 @@ fn normalize_event(payload: &Value) -> TaskEvent {
         message,
         received_at: now_local(),
         source,
-        session_id: text_field(
+        session_id: event_text_field(
             payload,
             &["session_id", "sessionId", "thread-id", "thread_id"],
         ),
-        turn_id: text_field(payload, &["turn_id", "turnId", "turn-id"]),
-        cwd: text_field(payload, &["cwd"]).map(|value| clip(&value, 120)),
-        model: text_field(payload, &["model"]),
+        turn_id: event_text_field(payload, &["turn_id", "turnId", "turn-id"]),
+        cwd: event_text_field(payload, &["cwd"]).map(|value| clip(&value, 120)),
+        model: event_text_field(payload, &["model"]),
     }
 }
 
@@ -1096,6 +1105,67 @@ fn text_field(payload: &Value, keys: &[&str]) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn event_text_field(payload: &Value, keys: &[&str]) -> Option<String> {
+    text_field(payload, keys).or_else(|| nested_event_text_field(payload, keys))
+}
+
+fn nested_event_text_field(payload: &Value, keys: &[&str]) -> Option<String> {
+    ["message", "raw"].iter().find_map(|container_key| {
+        let text = payload.get(*container_key)?.as_str()?.trim();
+        text_field_from_json_text(text, keys)
+            .or_else(|| text_field_from_partial_json_text(text, keys))
+    })
+}
+
+fn text_field_from_json_text(text: &str, keys: &[&str]) -> Option<String> {
+    let parsed = serde_json::from_str::<Value>(text).ok()?;
+    text_field(&parsed, keys)
+}
+
+fn text_field_from_partial_json_text(text: &str, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| quoted_json_string_value(text, key))
+        .filter(|value| !value.is_empty())
+}
+
+fn quoted_json_string_value(text: &str, key: &str) -> Option<String> {
+    let quoted_key = format!("\"{key}\"");
+    let after_key = text.split_once(&quoted_key)?.1;
+    let after_colon = after_key.trim_start().strip_prefix(':')?.trim_start();
+    let mut chars = after_colon.chars();
+    if chars.next()? != '"' {
+        return None;
+    }
+
+    let mut value = String::new();
+    let mut escaped = false;
+    for ch in chars {
+        if escaped {
+            value.push(match ch {
+                '"' => '"',
+                '\\' => '\\',
+                '/' => '/',
+                'b' => '\u{0008}',
+                'f' => '\u{000c}',
+                'n' => '\n',
+                'r' => '\r',
+                't' => '\t',
+                other => other,
+            });
+            escaped = false;
+            continue;
+        }
+
+        match ch {
+            '\\' => escaped = true,
+            '"' => return Some(value),
+            other => value.push(other),
+        }
+    }
+
+    (!value.is_empty()).then_some(value)
+}
+
 fn terminal_turn_for_event(codex_home: &Path, event: &TaskEvent) -> Option<TerminalTurn> {
     let session_id = event.session_id.as_deref()?;
     let turn_id = event.turn_id.as_deref()?;
@@ -1113,6 +1183,68 @@ fn find_session_file(codex_home: &Path, session_id: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+fn active_task_in_recent_session_files(codex_home: &Path) -> Option<TaskEvent> {
+    recent_session_files(&codex_home.join("sessions"))
+        .into_iter()
+        .filter_map(|path| {
+            let session_id = session_id_from_file_name(&path)?;
+            let active = active_task_in_session_file(&path, &session_id)
+                .ok()
+                .flatten()?;
+            if timestamp_is_recent(&active.received_at, RECOVER_ACTIVE_TASK_WINDOW) {
+                Some(active)
+            } else {
+                None
+            }
+        })
+        .next()
+}
+
+fn recent_session_files(root: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    collect_session_files(root, &mut files);
+    files.sort_by(|left, right| {
+        file_modified_at(right)
+            .cmp(&file_modified_at(left))
+            .then_with(|| right.cmp(left))
+    });
+    files.truncate(RECOVER_ACTIVE_SESSION_SCAN_LIMIT);
+    files
+}
+
+fn collect_session_files(root: &Path, files: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_session_files(&path, files);
+        } else if path.extension().and_then(|extension| extension.to_str()) == Some("jsonl") {
+            files.push(path);
+        }
+    }
+}
+
+fn file_modified_at(path: &Path) -> Option<std::time::SystemTime> {
+    path.metadata()
+        .and_then(|metadata| metadata.modified())
+        .ok()
+}
+
+fn session_id_from_file_name(path: &Path) -> Option<String> {
+    let file_name = path.file_name()?.to_str()?;
+    let stem = file_name.strip_suffix(".jsonl")?;
+    let session_id = stem.get(stem.len().checked_sub(36)?..)?;
+    let looks_like_uuid = session_id.len() == 36
+        && session_id.chars().filter(|ch| *ch == '-').count() == 4
+        && session_id
+            .chars()
+            .all(|ch| ch.is_ascii_hexdigit() || ch == '-');
+    looks_like_uuid.then(|| session_id.to_string())
 }
 
 fn find_file_name_containing(root: &Path, needle: &str) -> Option<PathBuf> {
@@ -1151,7 +1283,7 @@ fn active_task_in_session_file(path: &Path, session_id: &str) -> io::Result<Opti
             continue;
         };
         let payload = &record["payload"];
-        let Some(kind) = payload.get("type").and_then(Value::as_str) else {
+        let Some(kind) = session_record_kind(&record, payload) else {
             continue;
         };
 
@@ -1210,7 +1342,7 @@ fn terminal_turn_in_file(path: &Path, turn_id: &str) -> io::Result<Option<Termin
             continue;
         };
         let payload = &record["payload"];
-        let Some(kind) = payload.get("type").and_then(Value::as_str) else {
+        let Some(kind) = session_record_kind(&record, payload) else {
             continue;
         };
         if kind != "task_complete" && kind != "turn_aborted" {
@@ -1231,6 +1363,13 @@ fn terminal_turn_in_file(path: &Path, turn_id: &str) -> io::Result<Option<Termin
     }
 
     Ok(terminal)
+}
+
+fn session_record_kind<'a>(record: &'a Value, payload: &'a Value) -> Option<&'a str> {
+    payload
+        .get("type")
+        .and_then(Value::as_str)
+        .or_else(|| record.get("type").and_then(Value::as_str))
 }
 
 fn terminal_message(payload: &Value) -> Option<String> {
@@ -1359,6 +1498,36 @@ mod tests {
         assert_eq!(event.status, "running");
         assert_eq!(event.title, "Codex running");
         assert_eq!(event.message, "build the firmware");
+    }
+
+    #[test]
+    fn recovers_identity_from_json_message_payload() {
+        let event = normalize_event(&json!({
+            "hook_event_name": "UserPromptSubmit",
+            "message": "{\"session_id\":\"session-1\",\"turn_id\":\"turn-1\",\"cwd\":\"D:\\\\Desktop\\\\codex\",\"model\":\"gpt-5.5\"}"
+        }));
+
+        assert_eq!(event.status, "running");
+        assert_eq!(event.session_id.as_deref(), Some("session-1"));
+        assert_eq!(event.turn_id.as_deref(), Some("turn-1"));
+        assert_eq!(event.cwd.as_deref(), Some("D:\\Desktop\\codex"));
+        assert_eq!(event.model.as_deref(), Some("gpt-5.5"));
+    }
+
+    #[test]
+    fn recovers_identity_from_clipped_json_message_payload() {
+        let event = normalize_event(&json!({
+            "hook_event_name": "UserPromptSubmit",
+            "message": "{\"session_id\":\"session-1\",\"turn_id\":\"turn-1\",\"transcript_path\":null,\"cwd\":\"C:\\\\Program Files\\\\WindowsApps\\\\OpenAI.Codex_26.527.3686.0_x64__2p2nqsd0c76g0\\\\app"
+        }));
+
+        assert_eq!(event.status, "running");
+        assert_eq!(event.session_id.as_deref(), Some("session-1"));
+        assert_eq!(event.turn_id.as_deref(), Some("turn-1"));
+        assert_eq!(
+            event.cwd.as_deref(),
+            Some("C:\\Program Files\\WindowsApps\\OpenAI.Codex_26.527.3686.0_x64__2p2nqsd0c76g0\\app")
+        );
     }
 
     #[test]
@@ -1535,8 +1704,7 @@ mod tests {
         let mut state = BridgeState::default();
         let start = normalize_event(&json!({
             "hook_event_name": "UserPromptSubmit",
-            "session_id": "session-1",
-            "turn_id": "turn-1"
+            "message": "{\"session_id\":\"session-1\",\"turn_id\":\"turn-1\"}"
         }));
         let stop = normalize_event(&json!({
             "hook_event_name": "Stop",
@@ -2673,6 +2841,63 @@ mod tests {
         assert_eq!(snapshot.active_task_count, 1);
         assert_eq!(snapshot.status, "running");
         let task = snapshot.task.unwrap();
+        assert_eq!(task.turn_id.as_deref(), Some("turn-1"));
+        assert_eq!(task.cwd.as_deref(), Some("D:\\Desktop\\codex"));
+        assert_eq!(task.model.as_deref(), Some("gpt-5.5"));
+    }
+
+    #[test]
+    fn recovers_active_turn_from_recent_session_log_without_tracked_session() {
+        let codex_home = env::temp_dir().join(format!(
+            "codex-ornament-recover-recent-{}",
+            std::process::id()
+        ));
+        let session_dir = codex_home
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("31");
+        fs::create_dir_all(&session_dir).unwrap();
+        let session_file = session_dir
+            .join("rollout-2026-05-31T11-43-03-019e7467-fc36-7750-8418-f2bf0397bd05.jsonl");
+        fs::write(
+            &session_file,
+            format!(
+                "{}\n{}\n",
+                json!({
+                    "timestamp": now_local(),
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "task_started",
+                        "turn_id": "turn-1"
+                    }
+                }),
+                json!({
+                    "timestamp": now_local(),
+                    "type": "turn_context",
+                    "payload": {
+                        "turn_id": "turn-1",
+                        "cwd": "D:\\Desktop\\codex",
+                        "model": "gpt-5.5"
+                    }
+                })
+            ),
+        )
+        .unwrap();
+
+        let state = Arc::new(Mutex::new(BridgeState::default()));
+        let mut config = test_config(None);
+        config.codex_home = codex_home.clone();
+        let snapshot = task_snapshot(&state, &config);
+        let _ = fs::remove_dir_all(&codex_home);
+
+        assert_eq!(snapshot.active_task_count, 1);
+        assert_eq!(snapshot.status, "running");
+        let task = snapshot.task.unwrap();
+        assert_eq!(
+            task.session_id.as_deref(),
+            Some("019e7467-fc36-7750-8418-f2bf0397bd05")
+        );
         assert_eq!(task.turn_id.as_deref(), Some("turn-1"));
         assert_eq!(task.cwd.as_deref(), Some("D:\\Desktop\\codex"));
         assert_eq!(task.model.as_deref(), Some("gpt-5.5"));
