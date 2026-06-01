@@ -776,6 +776,7 @@ fn remove_recent_active_task_for_session(
     let key = state.active_order.iter().rev().find_map(|key| {
         state.active_tasks.get(key).and_then(|event| {
             (event.session_id.as_deref() == Some(session_id)
+                && event.turn_id.is_none()
                 && task_sources_match(event, terminal_event))
             .then(|| key.clone())
         })
@@ -2913,6 +2914,32 @@ mod tests {
     }
 
     #[test]
+    fn session_only_stop_does_not_complete_identified_turn_task() {
+        let mut state = BridgeState::default();
+        let start = normalize_event(&json!({
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "session-1",
+            "turn_id": "turn-1",
+            "prompt": "long task"
+        }));
+        let permission_auto_allow_stop = normalize_event(&json!({
+            "hook_event_name": "Stop",
+            "session_id": "session-1"
+        }));
+
+        apply_task_event(&mut state, start);
+        apply_task_event(&mut state, permission_auto_allow_stop);
+
+        assert_eq!(state.active_tasks.len(), 1);
+        assert_eq!(state.done_tasks.len(), 0);
+        assert_eq!(state.unmatched_stops.len(), 1);
+        assert_eq!(
+            state.task.as_ref().map(|event| event.status.as_str()),
+            Some("running")
+        );
+    }
+
+    #[test]
     fn snapshot_dedupes_existing_duplicate_active_turns() {
         let state = Arc::new(Mutex::new(BridgeState::default()));
         {
@@ -3965,6 +3992,9 @@ mod tests {
             "codex-ornament-fork-parent-new-active-{}",
             std::process::id()
         ));
+        let parent_started_at = recent_timestamp(2);
+        let child_forked_at = recent_timestamp(4);
+        let child_started_at = recent_timestamp(1);
         let session_dir = codex_home
             .join("sessions")
             .join("2026")
@@ -3973,17 +4003,17 @@ mod tests {
         fs::create_dir_all(&session_dir).unwrap();
         fs::write(
             session_dir.join("rollout-2026-05-31T12-17-11-11111111-1111-1111-1111-111111111111.jsonl"),
-            concat!(
-                "{\"timestamp\":\"2026-05-31T08:00:00+08:00\",\"type\":\"session_meta\",\"payload\":{\"id\":\"11111111-1111-1111-1111-111111111111\"}}\n",
-                "{\"timestamp\":\"2026-05-31T20:42:42+08:00\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"parent-new-turn\"}}\n"
+            format!(
+                "{{\"timestamp\":\"{child_forked_at}\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"11111111-1111-1111-1111-111111111111\"}}}}\n\
+                 {{\"timestamp\":\"{parent_started_at}\",\"payload\":{{\"type\":\"task_started\",\"turn_id\":\"parent-new-turn\"}}}}\n"
             ),
         )
         .unwrap();
         fs::write(
             session_dir.join("rollout-2026-05-31T17-00-13-22222222-2222-2222-2222-222222222222.jsonl"),
-            concat!(
-                "{\"timestamp\":\"2026-05-31T17:00:00+08:00\",\"type\":\"session_meta\",\"payload\":{\"id\":\"22222222-2222-2222-2222-222222222222\",\"forked_from_id\":\"11111111-1111-1111-1111-111111111111\",\"timestamp\":\"2026-05-31T17:00:00+08:00\"}}\n",
-                "{\"timestamp\":\"2026-05-31T20:46:35+08:00\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"child-turn\"}}\n"
+            format!(
+                "{{\"timestamp\":\"{child_forked_at}\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"22222222-2222-2222-2222-222222222222\",\"forked_from_id\":\"11111111-1111-1111-1111-111111111111\",\"timestamp\":\"{child_forked_at}\"}}}}\n\
+                 {{\"timestamp\":\"{child_started_at}\",\"payload\":{{\"type\":\"task_started\",\"turn_id\":\"child-turn\"}}}}\n"
             ),
         )
         .unwrap();

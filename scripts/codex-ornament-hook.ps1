@@ -65,15 +65,6 @@ function Find-EventName($Text, $FallbackEventName) {
   if (-not [string]::IsNullOrWhiteSpace($FallbackEventName)) {
     return $FallbackEventName
   }
-  if ($Text -match "UserPromptSubmit") {
-    return "UserPromptSubmit"
-  }
-  if ($Text -match "\bStop\b") {
-    return "Stop"
-  }
-  if ($Text -match "agent-turn-complete") {
-    return "agent-turn-complete"
-  }
   return "codex-event"
 }
 

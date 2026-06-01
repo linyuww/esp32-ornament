@@ -7,6 +7,19 @@ $stderr = Join-Path $root "bridge-stderr.log"
 $envFile = Join-Path $root ".env"
 $localEnv = Join-Path $root ".env.local"
 
+function Normalize-ProcessPathEnvironment {
+    $pathValue = [Environment]::GetEnvironmentVariable("Path", "Process")
+    if ([string]::IsNullOrEmpty($pathValue)) {
+        $pathValue = [Environment]::GetEnvironmentVariable("PATH", "Process")
+    }
+    [Environment]::SetEnvironmentVariable("PATH", $null, "Process")
+    if (-not [string]::IsNullOrEmpty($pathValue)) {
+        [Environment]::SetEnvironmentVariable("Path", $pathValue, "Process")
+    }
+}
+
+Normalize-ProcessPathEnvironment
+
 foreach ($file in @($envFile, $localEnv)) {
     if (Test-Path -LiteralPath $file) {
         Get-Content -LiteralPath $file | ForEach-Object {
