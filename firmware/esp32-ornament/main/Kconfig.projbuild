@@ -98,37 +98,54 @@ config ORNAMENT_DONE_FLASH_MS
     default 5000
     range 0 600000
 
-menu "ASRPRO done reminder"
+menu "ASRPRO UART link"
+
+config ORNAMENT_ASRPRO_UART_ENABLED
+    bool "Enable ASRPRO UART link"
+    default y
+    help
+        Enables the shared UART used for ESP32-to-ASRPRO done reminders and
+        ASRPRO-to-ESP32 voice commands.
 
 config ORNAMENT_ASRPRO_DONE_NOTIFY
     bool "Notify ASRPRO when task status becomes done"
+    depends on ORNAMENT_ASRPRO_UART_ENABLED
     default y
     help
         When the bridge status enters done, send a UART trigger to ASRPRO.
         Configure the ASRPRO project to receive the trigger string and play
         the chosen audio file. Other task statuses are not announced.
 
+config ORNAMENT_ASRPRO_VOICE_COMMANDS
+    bool "Receive ASRPRO voice commands over UART"
+    depends on ORNAMENT_ASRPRO_UART_ENABLED
+    default y
+    help
+        When ASRPRO recognizes a local command, it sends an ASCII token over
+        UART. The ornament parses tokens such as show_clock and refresh_state
+        and performs the matching local action.
+
 config ORNAMENT_ASRPRO_UART_NUM
     int "ASRPRO UART port"
-    depends on ORNAMENT_ASRPRO_DONE_NOTIFY
+    depends on ORNAMENT_ASRPRO_UART_ENABLED
     default 1
     range 0 2
 
 config ORNAMENT_ASRPRO_UART_BAUD
     int "ASRPRO UART baud rate"
-    depends on ORNAMENT_ASRPRO_DONE_NOTIFY
+    depends on ORNAMENT_ASRPRO_UART_ENABLED
     default 9600
     range 1200 921600
 
 config ORNAMENT_ASRPRO_UART_TX_GPIO
     int "ESP32 TX GPIO to ASRPRO RX"
-    depends on ORNAMENT_ASRPRO_DONE_NOTIFY
+    depends on ORNAMENT_ASRPRO_UART_ENABLED
     default 17
 
 config ORNAMENT_ASRPRO_UART_RX_GPIO
     int "ESP32 RX GPIO from ASRPRO TX, or -1 when unused"
-    depends on ORNAMENT_ASRPRO_DONE_NOTIFY
-    default -1
+    depends on ORNAMENT_ASRPRO_UART_ENABLED
+    default 18
 
 config ORNAMENT_ASRPRO_DONE_TRIGGER
     string "ASRPRO done trigger string"

@@ -623,6 +623,23 @@ static uint16_t status_color(ornament_status_t status)
     }
 }
 
+static const char *status_text_from_enum(ornament_status_t status)
+{
+    switch (status) {
+    case ORNAMENT_STATUS_RUNNING:
+        return "RUNNING";
+    case ORNAMENT_STATUS_DONE:
+        return "DONE";
+    case ORNAMENT_STATUS_ERROR:
+        return "ERROR";
+    case ORNAMENT_STATUS_EVENT:
+        return "EVENT";
+    case ORNAMENT_STATUS_IDLE:
+    default:
+        return "IDLE";
+    }
+}
+
 static void draw_standby_wallpaper(void)
 {
     if (active_canvas->width != STANDBY_WALLPAPER_WIDTH || active_canvas->height != STANDBY_WALLPAPER_HEIGHT) {
@@ -1014,6 +1031,92 @@ void display_core_render_clock(display_core_canvas_t *canvas, const ornament_sta
     draw_standby_header(time_text, date_text, reset_text);
     draw_standby_weather_row(state, temp_text);
     draw_standby_connectivity(state);
+}
+
+void display_core_render_voice_status(
+    display_core_canvas_t *canvas,
+    const ornament_state_t *state,
+    const char *bridge_status,
+    const char *voice_status)
+{
+    ornament_state_t fallback;
+    if (!begin_render(canvas)) {
+        return;
+    }
+    if (state == NULL) {
+        ornament_state_init(&fallback);
+        state = &fallback;
+    }
+    if (bridge_status == NULL) {
+        bridge_status = "BRIDGE --";
+    }
+    if (voice_status == NULL) {
+        voice_status = "VOICE READY";
+    }
+
+    char quota_text[32];
+    char tasks_text[32];
+    char wifi_text[32];
+    snprintf(
+        quota_text,
+        sizeof(quota_text),
+        "QUOTA %d%%/%d%%",
+        percent_or_zero(state->primary_remaining_percent),
+        percent_or_zero(state->secondary_remaining_percent));
+    snprintf(tasks_text, sizeof(tasks_text), "TASKS %d", state->active_task_count);
+    if (state->wifi_connected) {
+        snprintf(wifi_text, sizeof(wifi_text), "WIFI %dDBM", state->wifi_rssi);
+    } else {
+        snprintf(wifi_text, sizeof(wifi_text), "WIFI OFF");
+    }
+
+    clear_canvas(HUD_BLACK);
+    draw_ring_ticks(state);
+    draw_text_center_fit(sy(44), "VOICE STATUS", ss(3), HUD_WHITE);
+    draw_text_center_fit(sy(104), voice_status, ss(2), HUD_GREEN);
+    draw_text_center_fit(sy(152), bridge_status, ss(2), HUD_TEAL);
+    draw_text_center_fit(sy(200), quota_text, ss(2), ui_accent_color_for(state));
+    draw_text_center_fit(sy(248), tasks_text, ss(2), status_color(ornament_state_panel_status(state)));
+    draw_text_center_fit(sy(296), wifi_text, ss(2), state->wifi_connected ? HUD_WHITE : HUD_AMBER);
+}
+
+void display_core_render_tasks(display_core_canvas_t *canvas, const ornament_state_t *state)
+{
+    ornament_state_t fallback;
+    if (!begin_render(canvas)) {
+        return;
+    }
+    if (state == NULL) {
+        ornament_state_init(&fallback);
+        state = &fallback;
+    }
+
+    char codex_text[40];
+    char claude_text[40];
+    char total_text[32];
+    snprintf(
+        codex_text,
+        sizeof(codex_text),
+        "CODEX %s A%d D%d",
+        status_text_from_enum(state->codex_task_status),
+        state->codex_active_task_count,
+        state->codex_done_seq);
+    snprintf(
+        claude_text,
+        sizeof(claude_text),
+        "CLAUDE %s A%d D%d",
+        status_text_from_enum(state->claude_task_status),
+        state->claude_active_task_count,
+        state->claude_done_seq);
+    snprintf(total_text, sizeof(total_text), "TOTAL ACTIVE %d", state->active_task_count);
+
+    clear_canvas(HUD_BLACK);
+    draw_ring_ticks(state);
+    draw_text_center_fit(sy(44), "VOICE TASKS", ss(3), HUD_WHITE);
+    draw_text_center_fit(sy(112), codex_text, ss(2), status_color(state->codex_task_status));
+    draw_text_center_fit(sy(174), claude_text, ss(2), status_color(state->claude_task_status));
+    draw_text_center_fit(sy(244), total_text, ss(2), status_color(ornament_state_panel_status(state)));
+    draw_status_badge(state);
 }
 
 static void render_message(display_core_canvas_t *canvas, const char *line1, const char *line2, uint16_t color)

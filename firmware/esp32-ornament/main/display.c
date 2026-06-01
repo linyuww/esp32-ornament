@@ -183,6 +183,26 @@ static void render_clock(const ornament_state_t *state)
     (void)flush_canvas();
 }
 
+static void render_voice_status(const ornament_state_t *state, const char *bridge_status, const char *voice_status)
+{
+    if (!canvas_alloc()) {
+        ESP_LOGE(TAG, "failed to allocate display canvas");
+        return;
+    }
+    display_core_render_voice_status(&canvas, state, bridge_status, voice_status);
+    (void)flush_canvas();
+}
+
+static void render_tasks(const ornament_state_t *state)
+{
+    if (!canvas_alloc()) {
+        ESP_LOGE(TAG, "failed to allocate display canvas");
+        return;
+    }
+    display_core_render_tasks(&canvas, state);
+    (void)flush_canvas();
+}
+
 static void render_boot_message(void)
 {
     if (!canvas_alloc()) {
@@ -274,4 +294,22 @@ void display_render_clock(const ornament_state_t *state)
         state->wifi_ssid,
         state->wifi_rssi);
     render_clock(state);
+}
+
+void display_render_voice_status(const ornament_state_t *state, const char *bridge_status, const char *voice_status)
+{
+    ESP_LOGI(TAG, "voice status: bridge=%s voice=%s", bridge_status, voice_status);
+    render_voice_status(state, bridge_status, voice_status);
+}
+
+void display_render_tasks(const ornament_state_t *state)
+{
+    ESP_LOGI(
+        TAG,
+        "voice tasks: codex=%d/%d claude=%d/%d",
+        state->codex_active_task_count,
+        state->codex_done_seq,
+        state->claude_active_task_count,
+        state->claude_done_seq);
+    render_tasks(state);
 }
