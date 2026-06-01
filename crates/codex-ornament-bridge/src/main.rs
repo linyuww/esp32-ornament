@@ -1,5 +1,5 @@
 use chrono::{DateTime, FixedOffset, Local};
-use quota_core::{get_quota_snapshot, state_path, write_state, QuotaSnapshot};
+use quota_core::{get_quota_snapshot, state_path, write_state, QuotaSnapshot, SnapshotStatus};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -21,6 +21,7 @@ const MAX_BODY_BYTES: usize = 64 * 1024;
 const MAX_STATE_TASKS: usize = 8;
 const MAX_TASK_HISTORY: usize = 16;
 const TASK_EVENT_QUEUE_CAPACITY: usize = 64;
+const TASK_EVENT_ACK_TIMEOUT: Duration = Duration::from_millis(750);
 const QUOTA_CACHE_TTL: Duration = Duration::from_secs(60);
 const WEATHER_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
 const WEATHER_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -53,6 +54,7 @@ struct BridgeState {
     claude_done_seq: u64,
     next_anonymous_task_id: u64,
     quota: Option<CachedQuota>,
+    quota_refreshing: bool,
     weather: Option<CachedWeather>,
     weather_refreshing: bool,
     active_recovery: Option<CachedActiveRecovery>,
@@ -269,6 +271,7 @@ struct QueuedTaskEvent {
 enum TaskDispatchResult {
     Applied,
     Filtered,
+    Queued,
     LockUnavailable,
 }
 
@@ -371,7 +374,7 @@ fn handle_connection(
                 last_done_task: snapshot.last_done_task,
                 done_task_count: snapshot.done_task_count,
                 unmatched_stop_count: snapshot.unmatched_stop_count,
-                quota: cached_or_refresh_quota(&state),
+                quota: cached_or_refresh_quota_background(&state),
                 weather: cached_or_refresh_weather(&state, &config),
                 bridge: BridgeInfo {
                     service: "codex-ornament-bridge",
@@ -389,17 +392,30 @@ fn handle_connection(
                 );
             }
 
-            let payload = serde_json::from_slice::<Value>(&request.body).unwrap_or_else(|_| {
-                json!({
-                    "hook_event_name": "InvalidJson",
-                    "raw": String::from_utf8_lossy(&request.body).to_string()
-                })
-            });
+            let payload = match parse_hook_payload(&request.body) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    eprintln!(
+                        "invalid hook json ignored: {error}; body={}",
+                        clip(&String::from_utf8_lossy(&request.body), 160)
+                    );
+                    return write_json(
+                        &mut stream,
+                        400,
+                        &json!({"ok": false, "error": "invalid hook json"}),
+                    );
+                }
+            };
             let event = normalize_event(&payload);
             match dispatch_task_event(&task_events, event.clone()) {
                 Ok(TaskDispatchResult::Applied | TaskDispatchResult::Filtered) => {
                     write_json(&mut stream, 200, &json!({"ok": true, "event": event}))
                 }
+                Ok(TaskDispatchResult::Queued) => write_json(
+                    &mut stream,
+                    202,
+                    &json!({"ok": true, "queued": true, "event": event}),
+                ),
                 Ok(TaskDispatchResult::LockUnavailable) => write_json(
                     &mut stream,
                     500,
@@ -423,6 +439,10 @@ fn handle_connection(
             &json!({"ok": false, "error": "not found"}),
         ),
     }
+}
+
+fn parse_hook_payload(body: &[u8]) -> Result<Value, serde_json::Error> {
+    serde_json::from_slice::<Value>(body)
 }
 
 fn spawn_task_event_consumer(
@@ -500,9 +520,11 @@ fn dispatch_task_event(
     let queued = QueuedTaskEvent { event, completion };
 
     match sender.try_send(queued) {
-        Ok(()) => completed
-            .recv()
-            .map_err(|_| TaskQueueError::CompletionDropped),
+        Ok(()) => match completed.recv_timeout(TASK_EVENT_ACK_TIMEOUT) {
+            Ok(result) => Ok(result),
+            Err(mpsc::RecvTimeoutError::Timeout) => Ok(TaskDispatchResult::Queued),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(TaskQueueError::CompletionDropped),
+        },
         Err(TrySendError::Full(_)) => Err(TaskQueueError::Full),
         Err(TrySendError::Disconnected(_)) => Err(TaskQueueError::Closed),
     }
@@ -1983,6 +2005,78 @@ fn cached_or_refresh_quota(state: &Arc<Mutex<BridgeState>>) -> QuotaSnapshot {
     snapshot
 }
 
+fn cached_or_refresh_quota_background(state: &Arc<Mutex<BridgeState>>) -> QuotaSnapshot {
+    if let Ok(state) = state.lock() {
+        if let Some(cache) = state.quota.as_ref() {
+            if cache.fetched_at.elapsed() < QUOTA_CACHE_TTL {
+                return cache.snapshot.clone();
+            }
+        }
+    }
+
+    maybe_spawn_quota_refresh(Arc::clone(state));
+
+    if let Ok(state) = state.lock() {
+        if let Some(cache) = state.quota.as_ref() {
+            return cache.snapshot.clone();
+        }
+    }
+    quota_unavailable()
+}
+
+fn maybe_spawn_quota_refresh(state: SharedBridgeState) {
+    let should_spawn = {
+        let Ok(mut state) = state.lock() else {
+            return;
+        };
+        if state.quota_refreshing {
+            false
+        } else {
+            state.quota_refreshing = true;
+            true
+        }
+    };
+    if !should_spawn {
+        return;
+    }
+
+    std::thread::spawn(move || {
+        let snapshot = get_quota_snapshot();
+        let _ = write_state(state_path(), &snapshot);
+        let Ok(mut state) = state.lock() else {
+            return;
+        };
+        state.quota = Some(CachedQuota {
+            snapshot,
+            fetched_at: Instant::now(),
+        });
+        state.quota_refreshing = false;
+    });
+}
+
+fn quota_unavailable() -> QuotaSnapshot {
+    QuotaSnapshot {
+        status: SnapshotStatus::NoData,
+        source: "codex-wham".to_string(),
+        source_label: Some("ChatGPT usage API".to_string()),
+        web_url: Some(quota_core::USAGE_URL.to_string()),
+        limit_id: Some("codex".to_string()),
+        plan_type: None,
+        primary_used_percent: None,
+        primary_remaining_percent: None,
+        primary_window_minutes: None,
+        primary_resets_at: None,
+        secondary_used_percent: None,
+        secondary_remaining_percent: None,
+        secondary_window_minutes: None,
+        secondary_resets_at: None,
+        credits: None,
+        observed_at: Some(now_local()),
+        captured_at: None,
+        error: Some("quota refresh pending".to_string()),
+    }
+}
+
 fn cached_or_refresh_weather(
     state: &Arc<Mutex<BridgeState>>,
     config: &BridgeConfig,
@@ -2424,7 +2518,9 @@ fn write_response(
 ) -> io::Result<()> {
     let reason = match status {
         200 => "OK",
+        202 => "Accepted",
         204 => "No Content",
+        400 => "Bad Request",
         403 => "Forbidden",
         404 => "Not Found",
         500 => "Internal Server Error",
@@ -2699,6 +2795,24 @@ mod tests {
         assert_eq!(event.status, "done");
         assert_eq!(event.title, "Codex done");
         assert_eq!(event.message, "finished");
+    }
+
+    #[test]
+    fn rejects_invalid_hook_json_before_normalizing_event() {
+        assert!(parse_hook_payload(br#"{"hook_event_name":"UserPromptSubmit"}"#).is_ok());
+        assert!(parse_hook_payload(b"{hook_event_name:UserPromptSubmit}").is_err());
+    }
+
+    #[test]
+    fn quota_background_refresh_returns_placeholder_without_blocking() {
+        let state = Arc::new(Mutex::new(BridgeState::default()));
+        let snapshot = cached_or_refresh_quota_background(&state);
+
+        assert_eq!(snapshot.status, SnapshotStatus::NoData);
+        assert!(snapshot.error.as_deref().unwrap_or("").contains("pending"));
+
+        let state = state.lock().unwrap();
+        assert!(state.quota_refreshing || state.quota.is_some());
     }
 
     #[test]
@@ -4574,6 +4688,25 @@ mod tests {
             consume_task_event(&state, &test_config(None), event),
             TaskDispatchResult::LockUnavailable
         );
+    }
+
+    #[test]
+    fn dispatch_reports_queued_when_consumer_ack_is_slow() {
+        let (sender, receiver): (TaskEventSender, TaskEventReceiver) =
+            mpsc::sync_channel(TASK_EVENT_QUEUE_CAPACITY);
+        let consumer = std::thread::spawn(move || {
+            let queued = receiver.recv().unwrap();
+            std::thread::sleep(TASK_EVENT_ACK_TIMEOUT + Duration::from_millis(50));
+            let _ = queued.completion.send(TaskDispatchResult::Applied);
+        });
+
+        let event = normalize_event(&json!({"hook_event_name": "UserPromptSubmit"}));
+
+        assert_eq!(
+            dispatch_task_event(&sender, event),
+            Ok(TaskDispatchResult::Queued)
+        );
+        consumer.join().unwrap();
     }
 
     #[test]
