@@ -286,6 +286,44 @@ static bool is_new_done_event(const ornament_state_t *state, bool have_seen_stat
     return state->done_seq > last_done_seq;
 }
 
+static bool state_has_displayable_snapshot(const ornament_state_t *state)
+{
+    return state != NULL && (state->has_task || state->has_quota || state->has_weather || state->active_task_count > 0);
+}
+
+static bool shared_state_has_displayable_snapshot(void)
+{
+    if (shared_state_mutex == NULL) {
+        return false;
+    }
+    bool displayable = false;
+    if (xSemaphoreTake(shared_state_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+        displayable = shared_state.have_state && state_has_displayable_snapshot(&shared_state.state);
+        xSemaphoreGive(shared_state_mutex);
+    }
+    return displayable;
+}
+
+static bool should_announce_done_event(
+    const ornament_state_t *state,
+    bool have_seen_state,
+    int last_done_seq,
+    int previous_active_task_count)
+{
+    if (!is_new_done_event(state, have_seen_state, last_done_seq)) {
+        return false;
+    }
+    if (state->active_task_count < previous_active_task_count) {
+        return true;
+    }
+    ESP_LOGW(
+        TAG,
+        "suppress done alert: done_seq advanced but active task count stayed %d -> %d",
+        previous_active_task_count,
+        state->active_task_count);
+    return false;
+}
+
 static void publish_state(
     const ornament_state_t *state,
     esp_err_t fetch_error,
@@ -334,6 +372,11 @@ static bool auto_match_bridge(bool verify_current, const char *reason)
 {
     bridge_auto_match_result_t result;
     esp_err_t err = bridge_client_auto_match(verify_current, &result);
+    web_console_bridge_debug_t debug = {0};
+    debug.last_auto_match_error = err;
+    debug.last_auto_match_ok = (err == ESP_OK);
+    strlcpy(debug.last_auto_match_reason, reason, sizeof(debug.last_auto_match_reason));
+    web_console_set_bridge_debug(&debug);
     if (err == ESP_OK) {
         ESP_LOGI(
             TAG,
@@ -435,6 +478,7 @@ static void poll_task(void *arg)
     TickType_t last_done_tick = 0;
     TickType_t next_bridge_poll = 0;
     int last_done_seq = 0;
+    int previous_active_task_count = 0;
     int consecutive_fetch_failures = 0;
     bool have_seen_state = false;
     bool have_last_done_tick = false;
@@ -463,18 +507,32 @@ static void poll_task(void *arg)
         if (refresh_requested || now >= next_bridge_poll) {
             next_bridge_poll = now + pdMS_TO_TICKS(CONFIG_ORNAMENT_POLL_INTERVAL_MS);
             esp_err_t err = bridge_client_fetch_state(&fetched_state);
+            web_console_bridge_debug_t debug = {
+                .last_fetch_error = err,
+                .last_auto_match_error = ESP_ERR_INVALID_STATE,
+                .consecutive_fetch_failures = consecutive_fetch_failures,
+                .last_success_ms = 0,
+                .last_failure_ms = 0,
+                .last_auto_match_ok = false,
+            };
             if (err == ESP_OK) {
                 if (consecutive_fetch_failures > 0) {
                     ESP_LOGI(TAG, "bridge fetch recovered after %d failure(s)", consecutive_fetch_failures);
                 }
                 consecutive_fetch_failures = 0;
+                debug.consecutive_fetch_failures = 0;
+                debug.last_success_ms = ticks_to_ms(now);
                 if (refresh_requested) {
                     voice_control_set_result("REFRESH OK");
                 }
                 if (fetched_state.done_seq < last_done_seq) {
                     last_done_seq = fetched_state.done_seq;
                 }
-                if (is_new_done_event(&fetched_state, have_seen_state, last_done_seq)) {
+                if (should_announce_done_event(
+                        &fetched_state,
+                        have_seen_state,
+                        last_done_seq,
+                        previous_active_task_count)) {
                     last_done_tick = now;
                     have_last_done_tick = true;
                     if (!voice_control_quiet_mode()) {
@@ -485,10 +543,14 @@ static void poll_task(void *arg)
                 if (fetched_state.done_seq > last_done_seq) {
                     last_done_seq = fetched_state.done_seq;
                 }
+                previous_active_task_count = fetched_state.active_task_count;
                 have_seen_state = true;
+                web_console_set_bridge_debug(&debug);
                 publish_state(&fetched_state, err, last_done_tick, have_last_done_tick, true);
             } else {
                 consecutive_fetch_failures++;
+                debug.consecutive_fetch_failures = consecutive_fetch_failures;
+                debug.last_failure_ms = ticks_to_ms(now);
                 if (refresh_requested) {
                     voice_control_set_result("REFRESH FAIL");
                 }
@@ -507,7 +569,10 @@ static void poll_task(void *arg)
                     }
                 }
 
-                if (have_seen_state && consecutive_fetch_failures < CONFIG_ORNAMENT_BRIDGE_OFFLINE_FAILURES) {
+                web_console_set_bridge_debug(&debug);
+                if (have_seen_state &&
+                    consecutive_fetch_failures < CONFIG_ORNAMENT_BRIDGE_OFFLINE_FAILURES &&
+                    shared_state_has_displayable_snapshot()) {
                     publish_state(&fetched_state, ESP_OK, last_done_tick, have_last_done_tick, true);
                 } else if (have_seen_state) {
                     publish_state(&fetched_state, err, last_done_tick, have_last_done_tick, true);

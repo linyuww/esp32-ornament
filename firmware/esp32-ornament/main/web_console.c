@@ -28,6 +28,7 @@ static ornament_state_t last_state;
 static esp_err_t last_fetch_error = ESP_ERR_INVALID_STATE;
 static int64_t last_state_us;
 static ornament_settings_t console_settings;
+static web_console_bridge_debug_t bridge_debug;
 
 static void refresh_console_settings(void)
 {
@@ -242,6 +243,17 @@ void web_console_set_last_state(const ornament_state_t *state, esp_err_t fetch_e
     }
 }
 
+void web_console_set_bridge_debug(const web_console_bridge_debug_t *debug)
+{
+    if (debug == NULL) {
+        return;
+    }
+    if (state_mutex != NULL && xSemaphoreTake(state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        bridge_debug = *debug;
+        xSemaphoreGive(state_mutex);
+    }
+}
+
 static esp_err_t status_get_handler(httpd_req_t *req)
 {
     ornament_state_t state;
@@ -258,6 +270,7 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     char weather_summary[80];
     char weather_icon[40];
     char bridge_url[ORNAMENT_BRIDGE_URL_MAX * 2];
+    web_console_bridge_debug_t bridge_diag = {0};
 
     ornament_state_init(&state);
     state_snapshot(&state, &fetch_error, &age_ms);
@@ -273,6 +286,10 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     json_escape(state.weather_icon, weather_icon, sizeof(weather_icon));
 
     json_escape(settings_bridge_url_or_default(&console_settings), bridge_url, sizeof(bridge_url));
+    if (state_mutex != NULL && xSemaphoreTake(state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        bridge_diag = bridge_debug;
+        xSemaphoreGive(state_mutex);
+    }
 
     const size_t json_size = 4096;
     char *json = calloc(1, json_size);
@@ -300,6 +317,9 @@ static esp_err_t status_get_handler(httpd_req_t *req)
         "\"quota\":{\"has\":%s,\"status\":\"%s\",\"primary\":%d,\"weekly\":%d},"
         "\"task\":{\"has\":%s,\"active_count\":%d,\"done_seq\":%d,\"status\":\"%s\",\"title\":\"%s\",\"message\":\"%s\"},"
         "\"audio\":{\"enabled\":%s,\"volume_percent\":%d},"
+        "\"bridge_debug\":{\"last_fetch_error\":\"%s\",\"consecutive_fetch_failures\":%d,"
+        "\"last_success_ms\":%lld,\"last_failure_ms\":%lld,"
+        "\"last_auto_match_ok\":%s,\"last_auto_match_error\":\"%s\",\"last_auto_match_reason\":\"%s\"},"
         "\"heap\":{\"free\":%u,\"min_free\":%u,\"largest_free_block\":%u}"
         "}",
         (long long)(esp_timer_get_time() / 1000),
@@ -345,6 +365,13 @@ static esp_err_t status_get_handler(httpd_req_t *req)
         task_message,
         CONFIG_ORNAMENT_AUDIO_ENABLED ? "true" : "false",
         settings_audio_volume_percent_or_default(&console_settings),
+        esp_err_to_name(bridge_diag.last_fetch_error),
+        bridge_diag.consecutive_fetch_failures,
+        (long long)bridge_diag.last_success_ms,
+        (long long)bridge_diag.last_failure_ms,
+        bridge_diag.last_auto_match_ok ? "true" : "false",
+        esp_err_to_name(bridge_diag.last_auto_match_error),
+        bridge_diag.last_auto_match_reason,
         (unsigned int)esp_get_free_heap_size(),
         (unsigned int)esp_get_minimum_free_heap_size(),
         (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
@@ -374,6 +401,7 @@ static esp_err_t root_get_handler(httpd_req_t *req)
     char weather_icon[40];
     char weather_value[96];
     char weather_detail[128];
+    web_console_bridge_debug_t bridge_diag = {0};
     int audio_volume_percent = settings_audio_volume_percent_or_default(&console_settings);
 
     ornament_state_init(&state);
@@ -398,6 +426,10 @@ static esp_err_t root_get_handler(httpd_req_t *req)
     html_escape(state.claude_task_turn_id, claude_turn_id, sizeof(claude_turn_id));
     task_panel_status_label(state.has_codex_summary ? state.codex_task_status : state.status, codex_active_count, codex_status, sizeof(codex_status));
     task_panel_status_label(state.claude_task_status, state.claude_active_task_count, claude_status, sizeof(claude_status));
+    if (state_mutex != NULL && xSemaphoreTake(state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        bridge_diag = bridge_debug;
+        xSemaphoreGive(state_mutex);
+    }
     if (state.has_weather && state.weather_temperature_c != INT32_MIN) {
         snprintf(weather_value, sizeof(weather_value), "%dC %s", state.weather_temperature_c, weather_summary);
     } else {
@@ -481,6 +513,12 @@ static esp_err_t root_get_handler(httpd_req_t *req)
     appendf(html, html_size, &used, "<div class=\"card\"><div class=\"k\">BSSID</div><div class=\"v\">%s</div></div>", wifi_debug.bssid[0] != '\0' ? wifi_debug.bssid : "--");
     appendf(html, html_size, &used, "<div class=\"card\"><div class=\"k\">Disconnect</div><div class=\"v\">%u %s</div><div class=\"k\">rssi %d retries %d</div></div>", wifi_debug.last_disconnect_reason, wifi_debug.last_disconnect_name, wifi_debug.last_disconnect_rssi, wifi_debug.retry_count);
     appendf(html, html_size, &used, "<div class=\"card\"><div class=\"k\">Bridge Fetch</div><div class=\"v\">%s</div><div class=\"k\">age %lld ms</div></div>", esp_err_to_name(fetch_error), (long long)age_ms);
+    append(html, html_size, &used, "</section>");
+    append(html, html_size, &used, "<h2>Bridge Debug</h2><section class=\"grid\">");
+    appendf(html, html_size, &used, "<div class=\"card\"><div class=\"k\">Last Fetch</div><div class=\"v\">%s</div><div class=\"k\">failures %d</div></div>", esp_err_to_name(bridge_diag.last_fetch_error), bridge_diag.consecutive_fetch_failures);
+    appendf(html, html_size, &used, "<div class=\"card\"><div class=\"k\">Last Success</div><div class=\"v\">%lld ms</div><div class=\"k\">since boot</div></div>", (long long)bridge_diag.last_success_ms);
+    appendf(html, html_size, &used, "<div class=\"card\"><div class=\"k\">Last Failure</div><div class=\"v\">%lld ms</div><div class=\"k\">since boot</div></div>", (long long)bridge_diag.last_failure_ms);
+    appendf(html, html_size, &used, "<div class=\"card\"><div class=\"k\">Auto Match</div><div class=\"v\">%s</div><div class=\"k\">%s / %s</div></div>", bridge_diag.last_auto_match_ok ? "ok" : "failed", esp_err_to_name(bridge_diag.last_auto_match_error), bridge_diag.last_auto_match_reason[0] != '\0' ? bridge_diag.last_auto_match_reason : "--");
     append(html, html_size, &used, "</section>");
     appendf(
         html,
@@ -867,6 +905,9 @@ esp_err_t web_console_start(void)
             return ESP_ERR_NO_MEM;
         }
         ornament_state_init(&last_state);
+        memset(&bridge_debug, 0, sizeof(bridge_debug));
+        bridge_debug.last_fetch_error = ESP_ERR_INVALID_STATE;
+        bridge_debug.last_auto_match_error = ESP_ERR_INVALID_STATE;
     }
     refresh_console_settings();
 
