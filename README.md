@@ -3,7 +3,7 @@
 这个项目包含两部分：
 
 1. Windows/Tauri 桌面额度组件：读取本机 Codex 登录凭据，显示 Codex 用量。
-2. ESP32-S3 桌面摆件集成：在圆形 ST77916 屏幕上显示 Codex 额度和任务完成提醒。
+2. ESP32-S3 桌面摆件集成：在 ST7789 屏幕上显示 Codex/Claude 任务、额度、天气和本地控制面板。
 
 新增的桌面摆件方案分为 PC 端桥接服务和 ESP32 固件。Codex 凭据只保存在 PC 上，ESP32 只读取局域网内的展示用 JSON，不保存 token。
 
@@ -22,8 +22,9 @@ flowchart LR
   Hook -->|"POST /hook/codex"| Bridge["codex-ornament-bridge"]
   Bridge -->|"quota-core"| Usage["ChatGPT usage endpoint"]
   ESP32["ESP32-S3 固件"] -->|"GET /state"| Bridge
-  ESP32 --> Display["圆形 ST77916 屏幕"]
-  ESP32 --> Alert["蜂鸣器 / LED / 按键"]
+  ESP32 --> Display["ST7789 屏幕"]
+  ESP32 --> Web["本地 Web 控制台"]
+  ESP32 --> Audio["任务完成语音提醒"]
 ```
 
 ## 目录结构
@@ -180,7 +181,7 @@ notify = [
 | `agent-turn-complete` | `done` |
 | `UserPromptSubmit` | `running` |
 | `Stop` | `done` |
-| 非法 JSON | `error` |
+| 非法 JSON | HTTP 400，忽略，不改变面板状态 |
 
 ## ESP32 固件
 
@@ -188,24 +189,18 @@ notify = [
 
 ```text
 主控：ESP32-S3-N16R8
-屏幕：1.5 寸圆形 ST77916 TFT，360x360，QSPI，16P FPC
+屏幕：1.54 寸 ST7789 SPI，240x240
 数据源：GET http://<PC-LAN-IP>:8787/state
 ```
 
 手动 ESP-IDF 部署：
 
-```powershell
+```cmd
 cd D:\Desktop\codex\codex-quota-widget\firmware\esp32-ornament
+call D:\Espressif\frameworks\esp-idf-v5.4.1\export.bat
 idf.py set-target esp32s3
-idf.py menuconfig
 idf.py build
-idf.py -p COMx flash monitor
-```
-
-你买的 ESP32-S3-N16R8 带 8MB PSRAM，HUD 使用全屏 RGB565 缓冲，建议在 `menuconfig` 里启用 PSRAM：
-
-```text
-Component config -> ESP PSRAM -> Support for external, SPI-connected RAM
+idf.py -p COM5 flash
 ```
 
 `menuconfig` 配置入口：
@@ -218,57 +213,44 @@ Codex Ornament
 
 - Wi-Fi SSID。
 - Wi-Fi 密码。
-- PC bridge 的 `/state` URL。
-- ST77916 驱动默认是 `st77916_qspi`，对应你买的 360x360 QSPI 圆屏。
-- GPIO 默认映射已按当前购买型号给出，但烧录前仍要核对转接板标注。
-
-固件使用 Espressif 官方 `esp_lcd_st77916` 组件，并预留了 SPI/QSPI 初始化路径。项目没有手写 ST77916 初始化命令表。
+- PC bridge 的 `/state` URL，或启用自动匹配。
+- ST7789 SPI 屏幕引脚。
 
 默认屏幕接线建议：
 
-| 屏幕 16P 符号 | ESP32-S3 |
+| 屏幕信号 | ESP32-S3 |
 | --- | --- |
+| GND | GND |
 | VCC | 3V3 |
-| IOVCC | 3V3 |
-| GND / 14-16 GND | GND |
-| SCL | GPIO12 |
+| SCL/SCLK | GPIO12 |
+| SDA/MOSI | GPIO11 |
 | CS | GPIO10 |
-| RESET | GPIO8 |
-| IO0 | GPIO11 |
-| IO1 | GPIO13 |
-| IO2 | GPIO14 |
-| IO3 | GPIO15 |
-| TE | 初版不接 |
-| A | 背光阳极，走屏幕/转接板限流路径接 3V3 |
-| K | 背光阴极，建议通过 MOSFET 由 GPIO7 控制，或在确认限流后接 GND 常亮 |
+| DC | GPIO13 |
+| RES/RST | GPIO8 |
+| BLK | GPIO7 |
 
 注意：不要直接用 GPIO 给背光供电，除非确认转接板有限流且电流安全。
 
 ## 屏幕 UI
 
-屏幕渲染已从日志占位升级为实际圆屏 HUD 页面，风格参考你上传的黑底蓝绿像素仪表盘。
+屏幕渲染使用 RGB565 画布和 `esp_lcd_panel_draw_bitmap()`，不引入 LVGL。
 
 当前页面包含：
 
-- 黑色圆形背景。
-- 蓝色外圈刻度和分隔线。
-- 像素风 `CODEX` 标题。
-- `CURRENT` 当前额度行：青色百分比、分段进度条、重置时间。
-- `WEEKLY` 周额度行：绿色百分比、分段进度条、重置时间。
-- 底部 hook 状态：`IDLE`、`AGENT ACTIVE`、`TASK DONE`、`HOOK ERROR`。
-- 任务完成时显示绿色圆环和中央 `DONE` 覆盖提醒。
+- `CURRENT` 当前额度和 `WEEKLY` 周额度。
+- current/weekly reset time。
+- 合并后的任务状态：idle、running、done、error。
+- 多任务时保持 running；其中一个任务完成后 done 闪烁 5 秒，再回到 running。
+- 空闲 1 分钟后进入待机时钟页，显示壁纸、时间、日期、天气和 Wi-Fi 图标。
+- 连续 3 次桥接请求失败后才显示 `Bridge offline`，短暂网络抖动继续显示上一帧状态。
 
 实现文件：
 
 ```text
 firmware/esp32-ornament/main/display.c
+firmware/esp32-ornament/main/display_core.c
+firmware/esp32-ornament/main/app_main.c
 ```
-
-实现方式：
-
-- 使用 RGB565 内存画布。
-- 用 `esp_lcd_panel_draw_bitmap()` 刷屏。
-- 不引入 LVGL，避免小屏摆件依赖过重。
 
 ## 手机热点配网
 
@@ -399,13 +381,13 @@ src-tauri\target\release\bundle\nsis\
 
 ## 硬件注意事项
 
-烧录显示相关代码前，必须向卖家确认：
+烧录显示相关代码前，必须核对：
 
-- 屏幕确认为 360x360。
-- 接口确认为 QSPI。
-- 16P FPC 引脚表与上面的 K/A/GND/CS/SCL/RESET/IO3/IO2/IO1/IO0/TE/VCC/IOVCC/GND 一致。
-- 逻辑电压和背光电压。
-- 转接板是否带背光限流。
+- 屏幕控制器为 ST7789，分辨率为 240x240。
+- 屏幕接口为 SPI，不是 QSPI。
+- 模块引脚与 README 中的 SCL/SDA/CS/DC/RST/BLK 映射一致。
+- 逻辑电压为 3.3 V。
+- 背光引脚是否只是逻辑控制，还是需要独立限流/驱动。
 
 在确认屏幕引脚前，不要假定 README 或 Kconfig 里的候选 GPIO 映射一定安全。
 
@@ -413,8 +395,7 @@ src-tauri\target\release\bundle\nsis\
 
 - Codex hooks：`https://developers.openai.com/codex/hooks`
 - Codex advanced config 与 notify：`https://developers.openai.com/codex/config-advanced`
-- Espressif ST77916 组件：`https://components.espressif.com/components/espressif/esp_lcd_st77916`
-- Espressif ST77916 GitHub 源码：`https://github.com/espressif/esp-iot-solution/tree/master/components/display/lcd/esp_lcd_st77916`
+- ESP-IDF ST7789 panel driver：`https://github.com/espressif/esp-idf/tree/master/components/esp_lcd`
 - ESP-IDF Wi-Fi station 示例：`https://github.com/espressif/esp-idf/tree/master/examples/wifi/getting_started/station`
 - ESP-IDF SoftAP 示例：`https://github.com/espressif/esp-idf/tree/master/examples/wifi/getting_started/softAP`
 - ESP-IDF HTTP client 示例：`https://github.com/espressif/esp-idf/tree/master/examples/protocols/esp_http_client`

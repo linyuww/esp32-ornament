@@ -1,5 +1,7 @@
 use chrono::{DateTime, FixedOffset, Local};
-use quota_core::{get_quota_snapshot, state_path, write_state, QuotaSnapshot, SnapshotStatus};
+use quota_core::{
+    get_quota_snapshot, read_state, state_path, write_state, QuotaSnapshot, SnapshotStatus,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -2045,15 +2047,7 @@ fn cached_or_refresh_quota(state: &Arc<Mutex<BridgeState>>) -> QuotaSnapshot {
         }
     }
 
-    let snapshot = get_quota_snapshot();
-    let _ = write_state(state_path(), &snapshot);
-    if let Ok(mut state) = state.lock() {
-        state.quota = Some(CachedQuota {
-            snapshot: snapshot.clone(),
-            fetched_at: Instant::now(),
-        });
-    }
-    snapshot
+    store_quota_snapshot(state, get_quota_snapshot())
 }
 
 fn cached_or_refresh_quota_background(state: &Arc<Mutex<BridgeState>>) -> QuotaSnapshot {
@@ -2092,16 +2086,7 @@ fn maybe_spawn_quota_refresh(state: SharedBridgeState) {
     }
 
     std::thread::spawn(move || {
-        let snapshot = get_quota_snapshot();
-        let _ = write_state(state_path(), &snapshot);
-        let Ok(mut state) = state.lock() else {
-            return;
-        };
-        state.quota = Some(CachedQuota {
-            snapshot,
-            fetched_at: Instant::now(),
-        });
-        state.quota_refreshing = false;
+        store_quota_snapshot(&state, get_quota_snapshot());
     });
 }
 
@@ -2149,6 +2134,115 @@ fn quota_unavailable() -> QuotaSnapshot {
         captured_at: None,
         error: Some("quota refresh pending".to_string()),
     }
+}
+
+fn store_quota_snapshot(
+    state: &Arc<Mutex<BridgeState>>,
+    fetched_snapshot: QuotaSnapshot,
+) -> QuotaSnapshot {
+    let previous_snapshot = cached_quota_snapshot(state).or_else(load_persisted_quota_snapshot);
+    let snapshot = merge_quota_snapshot(previous_snapshot.as_ref(), fetched_snapshot);
+    let _ = write_state(state_path(), &snapshot);
+    if let Ok(mut state) = state.lock() {
+        state.quota = Some(CachedQuota {
+            snapshot: snapshot.clone(),
+            fetched_at: Instant::now(),
+        });
+        state.quota_refreshing = false;
+    }
+    snapshot
+}
+
+fn cached_quota_snapshot(state: &Arc<Mutex<BridgeState>>) -> Option<QuotaSnapshot> {
+    state
+        .lock()
+        .ok()
+        .and_then(|state| state.quota.as_ref().map(|cache| cache.snapshot.clone()))
+}
+
+fn load_persisted_quota_snapshot() -> Option<QuotaSnapshot> {
+    read_state(state_path())
+        .ok()
+        .flatten()
+        .filter(quota_snapshot_has_display_data)
+}
+
+fn merge_quota_snapshot(
+    previous: Option<&QuotaSnapshot>,
+    mut fetched: QuotaSnapshot,
+) -> QuotaSnapshot {
+    let Some(previous) = previous.filter(|snapshot| quota_snapshot_has_display_data(snapshot))
+    else {
+        return fetched;
+    };
+
+    if !quota_snapshot_has_actual_data(&fetched) {
+        return previous.clone();
+    }
+
+    fetched.source_label = fetched
+        .source_label
+        .or_else(|| previous.source_label.clone());
+    fetched.web_url = fetched.web_url.or_else(|| previous.web_url.clone());
+    fetched.limit_id = fetched.limit_id.or_else(|| previous.limit_id.clone());
+    fetched.plan_type = fetched.plan_type.or_else(|| previous.plan_type.clone());
+    fetched.primary_used_percent = fetched
+        .primary_used_percent
+        .or(previous.primary_used_percent);
+    fetched.primary_remaining_percent = fetched
+        .primary_remaining_percent
+        .or(previous.primary_remaining_percent);
+    fetched.primary_window_minutes = fetched
+        .primary_window_minutes
+        .or(previous.primary_window_minutes);
+    fetched.primary_resets_at = merged_reset_time(
+        previous.primary_resets_at.as_deref(),
+        fetched.primary_resets_at,
+    );
+    fetched.secondary_used_percent = fetched
+        .secondary_used_percent
+        .or(previous.secondary_used_percent);
+    fetched.secondary_remaining_percent = fetched
+        .secondary_remaining_percent
+        .or(previous.secondary_remaining_percent);
+    fetched.secondary_window_minutes = fetched
+        .secondary_window_minutes
+        .or(previous.secondary_window_minutes);
+    fetched.secondary_resets_at = merged_reset_time(
+        previous.secondary_resets_at.as_deref(),
+        fetched.secondary_resets_at,
+    );
+    fetched.credits = fetched.credits.or_else(|| previous.credits.clone());
+    fetched
+}
+
+fn merged_reset_time(previous: Option<&str>, fetched: Option<String>) -> Option<String> {
+    if let Some(previous) = previous {
+        if !timestamp_has_passed(previous) {
+            return Some(previous.to_string());
+        }
+    }
+    fetched.or_else(|| previous.map(str::to_string))
+}
+
+fn timestamp_has_passed(timestamp: &str) -> bool {
+    let Ok(timestamp) = DateTime::parse_from_rfc3339(timestamp) else {
+        return true;
+    };
+    timestamp.with_timezone(&Local) <= Local::now()
+}
+
+fn quota_snapshot_has_actual_data(snapshot: &QuotaSnapshot) -> bool {
+    snapshot.status == SnapshotStatus::Ok && quota_snapshot_has_display_data(snapshot)
+}
+
+fn quota_snapshot_has_display_data(snapshot: &QuotaSnapshot) -> bool {
+    snapshot.primary_remaining_percent.is_some()
+        || snapshot.primary_used_percent.is_some()
+        || snapshot.primary_resets_at.is_some()
+        || snapshot.secondary_remaining_percent.is_some()
+        || snapshot.secondary_used_percent.is_some()
+        || snapshot.secondary_resets_at.is_some()
 }
 
 fn cached_or_refresh_weather(
@@ -2731,6 +2825,42 @@ mod tests {
         (Local::now() - chrono::Duration::seconds(seconds_ago)).to_rfc3339()
     }
 
+    fn future_timestamp(seconds_from_now: i64) -> String {
+        (Local::now() + chrono::Duration::seconds(seconds_from_now)).to_rfc3339()
+    }
+
+    fn past_timestamp(seconds_ago: i64) -> String {
+        recent_timestamp(seconds_ago)
+    }
+
+    fn quota_snapshot(
+        primary_remaining: f64,
+        secondary_remaining: f64,
+        primary_reset: &str,
+        secondary_reset: &str,
+    ) -> QuotaSnapshot {
+        QuotaSnapshot {
+            status: SnapshotStatus::Ok,
+            source: "codex-wham".to_string(),
+            source_label: Some("ChatGPT usage API".to_string()),
+            web_url: Some(quota_core::USAGE_URL.to_string()),
+            limit_id: Some("codex".to_string()),
+            plan_type: Some("team".to_string()),
+            primary_used_percent: Some(100.0 - primary_remaining),
+            primary_remaining_percent: Some(primary_remaining),
+            primary_window_minutes: Some(300),
+            primary_resets_at: Some(primary_reset.to_string()),
+            secondary_used_percent: Some(100.0 - secondary_remaining),
+            secondary_remaining_percent: Some(secondary_remaining),
+            secondary_window_minutes: Some(10_080),
+            secondary_resets_at: Some(secondary_reset.to_string()),
+            credits: None,
+            observed_at: Some(now_local()),
+            captured_at: Some(now_local()),
+            error: None,
+        }
+    }
+
     #[test]
     fn maps_open_meteo_weather_codes_to_compact_display_labels() {
         assert_eq!(open_meteo_weather_summary_for_code(0), "CLEAR");
@@ -2943,6 +3073,53 @@ mod tests {
             fetched_at: Instant::now() - QUOTA_REFRESH_INTERVAL - Duration::from_millis(1),
         });
         assert!(quota_refresh_is_due(&state));
+    }
+
+    #[test]
+    fn quota_merge_keeps_previous_snapshot_when_refresh_has_no_actual_data() {
+        let previous = quota_snapshot(
+            64.0,
+            92.0,
+            "2026-06-02T18:00:00+08:00",
+            "2026-06-08T18:00:00+08:00",
+        );
+        let fetched = quota_unavailable();
+
+        let merged = merge_quota_snapshot(Some(&previous), fetched);
+
+        assert_eq!(merged.status, SnapshotStatus::Ok);
+        assert_eq!(merged.primary_remaining_percent, Some(64.0));
+        assert_eq!(merged.secondary_remaining_percent, Some(92.0));
+        assert_eq!(
+            merged.primary_resets_at.as_deref(),
+            Some("2026-06-02T18:00:00+08:00")
+        );
+    }
+
+    #[test]
+    fn quota_merge_keeps_reset_time_until_recorded_time_has_passed() {
+        let previous_reset = future_timestamp(3600);
+        let fetched_reset = future_timestamp(7200);
+        let previous = quota_snapshot(64.0, 92.0, &previous_reset, &future_timestamp(86_400));
+        let fetched = quota_snapshot(63.0, 91.0, &fetched_reset, &future_timestamp(172_800));
+
+        let merged = merge_quota_snapshot(Some(&previous), fetched);
+
+        assert_eq!(merged.primary_remaining_percent, Some(63.0));
+        assert_eq!(merged.primary_resets_at, Some(previous_reset));
+    }
+
+    #[test]
+    fn quota_merge_accepts_new_reset_time_after_recorded_time_has_passed() {
+        let previous_reset = past_timestamp(60);
+        let fetched_reset = future_timestamp(3600);
+        let previous = quota_snapshot(64.0, 92.0, &previous_reset, &past_timestamp(60));
+        let fetched = quota_snapshot(99.0, 100.0, &fetched_reset, &future_timestamp(604_800));
+
+        let merged = merge_quota_snapshot(Some(&previous), fetched);
+
+        assert_eq!(merged.primary_remaining_percent, Some(99.0));
+        assert_eq!(merged.primary_resets_at, Some(fetched_reset));
     }
 
     #[test]

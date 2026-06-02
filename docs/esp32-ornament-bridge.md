@@ -1,6 +1,6 @@
-# ESP32 摆件桥接服务快速说明
+﻿# ESP32 摆件桥接服务
 
-这个桥接服务通过本地 HTTP 端口输出 Codex 额度和任务完成状态，供 ESP32-S3 桌面摆件读取。
+桥接服务运行在 PC 上，负责读取 Codex 额度、接收 Codex/Claude hook 事件，并向 ESP32 与网页面板提供统一状态。
 
 ## 运行
 
@@ -9,127 +9,66 @@ cd D:\Desktop\codex\codex-quota-widget
 cargo run -p codex-ornament-bridge
 ```
 
-默认地址：
+默认监听：
 
 ```text
-Bind: 0.0.0.0:8787
-State: GET http://<PC-LAN-IP>:8787/state
-Quota: GET http://<PC-LAN-IP>:8787/quota
-Hook:  POST http://127.0.0.1:8787/hook/codex
+http://0.0.0.0:8787
 ```
 
-可选环境变量：
+常用接口：
+
+```text
+GET  /health       健康检查
+GET  /discover     返回局域网可访问的 state/health URL
+GET  /state        任务、额度、天气和桥接状态
+GET  /quota        当前额度快照
+POST /hook/codex   Codex/Claude hook 事件入口
+POST /event        /hook/codex 的别名
+```
+
+## 自动发现
+
+ESP32 会通过 UDP `8787` 广播 `codex-ornament-discover-v1` 来发现桥接服务。桥接服务返回当前可用 LAN 地址，并过滤 `198.18.0.0/15` 这类代理或虚拟网卡地址。
+
+如果需要手动指定返回给 ESP32 的 LAN 地址：
 
 ```powershell
-$env:CODEX_ORNAMENT_BIND = "0.0.0.0:8787"
-$env:CODEX_ORNAMENT_TOKEN = "change-me"
-$env:CODEX_ORNAMENT_ENDPOINT = "http://127.0.0.1:8787/hook/codex"
+$env:CODEX_ORNAMENT_LAN_IP = "192.168.1.101"
 ```
 
-本机 `POST` 默认放行。局域网 `POST` 需要设置 `CODEX_ORNAMENT_TOKEN` 并发送 `X-Codex-Ornament-Token`。ESP32 正常只需要 `GET /state`。
+## Hook 配置
 
-## Codex Notify
-
-把下面配置加入用户级配置文件：
-
-```text
-%USERPROFILE%\.codex\config.toml
-```
-
-```toml
-notify = [
-  "powershell.exe",
-  "-NoProfile",
-  "-ExecutionPolicy",
-  "Bypass",
-  "-File",
-  "D:\\Desktop\\codex\\codex-quota-widget\\scripts\\codex-ornament-hook.ps1"
-]
-```
-
-`notify` 当前会发送 `agent-turn-complete`，桥接服务会映射为：
-
-```json
-{
-  "status": "done",
-  "title": "Codex done"
-}
-```
-
-## 生命周期 Hook
-
-如果需要看到 `running` 到 `done` 的状态变化，可以配置生命周期 hook。
-
-创建或修改：
+Codex lifecycle hook 推荐放在：
 
 ```text
 %USERPROFILE%\.codex\hooks.json
 ```
 
-```json
-{
-  "hooks": {
-    "UserPromptSubmit": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"D:\\Desktop\\codex\\codex-quota-widget\\scripts\\codex-ornament-hook.ps1\""
-          }
-        ]
-      }
-    ],
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"D:\\Desktop\\codex\\codex-quota-widget\\scripts\\codex-ornament-hook.ps1\""
-          }
-        ]
-      }
-    ]
-  }
-}
+`UserPromptSubmit` 映射为 `running`，`Stop` 映射为 `done`。`notify` 或 `agent-turn-complete` 只产生 `done`。
+
+Claude hook 使用同一个脚本，并增加 `-Source Claude` 或环境变量 `CODEX_ORNAMENT_SOURCE=Claude`。Web 面板会并列显示 Codex 与 Claude 状态；ESP 硬件屏幕保持合并任务视图。
+
+非法 JSON 请求会被记录并返回 HTTP 400，不会更新面板任务状态。
+
+## 任务状态规则
+
+- 多生产者、多消费者事件通过桥接服务内部队列串行落盘到状态模型。
+- Codex 与 Claude 使用 source 隔离，互不错误完成对方任务。
+- 带 `turn_id` 的任务以 `source + turn_id` 作为强身份；同一 turn 在不同 session 中重开时不会重复计数。
+- 只有匹配到对应 turn 的完成事件才会关闭带 turn 身份的 active task。
+- session-only stop 不会误关已有 turn 身份的 active task。
+- 桥接服务重启后会从最近 session 日志尾部恢复 active task，避免大日志拖慢 `/state`。
+
+## 验证
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8787/health
+Invoke-RestMethod http://127.0.0.1:8787/discover
+Invoke-RestMethod http://127.0.0.1:8787/state
 ```
 
-配置后在 Codex 中运行 `/hooks`，信任这条 PowerShell 命令。
+预期：
 
-状态映射：
-
-| Codex 事件 | 摆件状态 |
-| --- | --- |
-| `UserPromptSubmit` | `running` |
-| `Stop` | `done` |
-| `agent-turn-complete` | `done` |
-| 非法 JSON | `error` |
-
-## ESP32 读取载荷
-
-`GET /state` 示例：
-
-```json
-{
-  "status": "done",
-  "task": {
-    "kind": "agent-turn-complete",
-    "status": "done",
-    "title": "Codex done",
-    "message": "last assistant message excerpt",
-    "receivedAt": "2026-05-21T13:00:00+08:00"
-  },
-  "quota": {
-    "status": "ok",
-    "primaryRemainingPercent": 64,
-    "secondaryRemainingPercent": 92,
-    "primaryResetsAt": "2026-05-21T17:00:00+08:00",
-    "secondaryResetsAt": "2026-05-28T17:00:00+08:00"
-  }
-}
-```
-
-额度代码复用 `quota-core`，读取本地 Codex 登录信息后请求：
-
-```text
-https://chatgpt.com/backend-api/wham/usage
-```
+- `/health` 返回 `ok`。
+- `/discover` 返回真实 LAN IP，例如 `192.168.1.101`。
+- `/state` 在正常情况下快速返回 JSON。

@@ -1,9 +1,9 @@
-# ESP32 Codex Desktop Ornament Software Development Guide
+﻿# ESP32 Codex Desktop Ornament Software Development Guide
 
 ## 1. Goal
 
-This project builds an ESP32-S3 desktop ornament with a round ST77916 display. It shows Codex quota,
-current Codex task state, and a completion alert.
+This project builds an ESP32-S3 desktop ornament with an ST7789 SPI display. It shows Codex/Claude
+task state, Codex quota, weather, time, and completion alerts.
 
 The system has two software sides:
 
@@ -20,8 +20,8 @@ The system has two software sides:
 | P1 | Make PC bridge runnable | `/health`, `/quota`, `/state`, `/hook/codex` |
 | P2 | Connect Codex hooks | `notify` and lifecycle hook forwarding script |
 | P3 | Create ESP32 framework | Wi-Fi, HTTP, JSON, state model, display boundary |
-| P4 | Bring up display | ST77916 SPI/QSPI driver and first UI screen |
-| P5 | Complete interaction | Buzzer, LED, acknowledge button, error states |
+| P4 | Bring up display | ST7789 SPI driver and first UI screen |
+| P5 | Complete interaction | Web console, voice reminder, standby, and error states |
 | P6 | Deploy and accept | Windows startup, firmware flashing, acceptance notes |
 
 ## 3. Document List
@@ -54,7 +54,8 @@ firmware/esp32-ornament
   main/wifi.c                    Wi-Fi connection
   main/bridge_client.c           HTTP polling and JSON parsing
   main/ornament_state.c          State model
-  main/display.c                 ST77916 display boundary
+  main/display.c                 ST7789 display boundary
+  main/display_core.c            RGB565 drawing helpers
 ```
 
 ## 5. Local Run
@@ -126,7 +127,7 @@ notify = [
 
 ## 7. ESP32 Development Flow
 
-1. Confirm the screen 16P pinout and SPI/QSPI mode.
+1. Confirm the ST7789 SPI screen pinout.
 2. Install ESP-IDF manually.
 3. Enter `firmware/esp32-ornament`.
 4. Run `idf.py set-target esp32s3`.
@@ -136,8 +137,7 @@ notify = [
 
 Firmware implementation references:
 
-- `https://components.espressif.com/components/espressif/esp_lcd_st77916`
-- `https://github.com/espressif/esp-iot-solution/tree/master/components/display/lcd/esp_lcd_st77916`
+- `https://github.com/espressif/esp-idf/tree/master/components/esp_lcd`
 - `https://github.com/espressif/esp-idf/tree/master/examples/wifi/getting_started/station`
 - `https://github.com/espressif/esp-idf/tree/master/examples/protocols/esp_http_client`
 
@@ -145,7 +145,7 @@ Firmware implementation references:
 
 - ESP32 shows `done` within 5 seconds after a Codex task completes.
 - ESP32 shows five-hour and weekly quota percentages.
-- ESP32 renders an offline state when the PC bridge is unavailable.
+- ESP32 renders an offline state only after consecutive bridge failures, so transient fetch errors do not flicker the panel.
 - Codex keeps running normally when the hook script cannot reach the bridge.
 - Credentials remain on the PC; the device does not store Codex tokens.
 
