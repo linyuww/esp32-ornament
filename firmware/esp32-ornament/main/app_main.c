@@ -614,4 +614,12 @@ void app_main(void)
     xTaskCreate(voice_command_task, "voice_cmd", 4096, NULL, 5, NULL);
     xTaskCreate(poll_task, "bridge_poll", 8192, NULL, 5, NULL);
     xTaskCreate(ui_render_task, "ui_render", 8192, NULL, 4, NULL);
+
+    /* Main task must never return in ESP-IDF — returning tears down
+     * FreeRTOS resources (mutexes, queues, semaphores) that child tasks
+     * still depend on, causing StoreProhibited panics.
+     */
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(60000));
+    }
 }
