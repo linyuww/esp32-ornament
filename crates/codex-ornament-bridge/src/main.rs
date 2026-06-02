@@ -7,7 +7,7 @@ use std::{
     env,
     fs::{self, File},
     io::{self, BufRead, BufReader, Read, Write},
-    net::{IpAddr, SocketAddr, TcpListener, TcpStream, UdpSocket},
+    net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket},
     path::{Path, PathBuf},
     sync::{
         mpsc::{self, Receiver, SyncSender, TrySendError},
@@ -1279,7 +1279,20 @@ fn bind_port(bind: &str) -> Option<u16> {
 }
 
 fn local_lan_ip() -> Option<String> {
-    local_lan_ip_for_peer("8.8.8.8:80".parse::<SocketAddr>().ok()?.ip())
+    if let Some(ip) = configured_lan_ip() {
+        return Some(ip);
+    }
+
+    [
+        "192.168.1.1:80",
+        "192.168.0.1:80",
+        "10.0.0.1:80",
+        "172.16.0.1:80",
+        "8.8.8.8:80",
+    ]
+    .into_iter()
+    .filter_map(|peer| peer.parse::<SocketAddr>().ok())
+    .find_map(|peer| local_lan_ip_for_peer(peer.ip()))
 }
 
 fn local_lan_ip_for_peer(peer: IpAddr) -> Option<String> {
@@ -1287,9 +1300,28 @@ fn local_lan_ip_for_peer(peer: IpAddr) -> Option<String> {
     socket.connect(SocketAddr::new(peer, 80)).ok()?;
     let ip = socket.local_addr().ok()?.ip();
     match ip {
-        IpAddr::V4(ip) if !ip.is_loopback() && !ip.is_unspecified() => Some(ip.to_string()),
+        IpAddr::V4(ip) if lan_discovery_ip_is_usable(ip) => Some(ip.to_string()),
         _ => None,
     }
+}
+
+fn configured_lan_ip() -> Option<String> {
+    let ip = env_text("CODEX_ORNAMENT_LAN_IP")?;
+    ip.parse::<Ipv4Addr>()
+        .ok()
+        .filter(|ip| lan_discovery_ip_is_usable(*ip))
+        .map(|ip| ip.to_string())
+}
+
+fn lan_discovery_ip_is_usable(ip: Ipv4Addr) -> bool {
+    let [first, second, ..] = ip.octets();
+    let is_benchmark_or_proxy = first == 198 && matches!(second, 18 | 19);
+    !ip.is_loopback()
+        && !ip.is_unspecified()
+        && !ip.is_link_local()
+        && !ip.is_broadcast()
+        && !ip.is_documentation()
+        && !is_benchmark_or_proxy
 }
 
 fn post_allowed(peer: Option<SocketAddr>, request: &HttpRequest, config: &BridgeConfig) -> bool {
@@ -2903,6 +2935,19 @@ mod tests {
         assert!(info.state_url.ends_with(":9876/state"));
         assert!(info.health_url.ends_with(":9876/health"));
         assert!(!info.local_ip.is_empty());
+    }
+
+    #[test]
+    fn discovery_rejects_proxy_and_non_lan_addresses() {
+        assert!(!lan_discovery_ip_is_usable("127.0.0.1".parse().unwrap()));
+        assert!(!lan_discovery_ip_is_usable("169.254.1.2".parse().unwrap()));
+        assert!(!lan_discovery_ip_is_usable("198.18.0.1".parse().unwrap()));
+        assert!(!lan_discovery_ip_is_usable(
+            "198.19.255.254".parse().unwrap()
+        ));
+        assert!(lan_discovery_ip_is_usable("192.168.1.101".parse().unwrap()));
+        assert!(lan_discovery_ip_is_usable("10.0.0.2".parse().unwrap()));
+        assert!(lan_discovery_ip_is_usable("172.16.0.2".parse().unwrap()));
     }
 
     #[test]
