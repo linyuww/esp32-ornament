@@ -2501,15 +2501,23 @@ fn compact_weather_icon(summary: &str) -> &'static str {
         "partly-cloudy"
     } else if summary.contains("云") || summary.contains("阴") || summary.contains("cloud") {
         "cloud"
-    } else if summary.contains("霾") || summary.contains("尘") || summary.contains("沙") || summary.contains("haze") || summary.contains("dust") || summary.contains("sand") {
+    } else if summary.contains("霾")
+        || summary.contains("尘")
+        || summary.contains("沙")
+        || summary.contains("haze")
+        || summary.contains("dust")
+        || summary.contains("sand")
+    {
         "haze"
     } else if summary.contains("雾") || summary.contains("fog") {
         "fog"
     } else if summary.contains("毛毛雨") || summary.contains("drizzle") {
         "drizzle"
-    } else if summary.contains("冻雨") || summary.contains("雨夹雪") || summary.contains("sleet") {
+    } else if summary.contains("冻雨") || summary.contains("雨夹雪") || summary.contains("sleet")
+    {
         "sleet"
-    } else if summary.contains("暴雨") || summary.contains("大暴雨") || summary.contains("heavy") {
+    } else if summary.contains("暴雨") || summary.contains("大暴雨") || summary.contains("heavy")
+    {
         "heavy-rain"
     } else if summary.contains("雨") || summary.contains("rain") {
         "rain"
