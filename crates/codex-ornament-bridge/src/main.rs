@@ -22,7 +22,8 @@ const MAX_STATE_TASKS: usize = 8;
 const MAX_TASK_HISTORY: usize = 16;
 const TASK_EVENT_QUEUE_CAPACITY: usize = 64;
 const TASK_EVENT_ACK_TIMEOUT: Duration = Duration::from_millis(750);
-const QUOTA_CACHE_TTL: Duration = Duration::from_secs(60);
+const QUOTA_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+const QUOTA_CACHE_TTL: Duration = QUOTA_REFRESH_INTERVAL;
 const WEATHER_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
 const WEATHER_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 const ACTIVE_RECOVERY_SCAN_TTL: Duration = Duration::from_secs(5);
@@ -322,6 +323,7 @@ fn run() -> io::Result<()> {
     let (task_events, task_event_receiver) = mpsc::sync_channel(TASK_EVENT_QUEUE_CAPACITY);
     spawn_task_event_consumer(Arc::clone(&state), config.clone(), task_event_receiver);
     spawn_discovery_responder(config.clone());
+    spawn_quota_refresh_loop(Arc::clone(&state));
 
     eprintln!("codex ornament bridge listening on http://{}", config.bind);
     for stream in listener.incoming() {
@@ -458,6 +460,13 @@ fn spawn_discovery_responder(config: BridgeConfig) {
         if let Err(error) = run_discovery_responder(config) {
             eprintln!("discovery responder failed: {error}");
         }
+    });
+}
+
+fn spawn_quota_refresh_loop(state: SharedBridgeState) {
+    std::thread::spawn(move || loop {
+        maybe_spawn_quota_refresh_if_due(Arc::clone(&state));
+        std::thread::sleep(QUOTA_REFRESH_INTERVAL);
     });
 }
 
@@ -2086,6 +2095,29 @@ fn maybe_spawn_quota_refresh(state: SharedBridgeState) {
     });
 }
 
+fn maybe_spawn_quota_refresh_if_due(state: SharedBridgeState) {
+    let refresh_due = {
+        let Ok(state) = state.lock() else {
+            return;
+        };
+        quota_refresh_is_due(&state)
+    };
+    if refresh_due {
+        maybe_spawn_quota_refresh(state);
+    }
+}
+
+fn quota_refresh_is_due(state: &BridgeState) -> bool {
+    if state.quota_refreshing {
+        return false;
+    }
+    state
+        .quota
+        .as_ref()
+        .map(|cache| cache.fetched_at.elapsed() >= QUOTA_CACHE_TTL)
+        .unwrap_or(true)
+}
+
 fn quota_unavailable() -> QuotaSnapshot {
     QuotaSnapshot {
         status: SnapshotStatus::NoData,
@@ -2879,6 +2911,28 @@ mod tests {
 
         let state = state.lock().unwrap();
         assert!(state.quota_refreshing || state.quota.is_some());
+    }
+
+    #[test]
+    fn quota_refresh_due_respects_one_minute_interval() {
+        let mut state = BridgeState::default();
+        assert!(quota_refresh_is_due(&state));
+
+        state.quota_refreshing = true;
+        assert!(!quota_refresh_is_due(&state));
+
+        state.quota_refreshing = false;
+        state.quota = Some(CachedQuota {
+            snapshot: quota_unavailable(),
+            fetched_at: Instant::now(),
+        });
+        assert!(!quota_refresh_is_due(&state));
+
+        state.quota = Some(CachedQuota {
+            snapshot: quota_unavailable(),
+            fetched_at: Instant::now() - QUOTA_REFRESH_INTERVAL - Duration::from_millis(1),
+        });
+        assert!(quota_refresh_is_due(&state));
     }
 
     #[test]
