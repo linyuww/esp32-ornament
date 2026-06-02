@@ -6,7 +6,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     env,
     fs::{self, File},
-    io::{self, BufRead, BufReader, Read, Write},
+    io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket},
     path::{Path, PathBuf},
     sync::{
@@ -35,6 +35,7 @@ const RECONCILED_DONE_NOTIFY_WINDOW: Duration = Duration::from_secs(120);
 const COMBINED_DONE_SOURCE_WINDOW: Duration = Duration::from_secs(5);
 const RECOVER_ACTIVE_TASK_WINDOW: Duration = Duration::from_secs(12 * 60 * 60);
 const RECOVER_ACTIVE_SESSION_SCAN_LIMIT: usize = 24;
+const SESSION_TASK_SCAN_TAIL_BYTES: u64 = 2 * 1024 * 1024;
 const ACTIVE_SESSION_FILE_MISSING_GRACE: Duration = Duration::from_secs(30);
 const SESSION_FORK_CHAIN_LIMIT: usize = 8;
 const DISCOVERY_MAGIC: &str = "codex-ornament-discover-v1";
@@ -1755,12 +1756,21 @@ fn open_shared_read(path: &Path) -> io::Result<File> {
     }
 }
 
+fn open_shared_tail_read(path: &Path, max_bytes: u64) -> io::Result<File> {
+    let mut file = open_shared_read(path)?;
+    let length = file.metadata()?.len();
+    if length > max_bytes {
+        file.seek(SeekFrom::Start(length - max_bytes))?;
+    }
+    Ok(file)
+}
+
 fn active_task_in_session_file(path: &Path, session_id: &str) -> io::Result<Option<TaskEvent>> {
     Ok(active_tasks_in_session_file(path, session_id)?.pop())
 }
 
 fn active_tasks_in_session_file(path: &Path, session_id: &str) -> io::Result<Vec<TaskEvent>> {
-    let file = open_shared_read(path)?;
+    let file = open_shared_tail_read(path, SESSION_TASK_SCAN_TAIL_BYTES)?;
     let reader = BufReader::new(file);
     let mut active: HashMap<String, TaskEvent> = HashMap::new();
     let mut active_order = VecDeque::new();
@@ -1837,7 +1847,7 @@ fn active_tasks_in_session_file(path: &Path, session_id: &str) -> io::Result<Vec
 }
 
 fn terminal_turn_in_file(path: &Path, turn_id: &str) -> io::Result<Option<TerminalTurn>> {
-    let file = open_shared_read(path)?;
+    let file = open_shared_tail_read(path, SESSION_TASK_SCAN_TAIL_BYTES)?;
     let reader = BufReader::new(file);
     let mut terminal = None;
     let mut active_order = VecDeque::new();
@@ -1914,7 +1924,7 @@ fn active_task_has_newer_turn_in_session_file(path: &Path, event: &TaskEvent) ->
         return Ok(false);
     };
 
-    let file = open_shared_read(path)?;
+    let file = open_shared_tail_read(path, SESSION_TASK_SCAN_TAIL_BYTES)?;
     let reader = BufReader::new(file);
     let mut saw_event_turn = false;
 
