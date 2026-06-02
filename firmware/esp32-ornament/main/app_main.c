@@ -435,6 +435,7 @@ static void poll_task(void *arg)
     TickType_t last_done_tick = 0;
     TickType_t next_bridge_poll = 0;
     int last_done_seq = 0;
+    int consecutive_fetch_failures = 0;
     bool have_seen_state = false;
     bool have_last_done_tick = false;
     TickType_t next_auto_match = 0;
@@ -463,6 +464,10 @@ static void poll_task(void *arg)
             next_bridge_poll = now + pdMS_TO_TICKS(CONFIG_ORNAMENT_POLL_INTERVAL_MS);
             esp_err_t err = bridge_client_fetch_state(&fetched_state);
             if (err == ESP_OK) {
+                if (consecutive_fetch_failures > 0) {
+                    ESP_LOGI(TAG, "bridge fetch recovered after %d failure(s)", consecutive_fetch_failures);
+                }
+                consecutive_fetch_failures = 0;
                 if (refresh_requested) {
                     voice_control_set_result("REFRESH OK");
                 }
@@ -483,10 +488,16 @@ static void poll_task(void *arg)
                 have_seen_state = true;
                 publish_state(&fetched_state, err, last_done_tick, have_last_done_tick, true);
             } else {
+                consecutive_fetch_failures++;
                 if (refresh_requested) {
                     voice_control_set_result("REFRESH FAIL");
                 }
-                ESP_LOGW(TAG, "failed to fetch bridge state: %s", esp_err_to_name(err));
+                ESP_LOGW(
+                    TAG,
+                    "failed to fetch bridge state (%d/%d): %s",
+                    consecutive_fetch_failures,
+                    CONFIG_ORNAMENT_BRIDGE_OFFLINE_FAILURES,
+                    esp_err_to_name(err));
                 if (now >= next_auto_match) {
                     next_auto_match = now + pdMS_TO_TICKS(CONFIG_ORNAMENT_BRIDGE_AUTO_MATCH_RETRY_MS);
                     if (auto_match_bridge(false, "poll failure")) {
@@ -496,7 +507,9 @@ static void poll_task(void *arg)
                     }
                 }
 
-                if (have_seen_state) {
+                if (have_seen_state && consecutive_fetch_failures < CONFIG_ORNAMENT_BRIDGE_OFFLINE_FAILURES) {
+                    publish_state(&fetched_state, ESP_OK, last_done_tick, have_last_done_tick, true);
+                } else if (have_seen_state) {
                     publish_state(&fetched_state, err, last_done_tick, have_last_done_tick, true);
                 } else {
                     ornament_state_t error_state;

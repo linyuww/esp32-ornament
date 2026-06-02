@@ -27,6 +27,15 @@ config ORNAMENT_BRIDGE_AUTO_MATCH_RETRY_MS
     help
         When bridge polling fails, retry automatic discovery at this cadence.
 
+config ORNAMENT_BRIDGE_OFFLINE_FAILURES
+    int "Consecutive bridge failures before offline"
+    default 3
+    range 1 20
+    help
+        Number of consecutive bridge state fetch failures required before the
+        hardware panel and web console report the bridge as offline. Transient
+        failures below this threshold keep showing the last good state.
+
 config ORNAMENT_CONNECT_TIMEOUT_MS
     int "Wi-Fi connect timeout in milliseconds"
     default 60000
