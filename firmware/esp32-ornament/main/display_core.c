@@ -756,6 +756,84 @@ static void draw_weather_unknown(int cx, int cy, int size)
     draw_text(cx - ss(7), cy - ss(12), "?", ss(3), HUD_WHITE);
 }
 
+static void draw_weather_partly_cloudy(int cx, int cy, int size)
+{
+    int sun_r = size * 2 / 7;
+    int sun_cx = cx - size / 3;
+    int sun_cy = cy - size / 8;
+    /* small sun peeking from behind cloud */
+    fill_circle(sun_cx, sun_cy, sun_r, HUD_AMBER);
+    fill_rect(sun_cx - ss(1), sun_cy - sun_r - ss(2), ss(3), ss(4), HUD_AMBER);
+    fill_rect(sun_cx - ss(1), sun_cy + sun_r - ss(2), ss(3), ss(4), HUD_AMBER);
+    fill_rect(sun_cx - sun_r - ss(2), sun_cy - ss(1), ss(4), ss(3), HUD_AMBER);
+    fill_rect(sun_cx + sun_r - ss(2), sun_cy - ss(1), ss(4), ss(3), HUD_AMBER);
+    /* cloud overlapping sun */
+    int cl_cx = cx + size / 6;
+    int cl_cy = cy;
+    int cl_sz = size * 4 / 5;
+    fill_circle(cl_cx - cl_sz / 2, cl_cy + cl_sz / 8, cl_sz / 3, HUD_WHITE);
+    fill_circle(cl_cx - cl_sz / 10, cl_cy - cl_sz / 7, cl_sz / 2, HUD_WHITE);
+    fill_circle(cl_cx + cl_sz / 2, cl_cy + cl_sz / 10, cl_sz / 3, HUD_WHITE);
+    fill_rect(cl_cx - cl_sz * 3 / 4, cl_cy + cl_sz / 10, cl_sz * 3 / 2, cl_sz / 3, HUD_WHITE);
+}
+
+static void draw_weather_drizzle(int cx, int cy, int size)
+{
+    draw_weather_cloud(cx, cy - size / 5, size, HUD_WHITE);
+    for (int i = -1; i <= 1; i++) {
+        int x = cx + i * size / 4;
+        fill_rect(x, cy + size / 4, ss(2), size / 7, HUD_CYAN);
+    }
+}
+
+static void draw_weather_heavy_rain(int cx, int cy, int size)
+{
+    draw_weather_cloud(cx, cy - size / 5, size, HUD_WHITE);
+    for (int i = -2; i <= 2; i++) {
+        int x = cx + i * size / 5;
+        fill_rect(x, cy + size / 5, ss(3), size / 3, HUD_CYAN);
+    }
+}
+
+static void draw_weather_sleet(int cx, int cy, int size)
+{
+    draw_weather_cloud(cx, cy - size / 5, size, HUD_WHITE);
+    /* rain drop left */
+    fill_rect(cx - size / 4, cy + size / 5, ss(3), size / 5, HUD_CYAN);
+    /* snow asterisk right */
+    int sx = cx + size / 4;
+    int sy = cy + size / 3;
+    fill_rect(sx - ss(3), sy, ss(7), ss(2), HUD_CYAN);
+    fill_rect(sx, sy - ss(3), ss(2), ss(7), HUD_CYAN);
+    /* rain drop center */
+    fill_rect(cx, cy + size / 4, ss(3), size / 6, HUD_CYAN);
+}
+
+static void draw_weather_haze(int cx, int cy, int size)
+{
+    /* dim sun */
+    int r = size / 4;
+    fill_circle(cx, cy - size / 5, r, HUD_MUTED);
+    /* horizontal haze bands */
+    for (int i = 0; i < 4; i++) {
+        int y = cy - size / 3 + i * ss(10);
+        int w = size - i * ss(6);
+        draw_hline(cx - w / 2, cx + w / 2, y, ss(2), HUD_MUTED);
+    }
+}
+
+static void draw_weather_windy(int cx, int cy, int size)
+{
+    /* three wind bars, decreasing in length */
+    for (int i = 0; i < 3; i++) {
+        int y = cy - size / 4 + i * size / 4;
+        int w = size - i * ss(6);
+        int x_start = cx - size / 3 + i * ss(4);
+        fill_rect(x_start, y, w * 2 / 3, ss(3), HUD_CYAN);
+        fill_circle(x_start, y + ss(1), ss(2), HUD_CYAN);
+    }
+}
+
 static void draw_weather_icon(const ornament_state_t *state, int cx, int cy, int size)
 {
     if (state == NULL || !state->has_weather || strcmp(state->weather_status, "ok") != 0) {
@@ -764,16 +842,28 @@ static void draw_weather_icon(const ornament_state_t *state, int cx, int cy, int
     }
     if (strcmp(state->weather_icon, "sun") == 0) {
         draw_weather_sun(cx, cy, size);
+    } else if (strcmp(state->weather_icon, "partly-cloudy") == 0) {
+        draw_weather_partly_cloudy(cx, cy, size);
     } else if (strcmp(state->weather_icon, "cloud") == 0) {
         draw_weather_cloud(cx, cy, size, HUD_WHITE);
+    } else if (strcmp(state->weather_icon, "drizzle") == 0) {
+        draw_weather_drizzle(cx, cy, size);
     } else if (strcmp(state->weather_icon, "rain") == 0) {
         draw_weather_rain(cx, cy, size);
+    } else if (strcmp(state->weather_icon, "heavy-rain") == 0) {
+        draw_weather_heavy_rain(cx, cy, size);
+    } else if (strcmp(state->weather_icon, "sleet") == 0) {
+        draw_weather_sleet(cx, cy, size);
     } else if (strcmp(state->weather_icon, "snow") == 0) {
         draw_weather_snow(cx, cy, size);
     } else if (strcmp(state->weather_icon, "fog") == 0) {
         draw_weather_fog(cx, cy, size);
+    } else if (strcmp(state->weather_icon, "haze") == 0) {
+        draw_weather_haze(cx, cy, size);
     } else if (strcmp(state->weather_icon, "storm") == 0) {
         draw_weather_storm(cx, cy, size);
+    } else if (strcmp(state->weather_icon, "windy") == 0) {
+        draw_weather_windy(cx, cy, size);
     } else {
         draw_weather_unknown(cx, cy, size);
     }

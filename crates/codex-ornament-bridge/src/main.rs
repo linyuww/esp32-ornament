@@ -2424,10 +2424,14 @@ fn open_meteo_weather_summary_for_code(code: i32) -> &'static str {
 fn open_meteo_weather_icon_for_code(code: i32) -> &'static str {
     match code {
         0 => "sun",
-        1..=3 => "cloud",
+        1 | 2 => "partly-cloudy",
+        3 => "cloud",
         45 | 48 => "fog",
-        51 | 53 | 55 | 56 | 57 | 61 | 63 | 65 | 66 | 67 | 80 | 81 | 82 => "rain",
-        71 | 73 | 75 | 77 | 85 | 86 => "snow",
+        51 | 53 | 55 | 80 | 81 => "drizzle",
+        56 | 57 | 66 | 67 | 77 => "sleet",
+        61 | 63 | 65 => "rain",
+        82 => "heavy-rain",
+        71 | 73 | 75 | 85 | 86 => "snow",
         95 | 96 | 99 => "storm",
         _ => "unknown",
     }
@@ -2442,11 +2446,16 @@ fn qweather_icon(summary: &str, icon: Option<&str>) -> &'static str {
         if let Ok(code) = icon.parse::<i32>() {
             return match code {
                 100 => "sun",
-                101..=104 => "cloud",
+                101 => "partly-cloudy",
+                102..=104 => "cloud",
                 150 => "sun",
-                151..=154 => "cloud",
-                300..=399 => "rain",
-                400..=499 => "snow",
+                151..=153 => "partly-cloudy",
+                154 => "cloud",
+                300..=304 => "drizzle",
+                305..=309 => "rain",
+                310..=315 => "heavy-rain",
+                400..=405 => "snow",
+                406..=409 => "sleet",
                 500..=515 => "fog",
                 _ => "unknown",
             };
@@ -2471,10 +2480,15 @@ fn caiyun_summary_for_skycon(skycon: &str) -> &'static str {
 fn caiyun_icon_for_skycon(skycon: &str) -> &'static str {
     match skycon {
         "CLEAR_DAY" | "CLEAR_NIGHT" => "sun",
-        "PARTLY_CLOUDY_DAY" | "PARTLY_CLOUDY_NIGHT" | "CLOUDY" => "cloud",
-        "LIGHT_HAZE" | "MODERATE_HAZE" | "HEAVY_HAZE" | "FOG" => "fog",
-        "LIGHT_RAIN" | "MODERATE_RAIN" | "HEAVY_RAIN" | "STORM_RAIN" => "rain",
+        "PARTLY_CLOUDY_DAY" | "PARTLY_CLOUDY_NIGHT" => "partly-cloudy",
+        "CLOUDY" => "cloud",
+        "LIGHT_HAZE" | "MODERATE_HAZE" | "HEAVY_HAZE" | "DUST" | "SAND" => "haze",
+        "FOG" => "fog",
+        "LIGHT_RAIN" => "drizzle",
+        "MODERATE_RAIN" => "rain",
+        "HEAVY_RAIN" | "STORM_RAIN" => "heavy-rain",
         "LIGHT_SNOW" | "MODERATE_SNOW" | "HEAVY_SNOW" | "STORM_SNOW" => "snow",
+        "WIND" => "windy",
         _ => "unknown",
     }
 }
@@ -2483,14 +2497,26 @@ fn compact_weather_icon(summary: &str) -> &'static str {
     let summary = summary.to_ascii_lowercase();
     if summary.contains("晴") || summary.contains("clear") || summary.contains("sun") {
         "sun"
+    } else if summary.contains("多云") && !summary.contains("阴") || summary.contains("partly") {
+        "partly-cloudy"
     } else if summary.contains("云") || summary.contains("阴") || summary.contains("cloud") {
         "cloud"
+    } else if summary.contains("霾") || summary.contains("尘") || summary.contains("沙") || summary.contains("haze") || summary.contains("dust") || summary.contains("sand") {
+        "haze"
+    } else if summary.contains("雾") || summary.contains("fog") {
+        "fog"
+    } else if summary.contains("毛毛雨") || summary.contains("drizzle") {
+        "drizzle"
+    } else if summary.contains("冻雨") || summary.contains("雨夹雪") || summary.contains("sleet") {
+        "sleet"
+    } else if summary.contains("暴雨") || summary.contains("大暴雨") || summary.contains("heavy") {
+        "heavy-rain"
     } else if summary.contains("雨") || summary.contains("rain") {
         "rain"
     } else if summary.contains("雪") || summary.contains("snow") {
         "snow"
-    } else if summary.contains("雾") || summary.contains("霾") || summary.contains("fog") {
-        "fog"
+    } else if summary.contains("风") || summary.contains("wind") {
+        "windy"
     } else {
         "unknown"
     }
@@ -2637,7 +2663,7 @@ mod tests {
     #[test]
     fn maps_open_meteo_weather_codes_to_display_icons() {
         assert_eq!(open_meteo_weather_icon_for_code(0), "sun");
-        assert_eq!(open_meteo_weather_icon_for_code(2), "cloud");
+        assert_eq!(open_meteo_weather_icon_for_code(2), "partly-cloudy");
         assert_eq!(open_meteo_weather_icon_for_code(45), "fog");
         assert_eq!(open_meteo_weather_icon_for_code(65), "rain");
         assert_eq!(open_meteo_weather_icon_for_code(75), "snow");
