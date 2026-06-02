@@ -1,6 +1,6 @@
 # 撤销网桥相关设置
 
-本文档记录本仓库在 Windows 上为 Codex Ornament 网桥做过的系统级配置，以及对应的撤销命令。
+本文档记录 Codex Ornament 网桥在 Windows 上做过的系统级配置，以及对应的撤销命令。
 
 ## 停止当前网桥进程
 
@@ -8,9 +8,9 @@
 Get-Process -Name codex-ornament-bridge -ErrorAction SilentlyContinue | Stop-Process -Force
 ```
 
-## 删除开机自启计划任务
+## 删除开机自启任务
 
-当前计划任务名称为 `Codex Ornament Bridge`，触发条件是当前用户登录时启动网桥。
+当前计划任务名为 `Codex Ornament Bridge`，触发条件是当前用户登录时启动网桥。
 
 ```powershell
 schtasks /delete /tn "Codex Ornament Bridge" /f
@@ -20,6 +20,30 @@ schtasks /delete /tn "Codex Ornament Bridge" /f
 
 ```powershell
 Unregister-ScheduledTask -TaskName "Codex Ornament Bridge" -Confirm:$false
+```
+
+## 撤销 LAN IP 覆盖
+
+启动脚本会自动选择可用 LAN 地址，并忽略 `198.18.0.0/15` 这类代理或虚拟网卡地址。
+
+如果手动配置过 `CODEX_ORNAMENT_LAN_IP`，可以从下面位置删除该变量：
+
+```text
+D:\Desktop\codex\codex-quota-widget\.env
+D:\Desktop\codex\codex-quota-widget\.env.local
+```
+
+也检查用户或系统环境变量中是否存在同名变量：
+
+```powershell
+[Environment]::GetEnvironmentVariable("CODEX_ORNAMENT_LAN_IP", "User")
+[Environment]::GetEnvironmentVariable("CODEX_ORNAMENT_LAN_IP", "Machine")
+```
+
+需要删除时：
+
+```powershell
+[Environment]::SetEnvironmentVariable("CODEX_ORNAMENT_LAN_IP", $null, "User")
 ```
 
 ## 撤销 Codex hook
@@ -36,7 +60,7 @@ Codex hook 通常位于：
 D:\Desktop\codex\codex-quota-widget\scripts\codex-ornament-hook.ps1
 ```
 
-如果 `%USERPROFILE%\.codex\config.toml` 中配置了 `notify` 并指向同一个脚本，也一并删除该 `notify` 配置。
+如果 `%USERPROFILE%\.codex\config.toml` 中配置了 `notify` 并指向同一脚本，也一并删除该 `notify` 配置。
 
 ## 撤销 Claude hook
 
@@ -52,20 +76,9 @@ Claude 配置通常位于：
 D:\Desktop\codex\codex-quota-widget\scripts\codex-ornament-hook.ps1
 ```
 
-保留或删除 `PermissionRequest` 语音播放 hook 取决于是否还需要权限提示音；它不属于网桥任务状态上报的必要配置。
+`PermissionRequest` 语音播放 hook 只负责权限提示音，不是任务状态上报的必要配置。是否删除取决于是否还需要权限提示音。
 
-## 撤销本地环境文件
-
-本仓库的网桥启动脚本会读取：
-
-```text
-D:\Desktop\codex\codex-quota-widget\.env
-D:\Desktop\codex\codex-quota-widget\.env.local
-```
-
-如果要完全撤销天气和网桥环境配置，可以删除这些文件，或移除其中的 `CODEX_ORNAMENT_*` 变量。
-
-## 撤销代理绕过配置
+## 撤销 Clash Nyanpasu 绕过配置
 
 如果曾经为了访问本地域名修改 Clash Nyanpasu 配置，请检查：
 
@@ -73,7 +86,7 @@ D:\Desktop\codex\codex-quota-widget\.env.local
 C:\Users\86147\AppData\Roaming\Clash Nyanpasu\config
 ```
 
-移除与下面域名或后缀相关的绕过规则：
+移除与下面域名或地址相关的绕过规则：
 
 ```text
 codex-ornament-4ad4.local
@@ -95,4 +108,3 @@ schtasks /query /tn "Codex Ornament Bridge"
 
 - 第一条命令没有输出。
 - 第二条命令提示找不到该计划任务。
-
