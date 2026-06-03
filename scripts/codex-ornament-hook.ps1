@@ -38,6 +38,25 @@ function Add-MissingEventName($Object, $FallbackEventName) {
   return $Object
 }
 
+function Test-ControlOnlyHookPayload($RawPayload) {
+  $Parsed = Test-JsonObject $RawPayload
+  if ($null -eq $Parsed) {
+    return $false
+  }
+
+  $Names = @($Parsed.PSObject.Properties.Name)
+  if ($Names.Count -eq 0) {
+    return $true
+  }
+
+  foreach ($Name in $Names) {
+    if ($Name -ne "exclude") {
+      return $false
+    }
+  }
+  return $true
+}
+
 function Add-MissingTextProperty($Object, $Name, $Value) {
   if ([string]::IsNullOrWhiteSpace($Value)) {
     return $Object
@@ -114,6 +133,24 @@ if ($IsNotifyPayload) {
   $RawPayload = $PayloadArgs -join " "
 } else {
   $RawPayload = [Console]::In.ReadToEnd()
+}
+
+if ([string]::IsNullOrWhiteSpace($RawPayload)) {
+  if ($DryRun) {
+    Write-Output ""
+  } else {
+    Write-Output '{"continue":true}'
+  }
+  exit 0
+}
+
+if ((-not $IsNotifyPayload) -and (Test-ControlOnlyHookPayload $RawPayload)) {
+  if ($DryRun) {
+    Write-Output ""
+  } else {
+    Write-Output '{"continue":true}'
+  }
+  exit 0
 }
 
 $Payload = ConvertTo-HookPayloadJson $RawPayload $EventName

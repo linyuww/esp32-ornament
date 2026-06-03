@@ -418,6 +418,9 @@ fn handle_connection(
                     );
                 }
             };
+            if hook_payload_is_control_only(&payload) {
+                return write_json(&mut stream, 200, &json!({"ok": true, "filtered": true}));
+            }
             let event = normalize_event(&payload);
             match dispatch_task_event(&task_events, event.clone()) {
                 Ok(TaskDispatchResult::Applied | TaskDispatchResult::Filtered) => {
@@ -455,6 +458,13 @@ fn handle_connection(
 
 fn parse_hook_payload(body: &[u8]) -> Result<Value, serde_json::Error> {
     serde_json::from_slice::<Value>(body)
+}
+
+fn hook_payload_is_control_only(payload: &Value) -> bool {
+    let Some(object) = payload.as_object() else {
+        return false;
+    };
+    !object.is_empty() && object.keys().all(|key| key == "exclude")
 }
 
 fn spawn_task_event_consumer(
@@ -596,6 +606,10 @@ fn task_snapshot(state: &SharedBridgeState, config: &BridgeConfig) -> TaskSnapsh
 }
 
 fn apply_task_event(state: &mut BridgeState, event: TaskEvent) {
+    if event_is_empty_lifecycle_hook(&event) {
+        return;
+    }
+
     match event.status.as_str() {
         "running" => {
             let key = active_task_key_for_start(state, &event);
@@ -610,9 +624,6 @@ fn apply_task_event(state: &mut BridgeState, event: TaskEvent) {
             } else if state.active_tasks.is_empty() {
                 if event_has_task_identity(&event) {
                     remember_unmatched_stop(state, event);
-                } else {
-                    remember_done_task(state, event.clone());
-                    state.task = Some(event);
                 }
             } else if !event_has_task_identity(&event)
                 && active_task_count_for_source(state, &event) == 1
@@ -629,6 +640,21 @@ fn apply_task_event(state: &mut BridgeState, event: TaskEvent) {
             state.task = Some(event);
         }
     }
+}
+
+fn event_is_empty_lifecycle_hook(event: &TaskEvent) -> bool {
+    event.kind == "UserPromptSubmit"
+        && ((done_source(event) == DoneSource::Codex
+            && event.turn_id.is_none()
+            && event.message == event.kind)
+            || hook_payload_text_is_control_only(&event.message))
+}
+
+fn hook_payload_text_is_control_only(text: &str) -> bool {
+    serde_json::from_str::<Value>(text)
+        .ok()
+        .map(|payload| hook_payload_is_control_only(&payload))
+        .unwrap_or(false)
 }
 
 fn event_has_task_identity(event: &TaskEvent) -> bool {
@@ -2115,10 +2141,12 @@ fn should_finalize_pending_final_answer(
         return false;
     };
     match kind {
-        "task_started" => turn_id.map(|turn_id| turn_id != pending.turn_id).unwrap_or(true),
-        "task_complete" | "turn_aborted" => {
-            turn_id.map(|turn_id| turn_id == pending.turn_id).unwrap_or(false)
-        }
+        "task_started" => turn_id
+            .map(|turn_id| turn_id != pending.turn_id)
+            .unwrap_or(true),
+        "task_complete" | "turn_aborted" => turn_id
+            .map(|turn_id| turn_id == pending.turn_id)
+            .unwrap_or(false),
         _ => false,
     }
 }
@@ -3570,7 +3598,10 @@ mod tests {
         let mut state = BridgeState::default();
         apply_task_event(
             &mut state,
-            normalize_event(&json!({"hook_event_name": "UserPromptSubmit"})),
+            normalize_event(&json!({
+                "hook_event_name": "UserPromptSubmit",
+                "prompt": "anonymous work"
+            })),
         );
 
         apply_task_event(
@@ -3584,7 +3615,41 @@ mod tests {
     }
 
     #[test]
-    fn stop_with_no_active_task_reports_done_without_unmatched_count() {
+    fn empty_user_prompt_submit_does_not_start_task() {
+        let mut state = BridgeState::default();
+
+        apply_task_event(
+            &mut state,
+            normalize_event(&json!({"hook_event_name": "UserPromptSubmit"})),
+        );
+
+        assert_eq!(state.active_tasks.len(), 0);
+        assert_eq!(state.done_tasks.len(), 0);
+        assert_eq!(state.unmatched_stops.len(), 0);
+        assert!(state.task.is_none());
+    }
+
+    #[test]
+    fn control_only_hook_payload_does_not_start_task() {
+        let mut state = BridgeState::default();
+
+        apply_task_event(
+            &mut state,
+            normalize_event(&json!({
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "session-1",
+                "message": "{\"exclude\":[]}"
+            })),
+        );
+
+        assert_eq!(state.active_tasks.len(), 0);
+        assert_eq!(state.done_tasks.len(), 0);
+        assert_eq!(state.unmatched_stops.len(), 0);
+        assert!(state.task.is_none());
+    }
+
+    #[test]
+    fn stop_with_no_active_task_does_not_emit_done() {
         let mut state = BridgeState::default();
 
         apply_task_event(
@@ -3593,12 +3658,9 @@ mod tests {
         );
 
         assert_eq!(state.active_tasks.len(), 0);
-        assert_eq!(state.done_tasks.len(), 1);
+        assert_eq!(state.done_tasks.len(), 0);
         assert_eq!(state.unmatched_stops.len(), 0);
-        assert_eq!(
-            state.task.as_ref().map(|event| event.status.as_str()),
-            Some("done")
-        );
+        assert!(state.task.is_none());
     }
 
     #[test]
@@ -3940,14 +4002,16 @@ mod tests {
             &mut state,
             normalize_event(&json!({
                 "hook_event_name": "UserPromptSubmit",
-                "session_id": "session-1"
+                "session_id": "session-1",
+                "prompt": "first task"
             })),
         );
         apply_task_event(
             &mut state,
             normalize_event(&json!({
                 "hook_event_name": "UserPromptSubmit",
-                "session_id": "session-2"
+                "session_id": "session-2",
+                "prompt": "second task"
             })),
         );
 
@@ -4229,14 +4293,16 @@ mod tests {
                 &mut state,
                 normalize_event(&json!({
                     "hook_event_name": "UserPromptSubmit",
-                    "session_id": "session-1"
+                    "session_id": "session-1",
+                    "prompt": "first task"
                 })),
             );
             apply_task_event(
                 &mut state,
                 normalize_event(&json!({
                     "hook_event_name": "UserPromptSubmit",
-                    "session_id": "session-2"
+                    "session_id": "session-2",
+                    "prompt": "second task"
                 })),
             );
         }
@@ -4853,7 +4919,10 @@ mod tests {
             Some("running")
         );
         assert_eq!(
-            snapshot.task.as_ref().and_then(|event| event.turn_id.as_deref()),
+            snapshot
+                .task
+                .as_ref()
+                .and_then(|event| event.turn_id.as_deref()),
             Some("turn-1")
         );
     }
