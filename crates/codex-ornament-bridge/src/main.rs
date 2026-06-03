@@ -266,6 +266,13 @@ struct TerminalTurn {
     message: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+struct PendingFinalAnswer {
+    turn_id: String,
+    timestamp: Option<String>,
+    message: Option<String>,
+}
+
 struct QueuedTaskEvent {
     event: TaskEvent,
     completion: SyncSender<TaskDispatchResult>,
@@ -997,6 +1004,15 @@ fn ordered_active_tasks(state: &BridgeState) -> Vec<TaskEvent> {
 }
 
 fn display_task(state: &BridgeState, active_tasks: &[TaskEvent]) -> Option<TaskEvent> {
+    if let Some(task) = state.task.as_ref() {
+        if matches!(task.status.as_str(), "done" | "error" | "event")
+            && active_tasks
+                .iter()
+                .any(|active| stable_task_key(active) == stable_task_key(task))
+        {
+            return active_tasks.first().cloned().or_else(|| state.task.clone());
+        }
+    }
     if matches!(
         state.task.as_ref().map(|event| event.status.as_str()),
         Some("done" | "error" | "event")
@@ -1663,6 +1679,7 @@ fn line_may_contain_active_task_record(line: &str) -> bool {
 
 fn line_may_contain_terminal_task_record(line: &str) -> bool {
     line.contains("\"task_started\"")
+        || line.contains("\"turn_context\"")
         || line.contains("\"task_complete\"")
         || line.contains("\"turn_aborted\"")
         || line.contains("\"final_answer\"")
@@ -1776,6 +1793,7 @@ fn active_tasks_in_session_file(path: &Path, session_id: &str) -> io::Result<Vec
     let reader = BufReader::new(file);
     let mut active: HashMap<String, TaskEvent> = HashMap::new();
     let mut active_order = VecDeque::new();
+    let mut pending_final_answer = None;
 
     for line in reader.lines() {
         let line = line?;
@@ -1787,7 +1805,8 @@ fn active_tasks_in_session_file(path: &Path, session_id: &str) -> io::Result<Vec
         };
         let payload = &record["payload"];
         if record_is_final_answer(&record, payload) {
-            remove_latest_active_turn(&mut active, &mut active_order);
+            pending_final_answer =
+                remember_latest_pending_final_answer(&active, &active_order, &record, payload);
             continue;
         }
 
@@ -1800,6 +1819,17 @@ fn active_tasks_in_session_file(path: &Path, session_id: &str) -> io::Result<Vec
                 let Some(turn_id) = payload.get("turn_id").and_then(Value::as_str) else {
                     continue;
                 };
+                if should_finalize_pending_final_answer(
+                    pending_final_answer.as_ref(),
+                    Some(turn_id),
+                    kind,
+                ) {
+                    apply_pending_final_answer(
+                        &mut active,
+                        &mut active_order,
+                        pending_final_answer.take(),
+                    );
+                }
                 if !active.contains_key(turn_id) {
                     active_order.push_back(turn_id.to_string());
                 }
@@ -1827,6 +1857,9 @@ fn active_tasks_in_session_file(path: &Path, session_id: &str) -> io::Result<Vec
                 let Some(turn_id) = payload.get("turn_id").and_then(Value::as_str) else {
                     continue;
                 };
+                if pending_final_answer_turn_matches(pending_final_answer.as_ref(), turn_id) {
+                    pending_final_answer = None;
+                }
                 if let Some(event) = active.get_mut(turn_id) {
                     event.cwd = text_field(payload, &["cwd"]).map(|value| clip(&value, 120));
                     event.model = text_field(payload, &["model"]);
@@ -1834,6 +1867,17 @@ fn active_tasks_in_session_file(path: &Path, session_id: &str) -> io::Result<Vec
             }
             "task_complete" | "turn_aborted" => {
                 if let Some(turn_id) = payload.get("turn_id").and_then(Value::as_str) {
+                    if should_finalize_pending_final_answer(
+                        pending_final_answer.as_ref(),
+                        Some(turn_id),
+                        kind,
+                    ) {
+                        apply_pending_final_answer(
+                            &mut active,
+                            &mut active_order,
+                            pending_final_answer.take(),
+                        );
+                    }
                     active.remove(turn_id);
                     active_order.retain(|candidate| candidate != turn_id);
                 }
@@ -1841,6 +1885,8 @@ fn active_tasks_in_session_file(path: &Path, session_id: &str) -> io::Result<Vec
             _ => {}
         }
     }
+
+    apply_pending_final_answer(&mut active, &mut active_order, pending_final_answer);
 
     Ok(active_order
         .into_iter()
@@ -1853,6 +1899,7 @@ fn terminal_turn_in_file(path: &Path, turn_id: &str) -> io::Result<Option<Termin
     let reader = BufReader::new(file);
     let mut terminal = None;
     let mut active_order = VecDeque::new();
+    let mut pending_final_answer = None;
 
     for line in reader.lines() {
         let line = line?;
@@ -1864,17 +1911,8 @@ fn terminal_turn_in_file(path: &Path, turn_id: &str) -> io::Result<Option<Termin
         };
         let payload = &record["payload"];
         if record_is_final_answer(&record, payload) {
-            if active_order.back().map(String::as_str) == Some(turn_id) {
-                terminal = Some(TerminalTurn {
-                    kind: "task_complete".to_string(),
-                    timestamp: record
-                        .get("timestamp")
-                        .and_then(Value::as_str)
-                        .map(str::to_string),
-                    message: final_answer_message(payload),
-                });
-            }
-            remove_latest_active_turn_id(&mut active_order);
+            pending_final_answer =
+                remember_latest_pending_final_answer_id(&active_order, &record, payload);
             continue;
         }
 
@@ -1884,7 +1922,29 @@ fn terminal_turn_in_file(path: &Path, turn_id: &str) -> io::Result<Option<Termin
 
         if kind == "task_started" {
             if let Some(started_turn_id) = payload.get("turn_id").and_then(Value::as_str) {
+                if should_finalize_pending_final_answer(
+                    pending_final_answer.as_ref(),
+                    Some(started_turn_id),
+                    kind,
+                ) {
+                    remember_terminal_from_pending_final_answer(
+                        &mut terminal,
+                        pending_final_answer.take(),
+                        turn_id,
+                    );
+                    remove_latest_active_turn_id(&mut active_order);
+                }
                 remember_active_turn_id(&mut active_order, started_turn_id);
+            }
+            continue;
+        }
+
+        if kind == "turn_context" {
+            if let Some(context_turn_id) = payload.get("turn_id").and_then(Value::as_str) {
+                if pending_final_answer_turn_matches(pending_final_answer.as_ref(), context_turn_id)
+                {
+                    pending_final_answer = None;
+                }
             }
             continue;
         }
@@ -1895,6 +1955,18 @@ fn terminal_turn_in_file(path: &Path, turn_id: &str) -> io::Result<Option<Termin
         let Some(terminal_turn_id) = payload.get("turn_id").and_then(Value::as_str) else {
             continue;
         };
+        if should_finalize_pending_final_answer(
+            pending_final_answer.as_ref(),
+            Some(terminal_turn_id),
+            kind,
+        ) {
+            remember_terminal_from_pending_final_answer(
+                &mut terminal,
+                pending_final_answer.take(),
+                turn_id,
+            );
+            remove_latest_active_turn_id(&mut active_order);
+        }
         forget_active_turn_id(&mut active_order, terminal_turn_id);
         if terminal_turn_id != turn_id {
             continue;
@@ -1917,6 +1989,8 @@ fn terminal_turn_in_file(path: &Path, turn_id: &str) -> io::Result<Option<Termin
             message: terminal_message(payload).or(previous_message),
         });
     }
+
+    remember_terminal_from_pending_final_answer(&mut terminal, pending_final_answer, turn_id);
 
     Ok(terminal)
 }
@@ -1987,15 +2061,96 @@ fn final_answer_message(payload: &Value) -> Option<String> {
         })
 }
 
-fn remove_latest_active_turn(
+fn remember_latest_pending_final_answer(
+    active: &HashMap<String, TaskEvent>,
+    active_order: &VecDeque<String>,
+    record: &Value,
+    payload: &Value,
+) -> Option<PendingFinalAnswer> {
+    let turn_id = active_order
+        .iter()
+        .rev()
+        .find(|candidate| active.contains_key(candidate.as_str()))?
+        .clone();
+    Some(PendingFinalAnswer {
+        turn_id,
+        timestamp: record
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        message: final_answer_message(payload),
+    })
+}
+
+fn remember_latest_pending_final_answer_id(
+    active_order: &VecDeque<String>,
+    record: &Value,
+    payload: &Value,
+) -> Option<PendingFinalAnswer> {
+    Some(PendingFinalAnswer {
+        turn_id: active_order.back()?.clone(),
+        timestamp: record
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        message: final_answer_message(payload),
+    })
+}
+
+fn pending_final_answer_turn_matches(
+    pending_final_answer: Option<&PendingFinalAnswer>,
+    turn_id: &str,
+) -> bool {
+    pending_final_answer
+        .map(|pending| pending.turn_id == turn_id)
+        .unwrap_or(false)
+}
+
+fn should_finalize_pending_final_answer(
+    pending_final_answer: Option<&PendingFinalAnswer>,
+    turn_id: Option<&str>,
+    kind: &str,
+) -> bool {
+    let Some(pending) = pending_final_answer else {
+        return false;
+    };
+    match kind {
+        "task_started" => turn_id.map(|turn_id| turn_id != pending.turn_id).unwrap_or(true),
+        "task_complete" | "turn_aborted" => {
+            turn_id.map(|turn_id| turn_id == pending.turn_id).unwrap_or(false)
+        }
+        _ => false,
+    }
+}
+
+fn apply_pending_final_answer(
     active: &mut HashMap<String, TaskEvent>,
     active_order: &mut VecDeque<String>,
+    pending_final_answer: Option<PendingFinalAnswer>,
 ) {
-    while let Some(turn_id) = active_order.pop_back() {
-        if active.remove(&turn_id).is_some() {
-            return;
-        }
+    let Some(pending) = pending_final_answer else {
+        return;
+    };
+    active.remove(&pending.turn_id);
+    active_order.retain(|candidate| candidate != &pending.turn_id);
+}
+
+fn remember_terminal_from_pending_final_answer(
+    terminal: &mut Option<TerminalTurn>,
+    pending_final_answer: Option<PendingFinalAnswer>,
+    turn_id: &str,
+) {
+    let Some(pending) = pending_final_answer else {
+        return;
+    };
+    if pending.turn_id != turn_id {
+        return;
     }
+    *terminal = Some(TerminalTurn {
+        kind: "task_complete".to_string(),
+        timestamp: pending.timestamp,
+        message: pending.message,
+    });
 }
 
 fn remember_active_turn_id(active_order: &mut VecDeque<String>, turn_id: &str) {
@@ -4533,6 +4688,40 @@ mod tests {
     }
 
     #[test]
+    fn session_log_parser_keeps_turn_running_when_final_answer_is_followed_by_same_turn_context() {
+        let path = env::temp_dir().join(format!(
+            "codex-ornament-final-answer-continued-{}.jsonl",
+            std::process::id()
+        ));
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-05-31T12:00:00+08:00\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"turn-1\"}}\n",
+                "{\"timestamp\":\"2026-05-31T12:00:01+08:00\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"phase\":\"final_answer\",\"content\":[{\"type\":\"output_text\",\"text\":\"turn one provisional done\"}]}}\n",
+                "{\"timestamp\":\"2026-05-31T12:00:02+08:00\",\"payload\":{\"type\":\"turn_context\",\"turn_id\":\"turn-1\",\"cwd\":\"D:\\\\Desktop\\\\codex\",\"model\":\"gpt-5\"}}\n"
+            ),
+        )
+        .unwrap();
+
+        let active = active_tasks_in_session_file(&path, "session-1").unwrap();
+        let terminal = terminal_turn_in_file(&path, "turn-1").unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(
+            active
+                .iter()
+                .filter_map(|event| event.turn_id.as_deref())
+                .collect::<Vec<_>>(),
+            vec!["turn-1"]
+        );
+        assert_eq!(
+            active.first().and_then(|event| event.model.as_deref()),
+            Some("gpt-5")
+        );
+        assert!(terminal.is_none());
+    }
+
+    #[test]
     fn recent_recovery_ignores_orphaned_turn_when_newer_turn_started() {
         let codex_home = env::temp_dir().join(format!(
             "codex-ornament-orphan-newer-turn-{}",
@@ -4601,6 +4790,72 @@ mod tests {
 
         assert_eq!(snapshot.active_task_count, 0);
         assert_eq!(snapshot.status, "done");
+    }
+
+    #[test]
+    fn snapshot_restores_running_after_compaction_continues_same_turn() {
+        let codex_home = env::temp_dir().join(format!(
+            "codex-ornament-compaction-continues-{}",
+            std::process::id()
+        ));
+        let session_dir = codex_home
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("31");
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::write(
+            session_dir.join("rollout-2026-05-31T16-59-09-session-1.jsonl"),
+            concat!(
+                "{\"timestamp\":\"2026-05-31T12:00:00+08:00\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"turn-1\"}}\n",
+                "{\"timestamp\":\"2026-05-31T12:00:10+08:00\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"phase\":\"final_answer\",\"content\":[{\"type\":\"output_text\",\"text\":\"intermediate final answer\"}]}}\n",
+                "{\"timestamp\":\"2026-05-31T12:00:11+08:00\",\"type\":\"event_msg\",\"payload\":{\"type\":\"context_compacted\",\"turn_id\":\"turn-1\"}}\n",
+                "{\"timestamp\":\"2026-05-31T12:00:12+08:00\",\"payload\":{\"type\":\"turn_context\",\"turn_id\":\"turn-1\",\"cwd\":\"D:\\\\Desktop\\\\codex\",\"model\":\"gpt-5\"}}\n"
+            ),
+        )
+        .unwrap();
+        let state = Arc::new(Mutex::new(BridgeState::default()));
+        {
+            let mut state = state.lock().unwrap();
+            apply_task_event(
+                &mut state,
+                normalize_event(&json!({
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": "session-1",
+                    "turn_id": "turn-1"
+                })),
+            );
+            remember_done_task(
+                &mut state,
+                TaskEvent {
+                    kind: "Stop".to_string(),
+                    status: "done".to_string(),
+                    title: "Codex done".to_string(),
+                    message: "stale done".to_string(),
+                    received_at: "2026-05-31T12:00:10+08:00".to_string(),
+                    source: None,
+                    session_id: Some("session-1".to_string()),
+                    turn_id: Some("turn-1".to_string()),
+                    cwd: None,
+                    model: None,
+                },
+            );
+            state.task = state.done_tasks.back().cloned();
+        }
+
+        let snapshot = task_snapshot(&state, &scoped_test_config("session-1", &codex_home));
+        let _ = fs::remove_dir_all(&codex_home);
+
+        assert_eq!(snapshot.active_task_count, 1);
+        assert_eq!(snapshot.status, "running");
+        assert_eq!(
+            snapshot.task.as_ref().map(|event| event.status.as_str()),
+            Some("running")
+        );
+        assert_eq!(
+            snapshot.task.as_ref().and_then(|event| event.turn_id.as_deref()),
+            Some("turn-1")
+        );
     }
 
     #[test]
