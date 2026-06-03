@@ -9,6 +9,10 @@ static const char *KEY_SSID = "ssid";
 static const char *KEY_PASSWORD = "password";
 static const char *KEY_BRIDGE_URL = "bridge_url";
 static const char *KEY_AUDIO_VOLUME = "audio_volume";
+static const char *KEY_WEATHER_LABEL = "weather_label";
+static const char *KEY_WEATHER_LAT_E6 = "weather_lat_e6";
+static const char *KEY_WEATHER_LON_E6 = "weather_lon_e6";
+static const char *KEY_CAIYUN_TOKEN = "caiyun_token";
 
 static void load_default_settings(ornament_settings_t *settings)
 {
@@ -16,9 +20,13 @@ static void load_default_settings(ornament_settings_t *settings)
     strlcpy(settings->ssid, CONFIG_ORNAMENT_WIFI_SSID, sizeof(settings->ssid));
     strlcpy(settings->password, CONFIG_ORNAMENT_WIFI_PASSWORD, sizeof(settings->password));
     strlcpy(settings->bridge_url, CONFIG_ORNAMENT_BRIDGE_URL, sizeof(settings->bridge_url));
+    strlcpy(settings->weather_label, CONFIG_ORNAMENT_WEATHER_LABEL, sizeof(settings->weather_label));
+    settings->weather_lat_e6 = CONFIG_ORNAMENT_WEATHER_LAT_E6;
+    settings->weather_lon_e6 = CONFIG_ORNAMENT_WEATHER_LON_E6;
     settings->audio_volume_percent = CONFIG_ORNAMENT_AUDIO_VOLUME_PERCENT;
     settings->has_wifi = settings->ssid[0] != '\0';
     settings->has_bridge_url = settings->bridge_url[0] != '\0';
+    settings->has_caiyun_token = false;
 }
 
 static void read_nvs_string(nvs_handle_t handle, const char *key, char *target, size_t target_size)
@@ -46,11 +54,19 @@ esp_err_t settings_load(ornament_settings_t *settings)
     char ssid[sizeof(settings->ssid)] = {0};
     char password[sizeof(settings->password)] = {0};
     char bridge_url[sizeof(settings->bridge_url)] = {0};
+    char weather_label[sizeof(settings->weather_label)] = {0};
+    char caiyun_token[sizeof(settings->caiyun_token)] = {0};
     int32_t audio_volume_percent = settings->audio_volume_percent;
+    int32_t weather_lat_e6 = settings->weather_lat_e6;
+    int32_t weather_lon_e6 = settings->weather_lon_e6;
     read_nvs_string(handle, KEY_SSID, ssid, sizeof(ssid));
     read_nvs_string(handle, KEY_PASSWORD, password, sizeof(password));
     read_nvs_string(handle, KEY_BRIDGE_URL, bridge_url, sizeof(bridge_url));
+    read_nvs_string(handle, KEY_WEATHER_LABEL, weather_label, sizeof(weather_label));
+    read_nvs_string(handle, KEY_CAIYUN_TOKEN, caiyun_token, sizeof(caiyun_token));
     (void)nvs_get_i32(handle, KEY_AUDIO_VOLUME, &audio_volume_percent);
+    (void)nvs_get_i32(handle, KEY_WEATHER_LAT_E6, &weather_lat_e6);
+    (void)nvs_get_i32(handle, KEY_WEATHER_LON_E6, &weather_lon_e6);
     nvs_close(handle);
 
     if (ssid[0] != '\0') {
@@ -64,6 +80,19 @@ esp_err_t settings_load(ornament_settings_t *settings)
     }
     if (audio_volume_percent >= 0 && audio_volume_percent <= 100) {
         settings->audio_volume_percent = (int)audio_volume_percent;
+    }
+    if (weather_label[0] != '\0') {
+        strlcpy(settings->weather_label, weather_label, sizeof(settings->weather_label));
+    }
+    if (weather_lat_e6 >= -90000000 && weather_lat_e6 <= 90000000) {
+        settings->weather_lat_e6 = (int)weather_lat_e6;
+    }
+    if (weather_lon_e6 >= -180000000 && weather_lon_e6 <= 180000000) {
+        settings->weather_lon_e6 = (int)weather_lon_e6;
+    }
+    if (caiyun_token[0] != '\0') {
+        strlcpy(settings->caiyun_token, caiyun_token, sizeof(settings->caiyun_token));
+        settings->has_caiyun_token = true;
     }
 
     return ESP_OK;
@@ -86,6 +115,25 @@ esp_err_t settings_save(const ornament_settings_t *settings)
     }
     if (err == ESP_OK) {
         err = nvs_set_i32(handle, KEY_AUDIO_VOLUME, settings_audio_volume_percent_or_default(settings));
+    }
+    if (err == ESP_OK) {
+        err = nvs_set_str(handle, KEY_WEATHER_LABEL, settings_weather_label_or_default(settings));
+    }
+    if (err == ESP_OK) {
+        err = nvs_set_i32(handle, KEY_WEATHER_LAT_E6, settings->weather_lat_e6);
+    }
+    if (err == ESP_OK) {
+        err = nvs_set_i32(handle, KEY_WEATHER_LON_E6, settings->weather_lon_e6);
+    }
+    if (err == ESP_OK) {
+        if (settings->has_caiyun_token && settings->caiyun_token[0] != '\0') {
+            err = nvs_set_str(handle, KEY_CAIYUN_TOKEN, settings->caiyun_token);
+        } else {
+            esp_err_t erase_err = nvs_erase_key(handle, KEY_CAIYUN_TOKEN);
+            if (erase_err != ESP_OK && erase_err != ESP_ERR_NVS_NOT_FOUND) {
+                err = erase_err;
+            }
+        }
     }
     if (err == ESP_OK) {
         err = nvs_commit(handle);
@@ -124,4 +172,12 @@ int settings_audio_volume_percent_or_default(const ornament_settings_t *settings
         return settings->audio_volume_percent;
     }
     return CONFIG_ORNAMENT_AUDIO_VOLUME_PERCENT;
+}
+
+const char *settings_weather_label_or_default(const ornament_settings_t *settings)
+{
+    if (settings != NULL && settings->weather_label[0] != '\0') {
+        return settings->weather_label;
+    }
+    return CONFIG_ORNAMENT_WEATHER_LABEL;
 }

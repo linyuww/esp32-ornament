@@ -64,6 +64,7 @@ typedef struct {
     bool has_quota;
     bool time_synced;
     bool wifi_connected;
+    bool bridge_offline;
     bool done_flash_active;
     bool done_flash_on;
     uint8_t active_dot_phase;

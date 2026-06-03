@@ -903,6 +903,21 @@ static void draw_wifi_signal_icon(int center_x, int center_y, int bars)
     }
 }
 
+static void draw_bridge_offline_icon(int center_x, int center_y)
+{
+    const int body_w = ss(26);
+    const int body_h = ss(18);
+    const int thickness = ss(2);
+    const int x = center_x - body_w / 2;
+    const int y = center_y - body_h / 2;
+
+    draw_rect_outline(x, y, body_w, body_h, thickness, HUD_AMBER);
+    fill_rect(x + body_w / 2 - ss(1), y - ss(5), ss(2), ss(5), HUD_AMBER);
+    fill_rect(x + ss(7), y + body_h, ss(4), ss(5), HUD_AMBER);
+    fill_rect(x + body_w - ss(11), y + body_h, ss(4), ss(5), HUD_AMBER);
+    draw_hline(x - ss(4), x + body_w + ss(4), center_y + ss(10), thickness, HUD_AMBER);
+}
+
 static void draw_standby_background(void)
 {
     draw_standby_wallpaper();
@@ -938,6 +953,9 @@ static void draw_standby_weather_row(const ornament_state_t *state, const char *
 static void draw_standby_connectivity(const ornament_state_t *state)
 {
     draw_wifi_signal_icon(active_canvas->center_x, sy(342), wifi_signal_bars(state));
+    if (state != NULL && state->bridge_offline) {
+        draw_bridge_offline_icon(active_canvas->center_x + ss(55), sy(342));
+    }
 }
 
 static void status_label(const ornament_state_t *state, char *out, size_t out_size)

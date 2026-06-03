@@ -10,6 +10,7 @@
 #include "esp_wifi.h"
 #include "settings.h"
 #include "task_audio.h"
+#include "weather_client.h"
 #include "wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -20,6 +21,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#define COORD_E6_SCALE 1000000
 
 static const char *TAG = "web_console";
 static httpd_handle_t server;
@@ -168,6 +171,23 @@ static const char *display_id_or_dash(const char *value)
     return value != NULL && value[0] != '\0' ? value : "--";
 }
 
+static void coord_e6_to_text(int value, char *out, size_t out_size)
+{
+    if (out_size == 0) {
+        return;
+    }
+    int whole = value / COORD_E6_SCALE;
+    int fraction = value % COORD_E6_SCALE;
+    if (fraction < 0) {
+        fraction = -fraction;
+    }
+    if (value < 0 && whole == 0) {
+        snprintf(out, out_size, "-0.%06d", fraction);
+    } else {
+        snprintf(out, out_size, "%d.%06d", whole, fraction);
+    }
+}
+
 static void append_task_card(
     char *html,
     size_t html_size,
@@ -269,6 +289,8 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     char weather_label[48];
     char weather_summary[80];
     char weather_icon[40];
+    char weather_observed_at[ORNAMENT_TIME_MAX * 2];
+    char weather_config_label[ORNAMENT_WEATHER_LABEL_MAX * 2];
     char bridge_url[ORNAMENT_BRIDGE_URL_MAX * 2];
     web_console_bridge_debug_t bridge_diag = {0};
 
@@ -284,6 +306,8 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     json_escape(state.weather_label, weather_label, sizeof(weather_label));
     json_escape(state.weather_summary, weather_summary, sizeof(weather_summary));
     json_escape(state.weather_icon, weather_icon, sizeof(weather_icon));
+    json_escape(state.weather_observed_at, weather_observed_at, sizeof(weather_observed_at));
+    json_escape(settings_weather_label_or_default(&console_settings), weather_config_label, sizeof(weather_config_label));
 
     json_escape(settings_bridge_url_or_default(&console_settings), bridge_url, sizeof(bridge_url));
     if (state_mutex != NULL && xSemaphoreTake(state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
@@ -305,6 +329,7 @@ static esp_err_t status_get_handler(httpd_req_t *req)
         "\"uptime_ms\":%lld,"
         "\"last_state_age_ms\":%lld,"
         "\"fetch_error\":\"%s\","
+        "\"bridge_offline\":%s,"
         "\"hostname\":\"%s\","
         "\"mdns_url\":\"%s\","
         "\"bridge_url\":\"%s\","
@@ -313,7 +338,9 @@ static esp_err_t status_get_handler(httpd_req_t *req)
         "\"channel\":%d,\"authmode\":%d,\"retry_count\":%d,\"last_disconnect_reason\":%u,"
         "\"last_disconnect_name\":\"%s\",\"last_disconnect_rssi\":%d},"
         "\"time\":{\"synced\":%s,\"local_time\":\"%s\",\"local_date\":\"%s\"},"
-        "\"weather\":{\"has\":%s,\"status\":\"%s\",\"label\":\"%s\",\"summary\":\"%s\",\"icon\":\"%s\",\"temperature_c\":%d,\"wind_kmh\":%d,\"code\":%d},"
+        "\"weather\":{\"has\":%s,\"status\":\"%s\",\"label\":\"%s\",\"summary\":\"%s\",\"icon\":\"%s\","
+        "\"observed_at\":\"%s\",\"temperature_c\":%d,\"wind_kmh\":%d,\"code\":%d},"
+        "\"weather_config\":{\"caiyun_configured\":%s,\"label\":\"%s\",\"lat_e6\":%d,\"lon_e6\":%d},"
         "\"quota\":{\"has\":%s,\"status\":\"%s\",\"primary\":%d,\"weekly\":%d},"
         "\"task\":{\"has\":%s,\"active_count\":%d,\"done_seq\":%d,\"status\":\"%s\",\"title\":\"%s\",\"message\":\"%s\"},"
         "\"audio\":{\"enabled\":%s,\"volume_percent\":%d},"
@@ -325,6 +352,7 @@ static esp_err_t status_get_handler(httpd_req_t *req)
         (long long)(esp_timer_get_time() / 1000),
         (long long)age_ms,
         esp_err_to_name(fetch_error),
+        state.bridge_offline ? "true" : "false",
         device_identity_hostname(),
         device_identity_mdns_url(),
         bridge_url,
@@ -350,9 +378,14 @@ static esp_err_t status_get_handler(httpd_req_t *req)
         weather_label,
         weather_summary,
         weather_icon,
+        weather_observed_at,
         state.weather_temperature_c,
         state.weather_wind_kmh,
         state.weather_code,
+        console_settings.has_caiyun_token ? "true" : "false",
+        weather_config_label,
+        console_settings.weather_lat_e6,
+        console_settings.weather_lon_e6,
         state.has_quota ? "true" : "false",
         quota_status,
         state.primary_remaining_percent,
@@ -401,6 +434,9 @@ static esp_err_t root_get_handler(httpd_req_t *req)
     char weather_icon[40];
     char weather_value[96];
     char weather_detail[128];
+    char settings_weather_label[ORNAMENT_WEATHER_LABEL_MAX * 2];
+    char weather_lat_text[24];
+    char weather_lon_text[24];
     web_console_bridge_debug_t bridge_diag = {0};
     int audio_volume_percent = settings_audio_volume_percent_or_default(&console_settings);
 
@@ -414,6 +450,9 @@ static esp_err_t root_get_handler(httpd_req_t *req)
     html_escape(state.weather_label, weather_label, sizeof(weather_label));
     html_escape(state.weather_summary, weather_summary, sizeof(weather_summary));
     html_escape(state.weather_icon, weather_icon, sizeof(weather_icon));
+    html_escape(settings_weather_label_or_default(&console_settings), settings_weather_label, sizeof(settings_weather_label));
+    coord_e6_to_text(console_settings.weather_lat_e6, weather_lat_text, sizeof(weather_lat_text));
+    coord_e6_to_text(console_settings.weather_lon_e6, weather_lon_text, sizeof(weather_lon_text));
     html_escape(
         state.has_codex_task ? state.codex_task_session_id : state.task_session_id,
         codex_session_id,
@@ -476,9 +515,10 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         html_size,
         &used,
         "<header class=\"top\"><div><h1>Codex Ornament</h1><p class=\"sub\">%s</p></div>"
-        "<div class=\"badges\"><span class=\"badge\">Bridge %s</span><span class=\"badge\">age %lld ms</span></div></header>",
+        "<div class=\"badges\"><span class=\"badge\">Bridge %s</span><span class=\"badge\">%s</span><span class=\"badge\">age %lld ms</span></div></header>",
         device_identity_hostname(),
         esp_err_to_name(fetch_error),
+        state.bridge_offline ? "Bridge offline" : "Bridge online",
         (long long)age_ms);
     append(html, html_size, &used, "<section class=\"urls\">");
     appendf(html, html_size, &used, "<div class=\"urlbox\"><div class=\"k\">Local URL</div><code>%s</code></div>", device_identity_mdns_url());
@@ -531,6 +571,22 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "<button class=\"warn\" type=\"submit\" formaction=\"/test-audio\">Test Voice</button></div></form></section>",
         audio_volume_percent,
         audio_volume_percent);
+    appendf(
+        html,
+        html_size,
+        &used,
+        "<section class=\"ops\"><form method=\"post\" action=\"/save-weather\">"
+        "<label class=\"k\">Weather Label</label><input name=\"weather_label\" maxlength=\"24\" value=\"%s\">"
+        "<label class=\"k\">Latitude</label><input name=\"weather_lat\" inputmode=\"decimal\" value=\"%s\">"
+        "<label class=\"k\">Longitude</label><input name=\"weather_lon\" inputmode=\"decimal\" value=\"%s\">"
+        "<label class=\"k\">Caiyun Token (%s)</label><input name=\"caiyun_token\" type=\"password\" maxlength=\"96\" value=\"\" placeholder=\"%s\">"
+        "<div class=\"actions\"><button type=\"submit\">Save Weather</button>"
+        "<button class=\"danger\" type=\"submit\" formaction=\"/clear-weather-token\">Clear Token</button></div></form></section>",
+        settings_weather_label,
+        weather_lat_text,
+        weather_lon_text,
+        console_settings.has_caiyun_token ? "configured" : "not configured",
+        console_settings.has_caiyun_token ? "configured" : "paste token");
     append(
         html,
         html_size,
@@ -721,6 +777,124 @@ static esp_err_t parse_audio_volume_percent(const char *value, int *volume_perce
     return ESP_OK;
 }
 
+static esp_err_t parse_coord_e6(const char *value, int min_e6, int max_e6, int *out)
+{
+    if (value == NULL || out == NULL || value[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    const char *cursor = value;
+    bool negative = false;
+    if (*cursor == '-' || *cursor == '+') {
+        negative = *cursor == '-';
+        cursor++;
+    }
+    if (*cursor == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    int64_t whole = 0;
+    int fraction = 0;
+    int fraction_digits = 0;
+    bool saw_digit = false;
+    while (*cursor >= '0' && *cursor <= '9') {
+        saw_digit = true;
+        whole = whole * 10 + (*cursor - '0');
+        if (whole > 180) {
+            return ESP_ERR_INVALID_ARG;
+        }
+        cursor++;
+    }
+    if (*cursor == '.') {
+        cursor++;
+        while (*cursor >= '0' && *cursor <= '9') {
+            if (fraction_digits < 6) {
+                fraction = fraction * 10 + (*cursor - '0');
+                fraction_digits++;
+            }
+            cursor++;
+        }
+    }
+    if (*cursor != '\0' || !saw_digit) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    while (fraction_digits < 6) {
+        fraction *= 10;
+        fraction_digits++;
+    }
+
+    int64_t scaled = whole * COORD_E6_SCALE + fraction;
+    if (negative) {
+        scaled = -scaled;
+    }
+    if (scaled < min_e6 || scaled > max_e6) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *out = (int)scaled;
+    return ESP_OK;
+}
+
+static esp_err_t save_weather_settings(
+    const char *label,
+    const char *lat_text,
+    const char *lon_text,
+    const char *token)
+{
+    if (label == NULL || label[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    int lat_e6 = 0;
+    int lon_e6 = 0;
+    esp_err_t err = parse_coord_e6(lat_text, -90 * COORD_E6_SCALE, 90 * COORD_E6_SCALE, &lat_e6);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = parse_coord_e6(lon_text, -180 * COORD_E6_SCALE, 180 * COORD_E6_SCALE, &lon_e6);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    ornament_settings_t settings;
+    err = settings_load(&settings);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    strlcpy(settings.weather_label, label, sizeof(settings.weather_label));
+    settings.weather_lat_e6 = lat_e6;
+    settings.weather_lon_e6 = lon_e6;
+    if (token != NULL && token[0] != '\0') {
+        strlcpy(settings.caiyun_token, token, sizeof(settings.caiyun_token));
+        settings.has_caiyun_token = true;
+    }
+
+    err = settings_save(&settings);
+    if (err == ESP_OK) {
+        console_settings = settings;
+        weather_client_settings_changed(settings.has_caiyun_token);
+    }
+    return err;
+}
+
+static esp_err_t clear_weather_token(void)
+{
+    ornament_settings_t settings;
+    esp_err_t err = settings_load(&settings);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    settings.caiyun_token[0] = '\0';
+    settings.has_caiyun_token = false;
+    err = settings_save(&settings);
+    if (err == ESP_OK) {
+        console_settings = settings;
+        weather_client_settings_changed(false);
+    }
+    return err;
+}
+
 static esp_err_t send_audio_saved_page(httpd_req_t *req, int volume_percent, bool played)
 {
     char html[768];
@@ -732,6 +906,25 @@ static esp_err_t send_audio_saved_page(httpd_req_t *req, int volume_percent, boo
         "</head><body><h1>Voice Volume</h1><p>Volume: %d%%</p><p>%s</p><p><a href=\"/\">Back</a></p></body></html>",
         volume_percent,
         played ? "Test voice queued." : "Saved for the next voice reminder.");
+
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
+    return httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t send_weather_saved_page(httpd_req_t *req, const char *title, const char *detail)
+{
+    char escaped_detail[160];
+    html_escape(detail != NULL ? detail : "", escaped_detail, sizeof(escaped_detail));
+
+    char html[768];
+    snprintf(
+        html,
+        sizeof(html),
+        "<!doctype html><html><head><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+        "<style>body{font-family:system-ui;margin:24px;background:#0b1116;color:#edf7fb}a{color:#49d3c8}</style>"
+        "</head><body><h1>%s</h1><p>%s</p><p><a href=\"/\">Back</a></p></body></html>",
+        title != NULL ? title : "Weather",
+        escaped_detail);
 
     httpd_resp_set_type(req, "text/html; charset=utf-8");
     return httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
@@ -813,6 +1006,47 @@ static esp_err_t save_audio_post_handler(httpd_req_t *req)
     }
 
     return send_audio_saved_page(req, volume_percent, false);
+}
+
+static esp_err_t save_weather_post_handler(httpd_req_t *req)
+{
+    char body[512] = {0};
+    char label[ORNAMENT_WEATHER_LABEL_MAX + 1] = {0};
+    char lat_text[24] = {0};
+    char lon_text[24] = {0};
+    char token[ORNAMENT_WEATHER_TOKEN_MAX + 1] = {0};
+    if (read_form_body(req, body, sizeof(body)) != ESP_OK) {
+        return ESP_FAIL;
+    }
+
+    form_value(body, "weather_label", label, sizeof(label));
+    form_value(body, "weather_lat", lat_text, sizeof(lat_text));
+    form_value(body, "weather_lon", lon_text, sizeof(lon_text));
+    form_value(body, "caiyun_token", token, sizeof(token));
+
+    esp_err_t err = save_weather_settings(label, lat_text, lon_text, token);
+    if (err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Weather label, latitude, longitude, or token is invalid");
+        return ESP_FAIL;
+    }
+
+    return send_weather_saved_page(req, "Weather Saved", "Caiyun settings were saved. A blank token field keeps the existing token.");
+}
+
+static esp_err_t clear_weather_token_post_handler(httpd_req_t *req)
+{
+    if (req->content_len > 0) {
+        char body[512] = {0};
+        (void)read_form_body(req, body, sizeof(body));
+    }
+
+    esp_err_t err = clear_weather_token();
+    if (err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, esp_err_to_name(err));
+        return ESP_FAIL;
+    }
+
+    return send_weather_saved_page(req, "Weather Token Cleared", "Local Caiyun weather is disabled until a token is saved again.");
 }
 
 static esp_err_t test_audio_post_handler(httpd_req_t *req)
@@ -914,7 +1148,7 @@ esp_err_t web_console_start(void)
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
     config.lru_purge_enable = true;
-    config.max_uri_handlers = 12;
+    config.max_uri_handlers = 14;
     config.stack_size = 16384;
 
     esp_err_t err = httpd_start(&server, &config);
@@ -953,6 +1187,16 @@ esp_err_t web_console_start(void)
         .method = HTTP_POST,
         .handler = test_audio_post_handler,
     };
+    const httpd_uri_t save_weather = {
+        .uri = "/save-weather",
+        .method = HTTP_POST,
+        .handler = save_weather_post_handler,
+    };
+    const httpd_uri_t clear_weather_token = {
+        .uri = "/clear-weather-token",
+        .method = HTTP_POST,
+        .handler = clear_weather_token_post_handler,
+    };
     const httpd_uri_t auto_bridge = {
         .uri = "/auto-bridge",
         .method = HTTP_POST,
@@ -975,6 +1219,8 @@ esp_err_t web_console_start(void)
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &save_bridge));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &save_audio));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &test_audio));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &save_weather));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &clear_weather_token));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &auto_bridge));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &reboot));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &clear_config));

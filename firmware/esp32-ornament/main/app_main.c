@@ -6,6 +6,7 @@
 #include "system_status.h"
 #include "task_audio.h"
 #include "web_console.h"
+#include "weather_client.h"
 #include "wifi.h"
 
 #include "esp_log.h"
@@ -56,9 +57,9 @@ static SemaphoreHandle_t voice_control_mutex;
 static voice_control_state_t voice_control;
 static QueueHandle_t voice_command_queue;
 
-static bool ui_needs_animation(const ornament_state_t *state)
+static bool bridge_is_offline(int consecutive_fetch_failures, esp_err_t err)
 {
-    return ornament_state_panel_status(state) == ORNAMENT_STATUS_RUNNING || state->done_flash_active;
+    return err != ESP_OK && consecutive_fetch_failures >= CONFIG_ORNAMENT_BRIDGE_OFFLINE_FAILURES;
 }
 
 static bool standby_timer_eligible(const ornament_state_t *state)
@@ -72,6 +73,9 @@ static bool standby_timer_eligible(const ornament_state_t *state)
 
 static bool should_show_standby_clock(const ornament_state_t *state, TickType_t idle_since_tick, TickType_t now)
 {
+    if (state != NULL && state->bridge_offline && !state->has_quota && state->active_task_count == 0) {
+        return true;
+    }
     return CONFIG_ORNAMENT_STANDBY_CLOCK_MS > 0 &&
            standby_timer_eligible(state) &&
            !state->done_flash_active &&
@@ -91,6 +95,19 @@ static void update_local_animation(
     bool have_last_done_tick)
 {
     ornament_state_update_display_timing(state, ticks_to_ms(now), ticks_to_ms(last_done_tick), have_last_done_tick);
+}
+
+static void apply_local_state(ornament_state_t *state, bool bridge_offline)
+{
+    if (state == NULL) {
+        return;
+    }
+    system_status_update(state);
+    weather_client_apply(state);
+    state->bridge_offline = bridge_offline;
+    if (bridge_offline && state->status == ORNAMENT_STATUS_ERROR && !state->has_task && !state->has_quota) {
+        state->status = ORNAMENT_STATUS_IDLE;
+    }
 }
 
 static void render_current_state(const ornament_state_t *state, TickType_t idle_since_tick, TickType_t now)
@@ -545,6 +562,7 @@ static void poll_task(void *arg)
                 }
                 previous_active_task_count = fetched_state.active_task_count;
                 have_seen_state = true;
+                fetched_state.bridge_offline = false;
                 web_console_set_bridge_debug(&debug);
                 publish_state(&fetched_state, err, last_done_tick, have_last_done_tick, true);
             } else {
@@ -570,6 +588,7 @@ static void poll_task(void *arg)
                 }
 
                 web_console_set_bridge_debug(&debug);
+                fetched_state.bridge_offline = bridge_is_offline(consecutive_fetch_failures, err);
                 if (have_seen_state &&
                     consecutive_fetch_failures < CONFIG_ORNAMENT_BRIDGE_OFFLINE_FAILURES &&
                     shared_state_has_displayable_snapshot()) {
@@ -579,7 +598,8 @@ static void poll_task(void *arg)
                 } else {
                     ornament_state_t error_state;
                     ornament_state_init(&error_state);
-                    error_state.status = ORNAMENT_STATUS_ERROR;
+                    error_state.status = ORNAMENT_STATUS_IDLE;
+                    error_state.bridge_offline = bridge_is_offline(consecutive_fetch_failures, err);
                     publish_state(&error_state, err, last_done_tick, have_last_done_tick, true);
                 }
             }
@@ -597,8 +617,6 @@ static void ui_render_task(void *arg)
     TickType_t last_done_tick = 0;
     bool have_last_done_tick = false;
     bool previous_standby_eligible = false;
-    bool last_render_was_error = false;
-    bool have_previous_state = false;
     esp_err_t fetch_error = ESP_OK;
 
     while (true) {
@@ -609,7 +627,7 @@ static void ui_render_task(void *arg)
         }
 
         update_local_animation(&state, now, last_done_tick, have_last_done_tick);
-        system_status_update(&state);
+        apply_local_state(&state, state.bridge_offline);
         web_console_set_last_state(&state, fetch_error);
         voice_control_state_t voice_state;
         bool have_voice_state = voice_control_snapshot(&voice_state);
@@ -624,19 +642,10 @@ static void ui_render_task(void *arg)
         }
         previous_standby_eligible = standby_eligible;
 
-        if (have_voice_state && render_voice_override(&state, fetch_error, &voice_state, now)) {
-            last_render_was_error = false;
-        } else if (fetch_error == ESP_OK) {
-            last_render_was_error = false;
-            render_current_state(&state, idle_since_tick, now);
-        } else if (!last_render_was_error) {
-            display_render_error("Bridge offline");
-            last_render_was_error = true;
-        } else if (have_previous_state && ui_needs_animation(&state)) {
+        if (!(have_voice_state && render_voice_override(&state, fetch_error, &voice_state, now))) {
             render_current_state(&state, idle_since_tick, now);
         }
 
-        have_previous_state = true;
         vTaskDelay(pdMS_TO_TICKS(CONFIG_ORNAMENT_UI_FRAME_MS));
     }
 }
@@ -681,6 +690,7 @@ void app_main(void)
         ESP_LOGW(TAG, "ASRPRO UART link unavailable: %s", esp_err_to_name(asrpro_err));
     }
     system_status_start_time_sync();
+    ESP_ERROR_CHECK(weather_client_start());
     ESP_ERROR_CHECK(web_console_start());
 
     shared_state_mutex = xSemaphoreCreateMutex();

@@ -9,6 +9,7 @@ idf_component_register(
     "settings.c"
     "system_status.c"
     "task_audio.c"
+    "weather_client.c"
     "web_console.c"
     "display.c"
     "display_core.c"
@@ -20,6 +21,7 @@ idf_component_register(
   REQUIRES
     driver
     esp_driver_i2s
+    esp-tls
     esp_http_client
     esp_http_server
     esp_lcd

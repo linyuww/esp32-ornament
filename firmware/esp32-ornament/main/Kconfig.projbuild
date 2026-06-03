@@ -92,6 +92,30 @@ config ORNAMENT_TIMEZONE
     help
         POSIX timezone string used by localtime_r(). CST-8 means UTC+8.
 
+config ORNAMENT_WEATHER_LABEL
+    string "Default weather label"
+    default "HAIDIAN"
+
+config ORNAMENT_WEATHER_LAT_E6
+    int "Default weather latitude scaled by 1e6"
+    default 39995401
+    range -90000000 90000000
+
+config ORNAMENT_WEATHER_LON_E6
+    int "Default weather longitude scaled by 1e6"
+    default 116341625
+    range -180000000 180000000
+
+config ORNAMENT_WEATHER_FETCH_INTERVAL_MS
+    int "Local weather refresh interval in milliseconds"
+    default 600000
+    range 60000 86400000
+
+config ORNAMENT_WEATHER_RETRY_INTERVAL_MS
+    int "Local weather retry interval in milliseconds"
+    default 60000
+    range 10000 3600000
+
 config ORNAMENT_QUOTA_CRITICAL_PERCENT
     int "Critical quota percent"
     default 10
