@@ -313,12 +313,12 @@ static bool should_announce_done_event(
     if (!is_new_done_event(state, have_seen_state, last_done_seq)) {
         return false;
     }
-    if (state->active_task_count < previous_active_task_count) {
+    if (previous_active_task_count > 0 && state->active_task_count == 0) {
         return true;
     }
     ESP_LOGW(
         TAG,
-        "suppress done alert: done_seq advanced but active task count stayed %d -> %d",
+        "suppress done alert: done_seq advanced but active task count is not idle %d -> %d",
         previous_active_task_count,
         state->active_task_count);
     return false;

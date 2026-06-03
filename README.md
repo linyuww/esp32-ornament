@@ -17,7 +17,7 @@ Codex 登录凭据只保存在 PC 上。ESP32 只读取局域网内的展示 JSO
 - ESP 支持 UDP 自动发现网桥，PC IP 变化后可自动保存新的 `/state` 地址。
 - ESP 支持 mDNS Web 控制台，例如 `http://codex-ornament-4ad4.local/`。
 - 空闲 1 分钟进入待机时钟页，显示壁纸、时间、日期、天气、Wi-Fi 信号和 reset 时间。
-- 任务完成时闪烁 done 5 秒；若仍有其他任务运行，闪烁结束后回到 running。
+- 所有任务完成时闪烁 done 5 秒；若仍有任务运行，保持 running 且不播放完成语音。
 - 连续桥接失败达到阈值后才显示 `Bridge offline`，短暂失败继续显示上一帧有效状态。
 - 任务完成语音音量可在 ESP Web 控制台调节。
 
@@ -156,8 +156,8 @@ $env:CODEX_ORNAMENT_CAIYUN_TOKEN = "replace-with-your-token"
 
 done 提醒规则：
 
-- `doneSeq` 增加且 active task 数量实际下降时，ESP 才播报任务完成。
-- 若 `doneSeq` 增加但 active task 数量没变，固件会抑制语音和 done 闪烁，避免误响。
+- `doneSeq` 增加且 active task 数量从非零降到 0 时，ESP 才播报任务完成。
+- 若 `doneSeq` 增加但仍有 active task，固件会抑制语音和 done 闪烁，避免任务还在运行时误响。
 - Codex 和 Claude 在 5 秒窗口内都完成时，Web 状态可合并显示为 `Claude + Codex done`。
 
 ## Hook 配置
@@ -322,7 +322,7 @@ ORNAMENT_AUDIO_VOLUME_PERCENT
 - 合并任务状态：idle、running、done、error。
 - active task 总数和 done seq。
 - 多任务运行时持续 running 跑马灯。
-- 任一任务完成时 done 闪烁 5 秒，之后如果仍有任务运行则继续 running。
+- 所有任务完成时 done 闪烁 5 秒；部分任务完成但仍有任务运行时继续 running。
 - 空闲 1 分钟后进入待机页。
 - 待机页显示壁纸、时间、日期、天气图标、温度、reset 时间和扇形 Wi-Fi 信号图标。
 - 桥接短暂失败时保留上一帧有效状态；冷启动且无有效快照时才显示错误页。
