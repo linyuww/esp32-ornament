@@ -1,92 +1,86 @@
-﻿# Codex 额度组件与 ESP32 桌面摆件
+# Codex Ornament
 
-这个项目包含两部分：
+这是一个本地 Codex/Claude 任务与 Codex 额度显示项目，包含三部分：
 
-1. Windows/Tauri 桌面额度组件：读取本机 Codex 登录凭据，显示 Codex 用量。
-2. ESP32-S3 桌面摆件集成：在 ST7789 屏幕上显示 Codex/Claude 任务、额度、天气和本地控制面板。
+1. Windows/Tauri 桌面额度组件。
+2. PC 端 `codex-ornament-bridge` 网桥服务。
+3. ESP32-S3 桌面摆件固件，驱动 240x240 ST7789 屏幕、Web 控制台和任务完成语音提醒。
 
-新增的桌面摆件方案分为 PC 端桥接服务和 ESP32 固件。Codex 凭据只保存在 PC 上，ESP32 只读取局域网内的展示用 JSON，不保存 token。
+Codex 登录凭据只保存在 PC 上。ESP32 只读取局域网内的展示 JSON，不保存 token。
 
-## 完成情况检查
+## 当前状态
 
-| 任务 | 状态 | 证据 |
-| --- | --- | --- |
-| 通过本地端口接收 Codex 任务完成 hook | 已完成 | `crates/codex-ornament-bridge`、`scripts/codex-ornament-hook.ps1` |
-| ESP32 程序框架与手动部署文档 | 已完成 | `firmware/esp32-ornament`、`docs/software-development-guide.md` |
+- PC 网桥接收 Codex/Claude hook，维护多生产者、多消费者场景下的任务状态。
+- Web 面板并列显示 Codex Task 和 Claude Task。
+- ESP 硬件屏幕保持合并任务视图，不区分 Codex/Claude。
+- 网桥每 1 分钟检查额度缓存，网络异常时保留旧数据，不用 `--` 覆盖有效数据。
+- ESP 支持 UDP 自动发现网桥，PC IP 变化后可自动保存新的 `/state` 地址。
+- ESP 支持 mDNS Web 控制台，例如 `http://codex-ornament-4ad4.local/`。
+- 空闲 1 分钟进入待机时钟页，显示壁纸、时间、日期、天气、Wi-Fi 信号和 reset 时间。
+- 任务完成时闪烁 done 5 秒；若仍有其他任务运行，闪烁结束后回到 running。
+- 连续桥接失败达到阈值后才显示 `Bridge offline`，短暂失败继续显示上一帧有效状态。
+- 任务完成语音音量可在 ESP Web 控制台调节。
 
 ## 架构
 
 ```mermaid
 flowchart LR
-  Codex["Codex CLI/App"] --> Hook["PowerShell hook 脚本"]
-  Hook -->|"POST /hook/codex"| Bridge["codex-ornament-bridge"]
-  Bridge -->|"quota-core"| Usage["ChatGPT usage endpoint"]
-  ESP32["ESP32-S3 固件"] -->|"GET /state"| Bridge
-  ESP32 --> Display["ST7789 屏幕"]
-  ESP32 --> Web["本地 Web 控制台"]
-  ESP32 --> Audio["任务完成语音提醒"]
+  Codex["Codex CLI/App"] --> CodexHook["codex-ornament-hook.ps1"]
+  Claude["Claude Code/Hook"] --> ClaudeHook["codex-ornament-hook.ps1<br/>source=claude"]
+  CodexHook -->|"POST /hook/codex"| Bridge["codex-ornament-bridge"]
+  ClaudeHook -->|"POST /event"| Bridge
+  Bridge -->|"quota-core"| Usage["ChatGPT usage API"]
+  Bridge -->|"Weather providers"| Weather["Caiyun / QWeather / Open-Meteo"]
+  ESP["ESP32-S3"] -->|"UDP discover"| Bridge
+  ESP -->|"GET /state"| Bridge
+  ESP --> Display["ST7789 hardware panel"]
+  ESP --> Web["ESP Web console"]
+  ESP --> Audio["I2S / ASRPRO done reminder"]
 ```
 
-## 目录结构
+## 目录
 
 ```text
 crates/quota-core
   共享的 Codex 额度读取逻辑。
 
 crates/codex-ornament-bridge
-  PC 本地 HTTP 桥接服务，负责接收 Codex hook、读取额度快照、向 ESP32 提供状态。
+  PC 本地 HTTP 网桥。接收 hook、聚合任务、读取额度和天气，向 ESP32 提供状态。
 
 scripts/codex-ornament-hook.ps1
-  Codex notify 和 lifecycle hooks 的 PowerShell 转发脚本。
+  Codex/Claude hook 转发脚本。
+
+scripts/start-codex-ornament-bridge.ps1
+  Windows 启动脚本。会加载 .env/.env.local，自动选择可用 LAN IP，并启动网桥。
 
 firmware/esp32-ornament
-  ESP32-S3 的 ESP-IDF 固件框架。
+  ESP32-S3 ESP-IDF 固件。
 
-docs/software-engineering
-  需求、架构、接口、测试、部署、风险和追踪矩阵等工程文档。
+src / src-tauri
+  原有 Tauri 桌面额度组件。
 
-docs/software-development-guide.md
-  软件开发指导书和代码审查命令。
+docs
+  工程文档、问题记录和部署说明。
 ```
 
-## 额度数据来源
+## PC 网桥
 
-额度读取复用现有的 `quota-core` 实现，请求地址为：
-
-```text
-https://chatgpt.com/backend-api/wham/usage
-```
-
-默认读取本机 Codex 登录凭据：
-
-```text
-%USERPROFILE%\.codex\auth.json
-```
-
-如果设置了 `CODEX_HOME`，则读取：
-
-```text
-%CODEX_HOME%\auth.json
-```
-
-PC 端会向 `chatgpt.com` 发送 `Authorization: Bearer <access_token>` 和 `ChatGPT-Account-Id`。这些凭据不会发送给 ESP32。
-
-## PC 桥接服务
-
-桥接服务提供以下接口：
-
-```text
-GET  /health       健康检查
-GET  /quota        当前 Codex 额度快照
-GET  /state        给 ESP32 使用的任务 + 额度状态
-POST /hook/codex   Codex hook 事件接收接口
-POST /event        /hook/codex 的别名
-```
-
-默认监听地址：
+默认监听：
 
 ```text
 http://0.0.0.0:8787
+```
+
+接口：
+
+```text
+GET  /health       健康检查，返回 ok
+GET  /discover     返回 LAN IP、/state 和 /health URL
+GET  /quota        当前额度快照
+GET  /state        ESP/Web 使用的任务、额度、天气状态
+POST /hook/codex   hook 事件入口
+POST /event        /hook/codex 的别名
+OPTIONS *          CORS/私有网络预检
 ```
 
 开发运行：
@@ -96,31 +90,79 @@ cd D:\Desktop\codex\codex-quota-widget
 cargo run -p codex-ornament-bridge
 ```
 
-手动构建 release：
+构建并后台启动：
 
 ```powershell
-cargo build -p codex-ornament-bridge --release
-.\target\release\codex-ornament-bridge.exe
+cd D:\Desktop\codex\codex-quota-widget
+cargo build -p codex-ornament-bridge
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\start-codex-ornament-bridge.ps1
 ```
 
-可选环境变量：
+启动脚本会：
+
+- 读取 `.env` 和 `.env.local`。
+- 默认设置北京海淀天气坐标。
+- 自动选择真实 LAN IP，过滤 loopback、link-local、`198.18.0.0/15`、Meta/Clash/VMware/WSL/蓝牙等接口。
+- 如果 `target\debug\codex-ornament-bridge.exe` 不存在，自动执行 `cargo build -p codex-ornament-bridge`。
+- 已有网桥进程时不重复启动。
+
+## 网桥配置
+
+常用环境变量：
 
 ```powershell
 $env:CODEX_ORNAMENT_BIND = "0.0.0.0:8787"
 $env:CODEX_ORNAMENT_ENDPOINT = "http://127.0.0.1:8787/hook/codex"
 $env:CODEX_ORNAMENT_TOKEN = "change-this-if-lan-post-is-needed"
+$env:CODEX_ORNAMENT_SOURCE = "codex"
+$env:CODEX_ORNAMENT_SESSION_ID = "<optional-session-id>"
+$env:CODEX_ORNAMENT_LAN_IP = "192.168.1.107"
 ```
+
+天气配置：
+
+```powershell
+$env:CODEX_ORNAMENT_WEATHER_PROVIDER = "auto"       # auto | openmeteo | qweather | caiyun
+$env:CODEX_ORNAMENT_WEATHER_LAT = "39.99540087499999"
+$env:CODEX_ORNAMENT_WEATHER_LON = "116.34162524999999"
+$env:CODEX_ORNAMENT_WEATHER_LABEL = "HAIDIAN"
+$env:CODEX_ORNAMENT_QWEATHER_HOST = "<qweather-api-host>"
+$env:CODEX_ORNAMENT_QWEATHER_TOKEN = "<token>"
+$env:CODEX_ORNAMENT_CAIYUN_TOKEN = "replace-with-your-token"
+```
+
+默认天气策略是 `auto`：优先尝试可用的 Caiyun/QWeather，再退回 Open-Meteo。请求失败时网桥保留旧天气数据，直到拿到新的有效数据。
 
 安全规则：
 
-- 来自本机 loopback 的 `POST` 请求可以不带 token。
-- 来自局域网的 `POST` 请求默认会被拒绝。
-- 如果确实需要允许局域网写入事件，设置 `CODEX_ORNAMENT_TOKEN`，并在请求头中带上 `X-Codex-Ornament-Token`。
-- ESP32 正常只需要访问 `GET /state`。
+- 来自本机 loopback 的 `POST` 可以不带 token。
+- 来自局域网的 `POST` 默认拒绝。
+- 如果需要允许局域网写入事件，设置 `CODEX_ORNAMENT_TOKEN`，请求头带 `X-Codex-Ornament-Token`。
+- ESP32 正常只需要 `GET /state`，不需要写入权限。
 
-## Codex Hook 配置
+## 任务状态模型
 
-把下面配置加入：
+网桥使用生产者/消费者模式处理 task event：
+
+- HTTP hook 请求作为生产者，把事件放入有界队列。
+- 单独消费者串行更新内存状态，避免多请求并发修改 active/done 状态。
+- 队列容量为 64，hook 请求会等待短时间确认；队列满时返回 503。
+- 任务身份优先使用 `source + turn_id`，其次使用 `source + session_id`，匿名任务使用递增 ID。
+- Codex 和 Claude 使用独立 source，互不闭合对方任务。
+- `source` 可用 `codex`、`claude` 或 `claudecode`。未提供时默认按 Codex 处理。
+- `sourceTasks.codex` 和 `sourceTasks.claude` 分别给 Web 面板显示。
+- 顶层 `activeTaskCount` 和 `status` 给 ESP 硬件屏幕使用，保持合并任务视图。
+- 对 Codex session 日志会做最近任务恢复，用于处理上下文压缩、进程重启或 hook stop 丢失导致的 orphaned active task。
+
+done 提醒规则：
+
+- `doneSeq` 增加且 active task 数量实际下降时，ESP 才播报任务完成。
+- 若 `doneSeq` 增加但 active task 数量没变，固件会抑制语音和 done 闪烁，避免误响。
+- Codex 和 Claude 在 5 秒窗口内都完成时，Web 状态可合并显示为 `Claude + Codex done`。
+
+## Hook 配置
+
+Codex notify 配置，写入：
 
 ```text
 %USERPROFILE%\.codex\config.toml
@@ -137,9 +179,7 @@ notify = [
 ]
 ```
 
-`notify` 会把单个 JSON 字符串作为命令行参数传给脚本，脚本会转发到本机 `POST /hook/codex`。
-
-可选 lifecycle hooks 文件：
+Codex lifecycle hooks，可选写入：
 
 ```text
 %USERPROFILE%\.codex\hooks.json
@@ -172,16 +212,44 @@ notify = [
 }
 ```
 
-生命周期 hook 会从 stdin 传入 JSON。配置后在 Codex 中运行 `/hooks`，信任这条 PowerShell 命令，否则 Codex 不会运行未信任的 hook。
+Claude 侧复用同一个脚本时，把环境变量设为：
 
-状态映射：
+```powershell
+$env:CODEX_ORNAMENT_SOURCE = "claude"
+$env:CODEX_ORNAMENT_ENDPOINT = "http://127.0.0.1:8787/event"
+```
 
-| Codex 事件 | 摆件状态 |
-| --- | --- |
-| `agent-turn-complete` | `done` |
-| `UserPromptSubmit` | `running` |
-| `Stop` | `done` |
-| 非法 JSON | HTTP 400，忽略，不改变面板状态 |
+hook 脚本会补齐 `session_id`、`cwd`、`source` 等上下文。非法 JSON 会被网桥作为 HTTP 400 拒绝，不进入任务状态机。
+
+## 额度数据
+
+额度读取复用 `quota-core`，请求：
+
+```text
+https://chatgpt.com/backend-api/wham/usage
+```
+
+凭据来源：
+
+```text
+%USERPROFILE%\.codex\auth.json
+```
+
+如果设置了 `CODEX_HOME`，则读取：
+
+```text
+%CODEX_HOME%\auth.json
+```
+
+网桥会向 ChatGPT usage API 发送 `Authorization: Bearer <access_token>` 和 `ChatGPT-Account-Id`。这些凭据不会发送给 ESP32。
+
+刷新策略：
+
+- 网桥启动后每 1 分钟检查一次额度。
+- 缓存未过期或已有刷新线程运行时，不重复请求。
+- `/state` 不阻塞等待慢请求。
+- reset 时间没过期时保留旧 reset 时间。
+- 网络错误或认证错误不会把已有有效数据改成 `--`。
 
 ## ESP32 固件
 
@@ -190,33 +258,45 @@ notify = [
 ```text
 主控：ESP32-S3-N16R8
 屏幕：1.54 寸 ST7789 SPI，240x240
+音频：MAX98357A I2S，或 ASRPRO UART 触发
 数据源：GET http://<PC-LAN-IP>:8787/state
 ```
 
-手动 ESP-IDF 部署：
+构建和烧录：
 
 ```cmd
 cd D:\Desktop\codex\codex-quota-widget\firmware\esp32-ornament
 call D:\Espressif\frameworks\esp-idf-v5.4.1\export.bat
+set IDF_CCACHE_ENABLE=0
 idf.py set-target esp32s3
 idf.py build
 idf.py -p COM5 flash
 ```
 
-`menuconfig` 配置入口：
+`menuconfig` 入口：
 
 ```text
 Codex Ornament
 ```
 
-需要配置：
+关键 Kconfig：
 
-- Wi-Fi SSID。
-- Wi-Fi 密码。
-- PC bridge 的 `/state` URL，或启用自动匹配。
-- ST7789 SPI 屏幕引脚。
+```text
+ORNAMENT_WIFI_SSID
+ORNAMENT_WIFI_PASSWORD
+ORNAMENT_BRIDGE_URL
+ORNAMENT_BRIDGE_AUTO_MATCH_ON_BOOT
+ORNAMENT_BRIDGE_AUTO_MATCH_RETRY_MS
+ORNAMENT_BRIDGE_OFFLINE_FAILURES
+ORNAMENT_HOSTNAME_PREFIX
+ORNAMENT_MDNS_ENABLED
+ORNAMENT_POLL_INTERVAL_MS
+ORNAMENT_DONE_FLASH_MS
+ORNAMENT_STANDBY_CLOCK_MS
+ORNAMENT_AUDIO_VOLUME_PERCENT
+```
 
-默认屏幕接线建议：
+默认屏幕接线：
 
 | 屏幕信号 | ESP32-S3 |
 | --- | --- |
@@ -231,35 +311,80 @@ Codex Ornament
 
 注意：不要直接用 GPIO 给背光供电，除非确认转接板有限流且电流安全。
 
-## 屏幕 UI
+## ESP 屏幕
 
 屏幕渲染使用 RGB565 画布和 `esp_lcd_panel_draw_bitmap()`，不引入 LVGL。
 
-当前页面包含：
+硬件屏幕当前显示：
 
 - `CURRENT` 当前额度和 `WEEKLY` 周额度。
 - current/weekly reset time。
-- 合并后的任务状态：idle、running、done、error。
-- 多任务时保持 running；其中一个任务完成后 done 闪烁 5 秒，再回到 running。
-- 空闲 1 分钟后进入待机时钟页，显示壁纸、时间、日期、天气和 Wi-Fi 图标。
-- 连续 3 次桥接请求失败后才显示 `Bridge offline`，短暂网络抖动继续显示上一帧状态。
+- 合并任务状态：idle、running、done、error。
+- active task 总数和 done seq。
+- 多任务运行时持续 running 跑马灯。
+- 任一任务完成时 done 闪烁 5 秒，之后如果仍有任务运行则继续 running。
+- 空闲 1 分钟后进入待机页。
+- 待机页显示壁纸、时间、日期、天气图标、温度、reset 时间和扇形 Wi-Fi 信号图标。
+- 桥接短暂失败时保留上一帧有效状态；冷启动且无有效快照时才显示错误页。
 
-实现文件：
+相关实现：
 
 ```text
+firmware/esp32-ornament/main/app_main.c
 firmware/esp32-ornament/main/display.c
 firmware/esp32-ornament/main/display_core.c
-firmware/esp32-ornament/main/app_main.c
+firmware/esp32-ornament/main/ornament_state.c
+firmware/esp32-ornament/main/standby_wallpaper.h
+```
+
+## ESP Web 控制台
+
+连接 Wi-Fi 后，控制台地址形如：
+
+```text
+http://codex-ornament-4ad4.local/
+http://<device-ip>/
+```
+
+页面包含：
+
+- Local URL 和当前 Bridge URL。
+- Wi-Fi、时间、天气、额度概览。
+- Codex Task 和 Claude Task 并列状态。
+- Codex/Claude session_id、turn_id 明细。
+- IP、Gateway、Channel、BSSID、断连原因。
+- Bridge Debug：last fetch、连续失败数、last success/failure、auto-match 结果。
+- Voice Volume 滑块和 Test Voice。
+- Test Bridge URL、Save Bridge URL、Auto Match This PC Bridge。
+- JSON Status、Reboot、Clear Wi-Fi and Bridge Config。
+
+JSON 状态接口：
+
+```text
+GET /status
+```
+
+关键字段包括：
+
+```json
+{
+  "fetch_error": "ESP_OK",
+  "bridge_debug": {
+    "last_fetch_error": "ESP_OK",
+    "consecutive_fetch_failures": 0,
+    "last_auto_match_ok": false
+  }
+}
 ```
 
 ## 手机热点配网
 
-固件支持用手机手动配网，不需要先把 Wi-Fi 写死在固件里。
+固件支持手机手动配网，不需要先把 Wi-Fi 写死在固件里。
 
 启动逻辑：
 
 1. ESP32 从 NVS 读取已保存的 Wi-Fi 和 bridge URL。
-2. 如果没有保存 Wi-Fi，自动启动配网热点。
+2. 如果没有保存 Wi-Fi，启动配网热点。
 3. 如果保存的 Wi-Fi 连接失败，也会启动配网热点。
 4. 手机提交配置后，ESP32 保存到 NVS 并自动重启。
 
@@ -273,18 +398,18 @@ SSID：Codex-Ornament-xxxx
 
 手机操作：
 
-1. 给 ESP32 摆件上电。
+1. 给 ESP32 上电。
 2. 如果屏幕或串口提示进入 setup/provisioning 模式，用手机连接 `Codex-Ornament-xxxx`。
 3. 浏览器打开 `http://192.168.4.1`。
-4. 在页面里选择扫描到的家庭/办公室 Wi-Fi SSID。
-5. 只填写 Wi-Fi 密码和 PC bridge 的 `/state` 地址。
-6. 如果列表没有目标 Wi-Fi，点击 `Rescan Wi-Fi` 重新扫描；只有扫描失败时才会显示手动 SSID 输入框。
-7. 点击保存，ESP32 会重启并连接到正常 Wi-Fi。
+4. 选择扫描到的 Wi-Fi SSID。
+5. 填 Wi-Fi 密码和 PC bridge 的 `/state` 地址。
+6. 如果列表没有目标 Wi-Fi，点击 `Rescan Wi-Fi`。
+7. 点击保存，ESP32 重启并连接正常 Wi-Fi。
 
 Bridge URL 示例：
 
 ```text
-http://192.168.1.23:8787/state
+http://192.168.1.107:8787/state
 ```
 
 配网相关源码：
@@ -295,34 +420,88 @@ firmware/esp32-ornament/main/settings.c
 firmware/esp32-ornament/main/wifi.c
 ```
 
-这部分参考 ESP-IDF 官方 SoftAP、HTTP server 和 Wi-Fi station 示例实现。
-配网页面使用 APSTA 模式，手机保持连接 ESP32 热点的同时，ESP32 会扫描附近路由器并生成 SSID 下拉列表。
+## 自动发现和 mDNS
+
+PC 网桥监听 UDP `8787`。ESP 发送：
+
+```text
+codex-ornament-discover-v1
+```
+
+网桥返回：
+
+```json
+{
+  "service": "codex-ornament-bridge",
+  "localIp": "192.168.1.107",
+  "stateUrl": "http://192.168.1.107:8787/state",
+  "healthUrl": "http://192.168.1.107:8787/health"
+}
+```
+
+ESP 校验 `/state` 成功后会保存 URL。轮询失败时，固件按 `ORNAMENT_BRIDGE_AUTO_MATCH_RETRY_MS` 周期重试发现。
+
+如果开启 Clash Verge Rev / Mihomo TUN 后 `.local` 访问异常，优先检查：
+
+- mDNS 是否能解析到当前设备 IP。
+- 当前设备 IP 是否变了。
+- TUN 是否拦截了局域网 HTTP。
+
+规则层的 `DOMAIN-SUFFIX,local,DIRECT` 不一定能解决 TUN 路由截获。更稳妥的是在 TUN 路由层排除局域网网段，或在路由器给 ESP MAC 做 DHCP 静态绑定。
 
 ## 手动烟测
 
-先启动 bridge，然后执行：
+启动 PC 网桥：
+
+```powershell
+cd D:\Desktop\codex\codex-quota-widget
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\start-codex-ornament-bridge.ps1
+```
+
+检查网桥：
 
 ```powershell
 Invoke-RestMethod http://127.0.0.1:8787/health
+Invoke-RestMethod http://127.0.0.1:8787/discover
+Invoke-RestMethod http://127.0.0.1:8787/state
+```
+
+模拟任务：
+
+```powershell
+Invoke-RestMethod `
+  -Method Post `
+  -Uri http://127.0.0.1:8787/hook/codex `
+  -ContentType application/json `
+  -Body '{"hook_event_name":"UserPromptSubmit","session_id":"manual","turn_id":"manual-1","prompt":"manual smoke"}'
 
 Invoke-RestMethod `
   -Method Post `
   -Uri http://127.0.0.1:8787/hook/codex `
   -ContentType application/json `
-  -Body '{"hook_event_name":"Stop","message":"manual smoke test"}'
-
-Invoke-RestMethod http://127.0.0.1:8787/state
+  -Body '{"hook_event_name":"Stop","session_id":"manual","turn_id":"manual-1","message":"manual done"}'
 ```
 
-预期结果：
+检查 ESP：
 
-- `/health` 返回 `ok`。
-- `/hook/codex` 返回 `{"ok":true,...}`。
-- `/state` 中包含 `status: "done"` 和额度快照。
+```powershell
+curl.exe --max-time 5 http://codex-ornament-4ad4.local/status
+curl.exe --max-time 5 http://<device-ip>/status
+```
 
-## 代码审查命令
+最近一次硬件验证：
 
-只使用本地已有工具，不自动安装环境。
+```text
+2026-06-03
+idf.py -p COM5 flash 成功。
+ESP32-S3 MAC：e0:72:a1:d3:4a:d4。
+mDNS 状态页可访问。
+/status 显示 Wi-Fi connected、fetch_error=ESP_OK、bridge_debug.consecutive_fetch_failures=0。
+```
+
+## 本地检查命令
+
+Rust：
 
 ```powershell
 cargo fmt --check -p codex-ornament-bridge -p quota-core
@@ -333,17 +512,24 @@ cargo clippy -p codex-ornament-bridge -- -D warnings
 cargo clippy -p quota-core -- -D warnings
 ```
 
-最近一次本地审查结果：
+ESP-IDF：
 
-```text
-以上命令全部通过。
-codex-ornament-bridge：7 个测试通过。
-quota-core：7 个测试通过。
+```cmd
+cd D:\Desktop\codex\codex-quota-widget\firmware\esp32-ornament
+call D:\Espressif\frameworks\esp-idf-v5.4.1\export.bat
+set IDF_CCACHE_ENABLE=0
+idf.py build
 ```
 
-ESP-IDF 构建未执行，因为当前 shell 找不到 `idf.py`，并且本项目按要求把工具链安装留给手动部署。
+前端/Tauri：
 
-## 原有 Tauri 桌面组件
+```powershell
+npm install
+npm run build
+npm run tauri:dev
+```
+
+## Tauri 桌面组件
 
 原有桌面额度组件仍可使用。
 
@@ -360,7 +546,7 @@ npm run tauri:dev
 npm run tauri:build
 ```
 
-安装包输出位置：
+安装包输出：
 
 ```text
 src-tauri\target\release\bundle\nsis\
@@ -378,6 +564,7 @@ src-tauri\target\release\bundle\nsis\
 - `docs/software-engineering/06-test-plan.md`
 - `docs/software-engineering/07-deployment.md`
 - `docs/software-engineering/11-hardware-software-interface.md`
+- `docs/bug-fix-summary.md`
 
 ## 硬件注意事项
 
@@ -385,7 +572,7 @@ src-tauri\target\release\bundle\nsis\
 
 - 屏幕控制器为 ST7789，分辨率为 240x240。
 - 屏幕接口为 SPI，不是 QSPI。
-- 模块引脚与 README 中的 SCL/SDA/CS/DC/RST/BLK 映射一致。
+- 模块引脚与 README/Kconfig 中的 SCL/SDA/CS/DC/RST/BLK 映射一致。
 - 逻辑电压为 3.3 V。
 - 背光引脚是否只是逻辑控制，还是需要独立限流/驱动。
 
