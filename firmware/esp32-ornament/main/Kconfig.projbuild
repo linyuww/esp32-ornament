@@ -96,6 +96,12 @@ config ORNAMENT_WEATHER_LABEL
     string "Default weather label"
     default "HAIDIAN"
 
+config ORNAMENT_WEATHER_SOURCE
+    string "Default local weather provider"
+    default "caiyun"
+    help
+        Local weather provider. Supported values are caiyun and open-meteo.
+
 config ORNAMENT_WEATHER_LAT_E6
     int "Default weather latitude scaled by 1e6"
     default 39995401

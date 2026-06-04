@@ -226,6 +226,7 @@ static esp_err_t parse_state_json(const char *json_text, ornament_state_t *state
         state->has_weather = true;
         copy_json_string(weather, "status", state->weather_status, sizeof(state->weather_status));
         copy_json_string(weather, "label", state->weather_label, sizeof(state->weather_label));
+        strlcpy(state->weather_source, "bridge", sizeof(state->weather_source));
         copy_json_string(weather, "summary", state->weather_summary, sizeof(state->weather_summary));
         copy_json_string(weather, "icon", state->weather_icon, sizeof(state->weather_icon));
         copy_json_string(weather, "observedAt", state->weather_observed_at, sizeof(state->weather_observed_at));

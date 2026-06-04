@@ -10,6 +10,7 @@ static const char *KEY_PASSWORD = "password";
 static const char *KEY_BRIDGE_URL = "bridge_url";
 static const char *KEY_AUDIO_VOLUME = "audio_volume";
 static const char *KEY_WEATHER_LABEL = "weather_label";
+static const char *KEY_WEATHER_SOURCE = "weather_source";
 static const char *KEY_WEATHER_LAT_E6 = "weather_lat_e6";
 static const char *KEY_WEATHER_LON_E6 = "weather_lon_e6";
 static const char *KEY_CAIYUN_TOKEN = "caiyun_token";
@@ -21,6 +22,7 @@ static void load_default_settings(ornament_settings_t *settings)
     strlcpy(settings->password, CONFIG_ORNAMENT_WIFI_PASSWORD, sizeof(settings->password));
     strlcpy(settings->bridge_url, CONFIG_ORNAMENT_BRIDGE_URL, sizeof(settings->bridge_url));
     strlcpy(settings->weather_label, CONFIG_ORNAMENT_WEATHER_LABEL, sizeof(settings->weather_label));
+    strlcpy(settings->weather_source, CONFIG_ORNAMENT_WEATHER_SOURCE, sizeof(settings->weather_source));
     settings->weather_lat_e6 = CONFIG_ORNAMENT_WEATHER_LAT_E6;
     settings->weather_lon_e6 = CONFIG_ORNAMENT_WEATHER_LON_E6;
     settings->audio_volume_percent = CONFIG_ORNAMENT_AUDIO_VOLUME_PERCENT;
@@ -55,6 +57,7 @@ esp_err_t settings_load(ornament_settings_t *settings)
     char password[sizeof(settings->password)] = {0};
     char bridge_url[sizeof(settings->bridge_url)] = {0};
     char weather_label[sizeof(settings->weather_label)] = {0};
+    char weather_source[sizeof(settings->weather_source)] = {0};
     char caiyun_token[sizeof(settings->caiyun_token)] = {0};
     int32_t audio_volume_percent = settings->audio_volume_percent;
     int32_t weather_lat_e6 = settings->weather_lat_e6;
@@ -63,6 +66,7 @@ esp_err_t settings_load(ornament_settings_t *settings)
     read_nvs_string(handle, KEY_PASSWORD, password, sizeof(password));
     read_nvs_string(handle, KEY_BRIDGE_URL, bridge_url, sizeof(bridge_url));
     read_nvs_string(handle, KEY_WEATHER_LABEL, weather_label, sizeof(weather_label));
+    read_nvs_string(handle, KEY_WEATHER_SOURCE, weather_source, sizeof(weather_source));
     read_nvs_string(handle, KEY_CAIYUN_TOKEN, caiyun_token, sizeof(caiyun_token));
     (void)nvs_get_i32(handle, KEY_AUDIO_VOLUME, &audio_volume_percent);
     (void)nvs_get_i32(handle, KEY_WEATHER_LAT_E6, &weather_lat_e6);
@@ -83,6 +87,9 @@ esp_err_t settings_load(ornament_settings_t *settings)
     }
     if (weather_label[0] != '\0') {
         strlcpy(settings->weather_label, weather_label, sizeof(settings->weather_label));
+    }
+    if (weather_source[0] != '\0') {
+        strlcpy(settings->weather_source, weather_source, sizeof(settings->weather_source));
     }
     if (weather_lat_e6 >= -90000000 && weather_lat_e6 <= 90000000) {
         settings->weather_lat_e6 = (int)weather_lat_e6;
@@ -118,6 +125,9 @@ esp_err_t settings_save(const ornament_settings_t *settings)
     }
     if (err == ESP_OK) {
         err = nvs_set_str(handle, KEY_WEATHER_LABEL, settings_weather_label_or_default(settings));
+    }
+    if (err == ESP_OK) {
+        err = nvs_set_str(handle, KEY_WEATHER_SOURCE, settings_weather_source_or_default(settings));
     }
     if (err == ESP_OK) {
         err = nvs_set_i32(handle, KEY_WEATHER_LAT_E6, settings->weather_lat_e6);
@@ -180,4 +190,14 @@ const char *settings_weather_label_or_default(const ornament_settings_t *setting
         return settings->weather_label;
     }
     return CONFIG_ORNAMENT_WEATHER_LABEL;
+}
+
+const char *settings_weather_source_or_default(const ornament_settings_t *settings)
+{
+    const char *source = settings != NULL && settings->weather_source[0] != '\0' ?
+        settings->weather_source : CONFIG_ORNAMENT_WEATHER_SOURCE;
+    if (strcmp(source, ORNAMENT_WEATHER_SOURCE_OPEN_METEO) == 0) {
+        return ORNAMENT_WEATHER_SOURCE_OPEN_METEO;
+    }
+    return ORNAMENT_WEATHER_SOURCE_CAIYUN;
 }

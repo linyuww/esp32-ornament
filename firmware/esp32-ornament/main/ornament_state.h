@@ -34,6 +34,7 @@ typedef struct {
     char quota_status[32];
     char weather_status[24];
     char weather_label[24];
+    char weather_source[16];
     char weather_summary[32];
     char weather_icon[16];
     char weather_observed_at[ORNAMENT_TIME_MAX];

@@ -20,6 +20,7 @@
 static const char *TAG = "weather_client";
 static const int WEATHER_RESPONSE_MAX = 4096;
 static const int WEATHER_FETCH_TIMEOUT_MS = 5000;
+static const time_t MIN_VALID_EPOCH = 1577836800;
 
 typedef struct {
     char *data;
@@ -35,6 +36,7 @@ typedef struct {
     int64_t last_success_ms;
     int64_t last_attempt_ms;
     bool have_weather;
+    bool local_enabled;
     bool token_configured;
 } weather_client_state_t;
 
@@ -72,8 +74,28 @@ static void format_observed_at(char *out, size_t out_size)
         return;
     }
     time_t now = time(NULL);
+    if (now < MIN_VALID_EPOCH) {
+        out[0] = '\0';
+        return;
+    }
     struct tm local = {0};
-    if (now <= 0 || localtime_r(&now, &local) == NULL ||
+    if (localtime_r(&now, &local) == NULL ||
+        strftime(out, out_size, "%Y-%m-%dT%H:%M:%S%z", &local) == 0) {
+        out[0] = '\0';
+    }
+}
+
+static void format_epoch_observed_at(time_t epoch, char *out, size_t out_size)
+{
+    if (out_size == 0) {
+        return;
+    }
+    if (epoch < MIN_VALID_EPOCH) {
+        out[0] = '\0';
+        return;
+    }
+    struct tm local = {0};
+    if (localtime_r(&epoch, &local) == NULL ||
         strftime(out, out_size, "%Y-%m-%dT%H:%M:%S%z", &local) == 0) {
         out[0] = '\0';
     }
@@ -159,6 +181,96 @@ static const char *caiyun_icon_for_skycon(const char *skycon)
     return "unknown";
 }
 
+static const char *open_meteo_summary_for_code(int code)
+{
+    switch (code) {
+    case 0:
+        return "CLEAR";
+    case 1:
+    case 2:
+        return "PARTLY CLOUDY";
+    case 3:
+        return "CLOUDY";
+    case 45:
+    case 48:
+        return "FOG";
+    case 51:
+    case 53:
+    case 55:
+    case 56:
+    case 57:
+        return "DRIZZLE";
+    case 61:
+    case 63:
+    case 80:
+    case 81:
+        return "RAIN";
+    case 65:
+    case 66:
+    case 67:
+    case 82:
+        return "HEAVY RAIN";
+    case 71:
+    case 73:
+    case 75:
+    case 77:
+    case 85:
+    case 86:
+        return "SNOW";
+    case 95:
+    case 96:
+    case 99:
+        return "STORM";
+    default:
+        return "WEATHER";
+    }
+}
+
+static const char *open_meteo_icon_for_code(int code)
+{
+    switch (code) {
+    case 0:
+        return "sun";
+    case 1:
+    case 2:
+        return "partly-cloudy";
+    case 3:
+        return "cloud";
+    case 45:
+    case 48:
+        return "fog";
+    case 51:
+    case 53:
+    case 55:
+    case 56:
+    case 57:
+        return "drizzle";
+    case 61:
+    case 63:
+    case 80:
+    case 81:
+        return "rain";
+    case 65:
+    case 66:
+    case 67:
+    case 82:
+        return "heavy-rain";
+    case 71:
+    case 73:
+    case 75:
+    case 77:
+    case 85:
+    case 86:
+        return "snow";
+    case 95:
+    case 96:
+    case 99:
+        return "storm";
+    default:
+        return "unknown";
+    }
+}
+
 static esp_err_t fetch_url_raw(const char *url, char *response, int response_capacity, int *status_code)
 {
     response_buffer_t buffer = {
@@ -187,6 +299,17 @@ static esp_err_t fetch_url_raw(const char *url, char *response, int response_cap
     return err;
 }
 
+static void init_weather_state(const ornament_settings_t *settings, ornament_state_t *state, const char *source)
+{
+    ornament_state_init(state);
+    state->has_weather = true;
+    strlcpy(state->weather_status, "ok", sizeof(state->weather_status));
+    strlcpy(state->weather_label, settings_weather_label_or_default(settings), sizeof(state->weather_label));
+    strlcpy(state->weather_source, source, sizeof(state->weather_source));
+    state->weather_code = -1;
+    format_observed_at(state->weather_observed_at, sizeof(state->weather_observed_at));
+}
+
 static esp_err_t parse_caiyun_json(const char *json_text, const ornament_settings_t *settings, ornament_state_t *state)
 {
     cJSON *root = cJSON_Parse(json_text);
@@ -208,11 +331,11 @@ static esp_err_t parse_caiyun_json(const char *json_text, const ornament_setting
         return ESP_ERR_INVALID_RESPONSE;
     }
 
-    ornament_state_init(state);
-    state->has_weather = true;
-    strlcpy(state->weather_status, "ok", sizeof(state->weather_status));
-    strlcpy(state->weather_label, settings_weather_label_or_default(settings), sizeof(state->weather_label));
-    state->weather_code = -1;
+    init_weather_state(settings, state, ORNAMENT_WEATHER_SOURCE_CAIYUN);
+    cJSON *server_time = cJSON_GetObjectItemCaseSensitive(root, "server_time");
+    if (cJSON_IsNumber(server_time)) {
+        format_epoch_observed_at((time_t)server_time->valuedouble, state->weather_observed_at, sizeof(state->weather_observed_at));
+    }
 
     cJSON *temperature = cJSON_GetObjectItemCaseSensitive(realtime, "temperature");
     if (cJSON_IsNumber(temperature)) {
@@ -223,7 +346,6 @@ static esp_err_t parse_caiyun_json(const char *json_text, const ornament_setting
     copy_json_string(realtime, "skycon", skycon, sizeof(skycon));
     strlcpy(state->weather_summary, caiyun_summary_for_skycon(skycon), sizeof(state->weather_summary));
     strlcpy(state->weather_icon, caiyun_icon_for_skycon(skycon), sizeof(state->weather_icon));
-    format_observed_at(state->weather_observed_at, sizeof(state->weather_observed_at));
 
     cJSON *wind = cJSON_GetObjectItemCaseSensitive(realtime, "wind");
     cJSON *speed = cJSON_IsObject(wind) ? cJSON_GetObjectItemCaseSensitive(wind, "speed") : NULL;
@@ -235,7 +357,43 @@ static esp_err_t parse_caiyun_json(const char *json_text, const ornament_setting
     return ESP_OK;
 }
 
-static esp_err_t fetch_weather(const ornament_settings_t *settings, ornament_state_t *state)
+static esp_err_t parse_open_meteo_json(const char *json_text, const ornament_settings_t *settings, ornament_state_t *state)
+{
+    cJSON *root = cJSON_Parse(json_text);
+    if (root == NULL) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    cJSON *current = cJSON_GetObjectItemCaseSensitive(root, "current");
+    if (!cJSON_IsObject(current)) {
+        cJSON_Delete(root);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    cJSON *temperature = cJSON_GetObjectItemCaseSensitive(current, "temperature_2m");
+    cJSON *weather_code = cJSON_GetObjectItemCaseSensitive(current, "weather_code");
+    cJSON *wind_speed = cJSON_GetObjectItemCaseSensitive(current, "wind_speed_10m");
+    if (!cJSON_IsNumber(temperature) || !cJSON_IsNumber(weather_code)) {
+        cJSON_Delete(root);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    init_weather_state(settings, state, ORNAMENT_WEATHER_SOURCE_OPEN_METEO);
+    copy_json_string(current, "time", state->weather_observed_at, sizeof(state->weather_observed_at));
+    int code = round_double_to_int(weather_code->valuedouble);
+    state->weather_temperature_c = round_double_to_int(temperature->valuedouble);
+    state->weather_code = code;
+    strlcpy(state->weather_summary, open_meteo_summary_for_code(code), sizeof(state->weather_summary));
+    strlcpy(state->weather_icon, open_meteo_icon_for_code(code), sizeof(state->weather_icon));
+    if (cJSON_IsNumber(wind_speed)) {
+        state->weather_wind_kmh = round_double_to_int(wind_speed->valuedouble);
+    }
+
+    cJSON_Delete(root);
+    return ESP_OK;
+}
+
+static esp_err_t fetch_caiyun_weather(const ornament_settings_t *settings, ornament_state_t *state)
 {
     if (settings == NULL || state == NULL || !settings->has_caiyun_token || settings->caiyun_token[0] == '\0') {
         return ESP_ERR_INVALID_STATE;
@@ -267,6 +425,57 @@ static esp_err_t fetch_weather(const ornament_settings_t *settings, ornament_sta
 
     free(response);
     return err;
+}
+
+static esp_err_t fetch_open_meteo_weather(const ornament_settings_t *settings, ornament_state_t *state)
+{
+    if (settings == NULL || state == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    double lon = (double)settings->weather_lon_e6 / 1000000.0;
+    double lat = (double)settings->weather_lat_e6 / 1000000.0;
+    char url[256];
+    snprintf(
+        url,
+        sizeof(url),
+        "https://api.open-meteo.com/v1/forecast?latitude=%.6f&longitude=%.6f&current=temperature_2m,weather_code,wind_speed_10m&wind_speed_unit=kmh&timezone=auto&forecast_days=1",
+        lat,
+        lon);
+
+    char *response = calloc(WEATHER_RESPONSE_MAX, 1);
+    if (response == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    int status_code = 0;
+    esp_err_t err = fetch_url_raw(url, response, WEATHER_RESPONSE_MAX, &status_code);
+    if (err == ESP_OK && status_code == 200) {
+        err = parse_open_meteo_json(response, settings, state);
+    } else if (err == ESP_OK) {
+        err = ESP_ERR_HTTP_BASE + status_code;
+    }
+
+    free(response);
+    return err;
+}
+
+static esp_err_t fetch_weather(const ornament_settings_t *settings, ornament_state_t *state)
+{
+    const char *source = settings_weather_source_or_default(settings);
+    if (strcmp(source, ORNAMENT_WEATHER_SOURCE_OPEN_METEO) == 0) {
+        return fetch_open_meteo_weather(settings, state);
+    }
+    return fetch_caiyun_weather(settings, state);
+}
+
+static bool local_weather_enabled(const ornament_settings_t *settings)
+{
+    const char *source = settings_weather_source_or_default(settings);
+    if (strcmp(source, ORNAMENT_WEATHER_SOURCE_OPEN_METEO) == 0) {
+        return true;
+    }
+    return settings != NULL && settings->has_caiyun_token;
 }
 
 static void publish_weather(const ornament_state_t *weather, esp_err_t err)
@@ -308,10 +517,11 @@ static void weather_task(void *arg)
 
         if (client_state.mutex != NULL && xSemaphoreTake(client_state.mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
             client_state.token_configured = settings.has_caiyun_token;
+            client_state.local_enabled = local_weather_enabled(&settings);
             xSemaphoreGive(client_state.mutex);
         }
 
-        if (!settings.has_caiyun_token) {
+        if (!local_weather_enabled(&settings)) {
             publish_weather(NULL, ESP_ERR_INVALID_STATE);
             wait_for_next_attempt(CONFIG_ORNAMENT_WEATHER_RETRY_INTERVAL_MS);
             continue;
@@ -322,7 +532,8 @@ static void weather_task(void *arg)
         if (err == ESP_OK) {
             ESP_LOGI(
                 TAG,
-                "Caiyun weather updated label=%s temp=%d icon=%s wind=%d",
+                "weather updated source=%s label=%s temp=%d icon=%s wind=%d",
+                weather.weather_source,
                 weather.weather_label,
                 weather.weather_temperature_c,
                 weather.weather_icon,
@@ -330,7 +541,7 @@ static void weather_task(void *arg)
             publish_weather(&weather, ESP_OK);
             wait_for_next_attempt(CONFIG_ORNAMENT_WEATHER_FETCH_INTERVAL_MS);
         } else {
-            ESP_LOGW(TAG, "Caiyun weather fetch failed: %s", esp_err_to_name(err));
+            ESP_LOGW(TAG, "weather fetch failed: %s", esp_err_to_name(err));
             publish_weather(NULL, err);
             wait_for_next_attempt(CONFIG_ORNAMENT_WEATHER_RETRY_INTERVAL_MS);
         }
@@ -363,10 +574,11 @@ void weather_client_apply(ornament_state_t *state)
     if (xSemaphoreTake(client_state.mutex, pdMS_TO_TICKS(20)) != pdTRUE) {
         return;
     }
-    if (client_state.token_configured && client_state.have_weather) {
+    if (client_state.local_enabled && client_state.have_weather) {
         state->has_weather = true;
         strlcpy(state->weather_status, client_state.weather.weather_status, sizeof(state->weather_status));
         strlcpy(state->weather_label, client_state.weather.weather_label, sizeof(state->weather_label));
+        strlcpy(state->weather_source, client_state.weather.weather_source, sizeof(state->weather_source));
         strlcpy(state->weather_summary, client_state.weather.weather_summary, sizeof(state->weather_summary));
         strlcpy(state->weather_icon, client_state.weather.weather_icon, sizeof(state->weather_icon));
         strlcpy(state->weather_observed_at, client_state.weather.weather_observed_at, sizeof(state->weather_observed_at));
@@ -390,10 +602,9 @@ bool weather_client_token_configured(void)
     return configured;
 }
 
-void weather_client_settings_changed(bool token_configured)
+void weather_client_settings_changed(void)
 {
     if (client_state.mutex != NULL && xSemaphoreTake(client_state.mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        client_state.token_configured = token_configured;
         client_state.have_weather = false;
         xSemaphoreGive(client_state.mutex);
     }

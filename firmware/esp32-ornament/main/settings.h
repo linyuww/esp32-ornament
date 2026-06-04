@@ -8,13 +8,17 @@
 #define ORNAMENT_WIFI_PASSWORD_MAX 64
 #define ORNAMENT_BRIDGE_URL_MAX 160
 #define ORNAMENT_WEATHER_LABEL_MAX 24
+#define ORNAMENT_WEATHER_SOURCE_MAX 16
 #define ORNAMENT_WEATHER_TOKEN_MAX 96
+#define ORNAMENT_WEATHER_SOURCE_CAIYUN "caiyun"
+#define ORNAMENT_WEATHER_SOURCE_OPEN_METEO "open-meteo"
 
 typedef struct {
     char ssid[ORNAMENT_WIFI_SSID_MAX + 1];
     char password[ORNAMENT_WIFI_PASSWORD_MAX + 1];
     char bridge_url[ORNAMENT_BRIDGE_URL_MAX];
     char weather_label[ORNAMENT_WEATHER_LABEL_MAX + 1];
+    char weather_source[ORNAMENT_WEATHER_SOURCE_MAX + 1];
     char caiyun_token[ORNAMENT_WEATHER_TOKEN_MAX + 1];
     int weather_lat_e6;
     int weather_lon_e6;
@@ -30,3 +34,4 @@ esp_err_t settings_clear(void);
 const char *settings_bridge_url_or_default(const ornament_settings_t *settings);
 int settings_audio_volume_percent_or_default(const ornament_settings_t *settings);
 const char *settings_weather_label_or_default(const ornament_settings_t *settings);
+const char *settings_weather_source_or_default(const ornament_settings_t *settings);
