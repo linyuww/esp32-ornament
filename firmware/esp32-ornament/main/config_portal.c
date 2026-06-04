@@ -199,6 +199,8 @@ static char *render_config_form(void)
         &used,
         "<label>Wi-Fi Password</label><input name=\"password\" maxlength=\"64\" type=\"password\">"
         "<label>Bridge State URL</label><input name=\"bridge_url\" maxlength=\"159\" value=\"\" placeholder=\"Auto match after Wi-Fi connects\">"
+        "<label>Xiaozhi WebSocket URL</label><input name=\"xiaozhi_ws_url\" maxlength=\"191\" value=\"\" placeholder=\"Optional ws:// or wss:// endpoint\">"
+        "<label>Xiaozhi Token</label><input name=\"xiaozhi_token\" maxlength=\"159\" type=\"password\" value=\"\" placeholder=\"Optional bearer token\">"
         "<button type=\"submit\">Save and restart</button>"
         "<button type=\"submit\" formaction=\"/test-bridge\">Test Wi-Fi and Bridge URL</button>"
         "</form>"
@@ -303,7 +305,7 @@ static esp_err_t root_get_handler(httpd_req_t *req)
 
 static esp_err_t save_post_handler(httpd_req_t *req)
 {
-    char body[513] = {0};
+    char body[1024] = {0};
     if (read_form_body(req, body, sizeof(body)) != ESP_OK) {
         return ESP_FAIL;
     }
@@ -312,8 +314,12 @@ static esp_err_t save_post_handler(httpd_req_t *req)
     form_value(body, "ssid", settings.ssid, sizeof(settings.ssid));
     form_value(body, "password", settings.password, sizeof(settings.password));
     form_value(body, "bridge_url", settings.bridge_url, sizeof(settings.bridge_url));
+    form_value(body, "xiaozhi_ws_url", settings.xiaozhi_ws_url, sizeof(settings.xiaozhi_ws_url));
+    form_value(body, "xiaozhi_token", settings.xiaozhi_token, sizeof(settings.xiaozhi_token));
     settings.has_wifi = settings.ssid[0] != '\0';
     settings.has_bridge_url = settings.bridge_url[0] != '\0';
+    settings.has_xiaozhi_ws_url = settings.xiaozhi_ws_url[0] != '\0';
+    settings.has_xiaozhi_token = settings.xiaozhi_token[0] != '\0';
 
     if (!settings.has_wifi) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "SSID is required");
@@ -384,7 +390,7 @@ static esp_err_t connect_sta_for_probe(const char *ssid, const char *password, i
 
 static esp_err_t test_bridge_post_handler(httpd_req_t *req)
 {
-    char body[512] = {0};
+    char body[1024] = {0};
     char ssid[ORNAMENT_WIFI_SSID_MAX + 1] = {0};
     char password[ORNAMENT_WIFI_PASSWORD_MAX + 1] = {0};
     char url[ORNAMENT_BRIDGE_URL_MAX] = {0};

@@ -90,6 +90,38 @@ config ORNAMENT_UI_FRAME_MS
     default 250
     range 100 2000
 
+menu "Page button"
+
+config ORNAMENT_PAGE_BUTTON_ENABLED
+    bool "Enable hardware page cycle button"
+    default y
+    help
+        Enables a physical button that cycles the display through auto,
+        quota, tasks, clock, and Xiaozhi pages.
+
+config ORNAMENT_PAGE_BUTTON_GPIO
+    int "Page cycle button GPIO"
+    depends on ORNAMENT_PAGE_BUTTON_ENABLED
+    default 15
+    help
+        Connect one side of the button to this GPIO and the other side to
+        GND when active-low mode is enabled.
+
+config ORNAMENT_PAGE_BUTTON_ACTIVE_LOW
+    bool "Button is active low"
+    depends on ORNAMENT_PAGE_BUTTON_ENABLED
+    default y
+    help
+        Enables the GPIO internal pull-up and treats a low level as pressed.
+
+config ORNAMENT_PAGE_BUTTON_DEBOUNCE_MS
+    int "Page button debounce in milliseconds"
+    depends on ORNAMENT_PAGE_BUTTON_ENABLED
+    default 50
+    range 10 500
+
+endmenu
+
 config ORNAMENT_SNTP_SERVER
     string "SNTP server"
     default "pool.ntp.org"
@@ -244,6 +276,101 @@ config ORNAMENT_AUDIO_VOLUME_PERCENT
     int "Task done voice volume percent"
     default 70
     range 0 100
+
+menu "Xiaozhi AI voice"
+
+config ORNAMENT_XIAOZHI_ENABLED
+    bool "Enable Xiaozhi AI voice client"
+    default y
+    help
+        Builds the Xiaozhi-compatible WebSocket + Opus voice client. The client
+        stays idle until a WebSocket URL and microphone pin are configured.
+
+config ORNAMENT_XIAOZHI_WS_URL
+    string "Xiaozhi WebSocket URL"
+    depends on ORNAMENT_XIAOZHI_ENABLED
+    default ""
+    help
+        WebSocket endpoint for a Xiaozhi-compatible server, for example a
+        self-hosted xiaozhi-esp32-server endpoint. Leave empty to keep the
+        client disabled at runtime.
+
+config ORNAMENT_XIAOZHI_TOKEN
+    string "Xiaozhi access token"
+    depends on ORNAMENT_XIAOZHI_ENABLED
+    default ""
+    help
+        Optional bearer token sent in the WebSocket Authorization header.
+
+config ORNAMENT_XIAOZHI_AUTO_START
+    bool "Start Xiaozhi session after Wi-Fi connects"
+    depends on ORNAMENT_XIAOZHI_ENABLED
+    default n
+
+config ORNAMENT_XIAOZHI_CLIENT_ID
+    string "Xiaozhi client ID override"
+    depends on ORNAMENT_XIAOZHI_ENABLED
+    default ""
+    help
+        Optional stable client ID. When empty, the ornament hostname is used.
+
+config ORNAMENT_XIAOZHI_PROTOCOL_VERSION
+    int "Xiaozhi binary protocol version"
+    depends on ORNAMENT_XIAOZHI_ENABLED
+    default 1
+    range 1 1
+    help
+        Version 1 sends raw Opus frames in WebSocket binary messages.
+
+config ORNAMENT_XIAOZHI_FRAME_MS
+    int "Xiaozhi Opus frame duration in milliseconds"
+    depends on ORNAMENT_XIAOZHI_ENABLED
+    default 60
+    range 20 60
+    help
+        Xiaozhi commonly uses 60 ms Opus frames at 16 kHz mono.
+
+config ORNAMENT_XIAOZHI_OPUS_COMPLEXITY
+    int "Xiaozhi Opus encoder complexity"
+    depends on ORNAMENT_XIAOZHI_ENABLED
+    default 3
+    range 0 10
+
+config ORNAMENT_XIAOZHI_WS_BUFFER_BYTES
+    int "Xiaozhi WebSocket receive buffer bytes"
+    depends on ORNAMENT_XIAOZHI_ENABLED
+    default 2048
+    range 1024 8192
+
+config ORNAMENT_XIAOZHI_OPUS_MAX_BYTES
+    int "Xiaozhi maximum Opus packet bytes"
+    depends on ORNAMENT_XIAOZHI_ENABLED
+    default 1500
+    range 256 4096
+
+config ORNAMENT_XIAOZHI_CONNECT_TIMEOUT_MS
+    int "Xiaozhi connect and hello timeout in milliseconds"
+    depends on ORNAMENT_XIAOZHI_ENABLED
+    default 10000
+    range 2000 60000
+
+config ORNAMENT_XIAOZHI_MIC_PIN_DIN
+    int "I2S microphone DOUT GPIO"
+    depends on ORNAMENT_XIAOZHI_ENABLED
+    default -1
+    help
+        Set to the I2S microphone data output GPIO. BCLK and WS reuse the
+        speaker I2S pins so the microphone and speaker stay clock-compatible.
+
+config ORNAMENT_XIAOZHI_MIC_SLOT_RIGHT
+    bool "Read microphone samples from right I2S slot"
+    depends on ORNAMENT_XIAOZHI_ENABLED
+    default n
+    help
+        Enable when the I2S microphone is wired or strapped to transmit on the
+        right channel. Left slot is used by default.
+
+endmenu
 
 config ORNAMENT_STANDBY_CLOCK_MS
     int "Switch to standby clock page after idle milliseconds"

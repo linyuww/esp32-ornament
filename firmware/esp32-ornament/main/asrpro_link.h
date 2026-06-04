@@ -12,6 +12,8 @@ typedef enum {
     ASRPRO_VOICE_COMMAND_BRIDGE_MATCH,
     ASRPRO_VOICE_COMMAND_QUIET_ON,
     ASRPRO_VOICE_COMMAND_QUIET_OFF,
+    ASRPRO_VOICE_COMMAND_XIAOZHI_START,
+    ASRPRO_VOICE_COMMAND_XIAOZHI_STOP,
 } asrpro_voice_command_t;
 
 typedef void (*asrpro_voice_command_handler_t)(asrpro_voice_command_t command, void *context);

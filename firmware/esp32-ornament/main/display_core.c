@@ -1,12 +1,17 @@
 #include "display_core.h"
 #include "standby_wallpaper.h"
 
+#include "lvgl.h"
+#include "misc/lv_text_private.h"
+
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+LV_FONT_DECLARE(font_puhui_14_1);
 
 #ifndef CONFIG_ORNAMENT_QUOTA_CRITICAL_PERCENT
 #define CONFIG_ORNAMENT_QUOTA_CRITICAL_PERCENT 10
@@ -362,6 +367,13 @@ static const uint8_t *glyph_for(char ch)
         ['-'] = {0x00, 0x00, 0x00, 0x1F, 0x00, 0x00, 0x00},
         ['/'] = {0x01, 0x01, 0x02, 0x04, 0x08, 0x10, 0x10},
         ['?'] = {0x0E, 0x11, 0x01, 0x02, 0x04, 0x00, 0x04},
+        ['_'] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1F},
+        ['+'] = {0x00, 0x04, 0x04, 0x1F, 0x04, 0x04, 0x00},
+        ['='] = {0x00, 0x00, 0x1F, 0x00, 0x1F, 0x00, 0x00},
+        ['('] = {0x02, 0x04, 0x08, 0x08, 0x08, 0x04, 0x02},
+        [')'] = {0x08, 0x04, 0x02, 0x02, 0x02, 0x04, 0x08},
+        [','] = {0x00, 0x00, 0x00, 0x00, 0x0C, 0x04, 0x08},
+        ['!'] = {0x04, 0x04, 0x04, 0x04, 0x04, 0x00, 0x04},
         [' '] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
     };
     unsigned char index = (unsigned char)ch;
@@ -427,6 +439,170 @@ static void draw_text_xy(int x, int y, const char *text, int x_scale, int y_scal
 static int text_width_xy(const char *text, int x_scale)
 {
     return (int)strlen(text) * 6 * x_scale;
+}
+
+static uint32_t utf8_next(const char *text, uint32_t *offset)
+{
+    if (text == NULL || offset == NULL || text[*offset] == '\0') {
+        return 0;
+    }
+    return lv_text_encoded_next(text, offset);
+}
+
+static uint8_t lv_alpha_from_bitmap(const uint8_t *bitmap, uint32_t index, lv_font_glyph_format_t format)
+{
+    switch (format) {
+    case LV_FONT_GLYPH_FORMAT_A1:
+        return (bitmap[index / 8] & (uint8_t)(0x80 >> (index % 8))) ? 255 : 0;
+    case LV_FONT_GLYPH_FORMAT_A2:
+        return (uint8_t)(((bitmap[index / 4] >> (6 - (index % 4) * 2)) & 0x03) * 85);
+    case LV_FONT_GLYPH_FORMAT_A4:
+        return (uint8_t)(((index & 1) == 0 ? (bitmap[index / 2] >> 4) : bitmap[index / 2] & 0x0F) * 17);
+    case LV_FONT_GLYPH_FORMAT_A8:
+        return bitmap[index];
+    default:
+        return 0;
+    }
+}
+
+static void blend_pixel(int x, int y, uint16_t color, uint8_t alpha)
+{
+    if (x < 0 || y < 0 || x >= active_canvas->width || y >= active_canvas->height || alpha == 0) {
+        return;
+    }
+    if (alpha == 255) {
+        draw_pixel(x, y, color);
+        return;
+    }
+    uint16_t *pixel = &active_canvas->pixels[y * active_canvas->width + x];
+    *pixel = blend_rgb565(*pixel, color, alpha);
+}
+
+static int draw_utf8_text(int x, int y, const lv_font_t *font, const char *text, uint16_t color, int max_width)
+{
+    if (font == NULL || text == NULL || text[0] == '\0') {
+        return 0;
+    }
+    int cursor = x;
+    uint32_t offset = 0;
+    while (text[offset] != '\0') {
+        uint32_t letter_offset = offset;
+        uint32_t letter = utf8_next(text, &offset);
+        uint32_t next_offset = offset;
+        uint32_t letter_next = utf8_next(text, &next_offset);
+        if (letter == 0 || offset == letter_offset) {
+            offset++;
+            continue;
+        }
+
+        uint16_t adv = lv_font_get_glyph_width(font, letter, letter_next);
+        if (max_width > 0 && cursor + (int)adv > x + max_width) {
+            break;
+        }
+
+        lv_font_glyph_dsc_t glyph = {0};
+        if (!lv_font_get_glyph_dsc(font, &glyph, letter, letter_next)) {
+            cursor += adv > 0 ? adv : font->line_height / 2;
+            continue;
+        }
+        const uint8_t *bitmap = (const uint8_t *)lv_font_get_glyph_bitmap(&glyph, NULL);
+        if (bitmap != NULL) {
+            int glyph_x = cursor + glyph.ofs_x;
+            int glyph_y = y + font->line_height - font->base_line - glyph.box_h - glyph.ofs_y;
+            uint32_t bitmap_index = 0;
+            for (int row = 0; row < glyph.box_h; row++) {
+                for (int col = 0; col < glyph.box_w; col++, bitmap_index++) {
+                    uint8_t alpha = lv_alpha_from_bitmap(bitmap, bitmap_index, glyph.format);
+                    blend_pixel(glyph_x + col, glyph_y + row, color, alpha);
+                }
+            }
+        }
+        lv_font_glyph_release_draw_data(&glyph);
+        cursor += adv;
+    }
+    return cursor - x;
+}
+
+static void draw_utf8_text_line(
+    int x,
+    int y,
+    const lv_font_t *font,
+    const char *text,
+    uint32_t start,
+    uint32_t end,
+    uint16_t color,
+    int max_width)
+{
+    char line[XIAOZHI_STATUS_TEXT_MAX + 1];
+    uint32_t length = end > start ? end - start : 0;
+    if (length >= sizeof(line)) {
+        length = sizeof(line) - 1;
+    }
+    memcpy(line, text + start, length);
+    line[length] = '\0';
+    draw_utf8_text(x, y, font, line, color, max_width);
+}
+
+static void draw_utf8_text_wrapped(
+    int x,
+    int y,
+    const lv_font_t *font,
+    const char *text,
+    uint16_t color,
+    int max_width,
+    int max_lines)
+{
+    if (font == NULL || max_lines <= 0) {
+        return;
+    }
+    if (text == NULL || text[0] == '\0') {
+        text = "--";
+    }
+
+    uint32_t line_start = 0;
+    for (int line = 0; line < max_lines && text[line_start] != '\0'; line++) {
+        uint32_t offset = line_start;
+        uint32_t line_end = line_start;
+        int line_width = 0;
+        while (text[offset] != '\0') {
+            uint32_t letter_offset = offset;
+            uint32_t letter = utf8_next(text, &offset);
+            uint32_t next_offset = offset;
+            uint32_t letter_next = utf8_next(text, &next_offset);
+            if (letter == 0 || offset == letter_offset) {
+                offset++;
+                line_end = offset;
+                continue;
+            }
+
+            uint16_t adv = lv_font_get_glyph_width(font, letter, letter_next);
+            if (line_end > line_start && max_width > 0 && line_width + (int)adv > max_width) {
+                offset = letter_offset;
+                break;
+            }
+            line_width += adv;
+            line_end = offset;
+        }
+
+        if (line_end == line_start) {
+            break;
+        }
+
+        draw_utf8_text_line(
+            x,
+            y + line * (font->line_height + ss(2)),
+            font,
+            text,
+            line_start,
+            line_end,
+            color,
+            max_width);
+
+        line_start = line_end;
+        while (text[line_start] == ' ') {
+            line_start++;
+        }
+    }
 }
 
 static int min_int(int a, int b)
@@ -1225,6 +1401,69 @@ void display_core_render_tasks(display_core_canvas_t *canvas, const ornament_sta
     draw_text_center_fit(sy(174), claude_text, ss(2), status_color(state->claude_task_status));
     draw_text_center_fit(sy(244), total_text, ss(2), status_color(ornament_state_panel_status(state)));
     draw_status_badge(state);
+}
+
+void display_core_render_xiaozhi(
+    display_core_canvas_t *canvas,
+    const ornament_state_t *state,
+    const xiaozhi_client_snapshot_t *snapshot)
+{
+    ornament_state_t state_fallback;
+    xiaozhi_client_snapshot_t snapshot_fallback;
+    if (!begin_render(canvas)) {
+        return;
+    }
+    if (state == NULL) {
+        ornament_state_init(&state_fallback);
+        state = &state_fallback;
+    }
+    if (snapshot == NULL) {
+        memset(&snapshot_fallback, 0, sizeof(snapshot_fallback));
+        snapshot_fallback.state = XIAOZHI_CLIENT_STATE_DISABLED;
+        snapshot = &snapshot_fallback;
+    }
+
+    char status_text[32];
+    char frames_text[40];
+    char config_text[40];
+    const char *stt_text = snapshot->last_stt[0] != '\0' ? snapshot->last_stt : "NO STT";
+    const char *tts_text = snapshot->last_tts[0] != '\0' ? snapshot->last_tts : "NO TTS";
+    snprintf(status_text, sizeof(status_text), "AI %s", xiaozhi_client_state_name(snapshot->state));
+    snprintf(frames_text, sizeof(frames_text), "UP %lu DOWN %lu", (unsigned long)snapshot->uplink_frames, (unsigned long)snapshot->downlink_frames);
+    snprintf(config_text, sizeof(config_text), "%s %s", snapshot->configured ? "CONFIG OK" : "NO CONFIG", snapshot->connected ? "ONLINE" : "OFFLINE");
+
+    uint16_t state_color = HUD_MUTED;
+    switch (snapshot->state) {
+    case XIAOZHI_CLIENT_STATE_LISTENING:
+        state_color = HUD_GREEN;
+        break;
+    case XIAOZHI_CLIENT_STATE_SPEAKING:
+        state_color = HUD_CYAN;
+        break;
+    case XIAOZHI_CLIENT_STATE_CONNECTING:
+        state_color = HUD_AMBER;
+        break;
+    case XIAOZHI_CLIENT_STATE_ERROR:
+    case XIAOZHI_CLIENT_STATE_CONFIG_MISSING:
+        state_color = HUD_RED;
+        break;
+    case XIAOZHI_CLIENT_STATE_IDLE:
+    case XIAOZHI_CLIENT_STATE_DISABLED:
+    default:
+        state_color = HUD_MUTED;
+        break;
+    }
+
+    clear_canvas(HUD_BLACK);
+    draw_ring_ticks(state);
+    draw_text_center_fit(sy(34), "XIAOZHI AI", ss(3), HUD_WHITE);
+    draw_text_center_fit(sy(78), status_text, ss(2), state_color);
+    draw_text_center_fit(sy(110), "YOU", ss(1), HUD_MUTED);
+    draw_utf8_text_wrapped(sx(32), sy(128), &font_puhui_14_1, stt_text, HUD_GREEN, sx(296), 2);
+    draw_text_center_fit(sy(188), "AI", ss(1), HUD_MUTED);
+    draw_utf8_text_wrapped(sx(32), sy(204), &font_puhui_14_1, tts_text, HUD_CYAN, sx(296), 2);
+    draw_text_center_fit(sy(268), frames_text, ss(1), HUD_TEAL);
+    draw_text_center_fit(sy(298), config_text, ss(1), snapshot->configured ? HUD_WHITE : HUD_AMBER);
 }
 
 static void render_message(display_core_canvas_t *canvas, const char *line1, const char *line2, uint16_t color)

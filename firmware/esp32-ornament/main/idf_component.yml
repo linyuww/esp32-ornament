@@ -1,2 +1,6 @@
 dependencies:
-  espressif/mdns: "^1.8.2"
+  espressif/mdns: ^1.8.2
+  espressif/esp_websocket_client: ^1.7.0
+  78/esp-opus: ^1.0.5
+  78/xiaozhi-fonts: ^1.6.0
+  lvgl/lvgl: ~9.2.0

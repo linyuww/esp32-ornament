@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ornament_state.h"
+#include "xiaozhi_client.h"
 
 #include <stdint.h>
 
@@ -22,6 +23,10 @@ void display_core_render_voice_status(
     const ornament_state_t *state,
     const char *bridge_status,
     const char *voice_status);
+void display_core_render_xiaozhi(
+    display_core_canvas_t *canvas,
+    const ornament_state_t *state,
+    const xiaozhi_client_snapshot_t *snapshot);
 void display_core_render_tasks(display_core_canvas_t *canvas, const ornament_state_t *state);
 void display_core_render_boot(display_core_canvas_t *canvas);
 void display_core_render_status_message(display_core_canvas_t *canvas, const char *message);

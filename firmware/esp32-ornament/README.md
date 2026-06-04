@@ -13,6 +13,8 @@
 | 逻辑电平 | 3.3 V |
 | 数据源 | `http://<PC-LAN-IP>:8787/state` |
 | 配网方式 | ESP32 SoftAP + 手机浏览器 |
+| 小智 AI | 可选 WebSocket + Opus，默认不自动启动 |
+| 页面按键 | GPIO15 短按切换页面 |
 
 默认引脚：
 
@@ -32,6 +34,7 @@
 - 每 `CONFIG_ORNAMENT_POLL_INTERVAL_MS` 轮询一次网桥，默认 3000 ms。
 - 连续 `CONFIG_ORNAMENT_BRIDGE_OFFLINE_FAILURES` 次拉取失败后才显示 `Bridge offline`，默认 3 次。
 - 空闲 `CONFIG_ORNAMENT_STANDBY_CLOCK_MS` 后进入待机时钟页，默认 60000 ms。
+- GPIO15 页面按键可短按切换 `Auto` / `Quota` / `Tasks` / `Clock` / `Xiaozhi`。
 - 任务完成后边框闪烁 `CONFIG_ORNAMENT_DONE_FLASH_MS`，默认 5000 ms。
 - 本地 Web 控制台提供状态查看、Bridge URL 测试、重启、清空配置和语音音量设置。
 
@@ -122,8 +125,36 @@ http://<ESP32-IP>/
 - 当前 Wi-Fi、RSSI、时间、额度、天气和任务状态。
 - `GET /status` 机器可读 JSON。
 - `POST /test-bridge` 测试当前 Bridge URL。
+- `POST /save-xiaozhi` 保存小智 WebSocket URL 和 token。
+- `POST /xiaozhi-start` / `POST /xiaozhi-stop` 启动或停止小智语音会话。
 - `POST /reboot` 重启 ESP32。
 - `POST /clear-config` 清空 Wi-Fi 与 Bridge URL 后重启到配网模式。
+
+## 小智 AI 语音
+
+固件集成了兼容 `78/xiaozhi-esp32` WebSocket 协议的轻量客户端：设备发送 `hello`，随后上传 16 kHz mono Opus 音频帧，并播放服务端下发的 Opus TTS 音频。当前使用 binary protocol version 1，也就是 WebSocket binary payload 直接承载 raw Opus frame。
+
+小智配置入口：
+
+- 首次配网页可填写 Xiaozhi WebSocket URL 和 token。
+- 联网后 Web 控制台的 `Xiaozhi AI` 区域可保存 URL/token、启动/停止会话、查看 STT/TTS 文本和上下行帧计数。
+- ASRPRO 串口命令可发送 `xiaozhi_start` / `xiaozhi_stop`，别名为 `ai_start` / `ai_stop`。
+- 屏幕的小智页面使用 `78/xiaozhi-fonts` 普惠中文字体和 LVGL 字形渲染，STT/TTS 中文文本会直接显示在当前 ST7789 帧缓冲页面中。
+
+音频硬件配置：
+
+| 信号 | 默认值 | 说明 |
+| --- | ---: | --- |
+| Speaker BCLK | GPIO4 | 复用现有 I2S BCLK |
+| Speaker LRC/WS | GPIO5 | 复用现有 I2S WS |
+| Speaker DIN | GPIO6 | MAX98357A 或兼容 I2S 功放输入 |
+| Mic DOUT | GPIO14 | INMP441 `SD`/`DOUT` 输入 |
+| Page Button | GPIO15 | 另一端接 GND，内部上拉，低电平触发 |
+
+INMP441 `SCK`/`BCLK` 接 GPIO4，`WS`/`LRCLK` 接 GPIO5，`SD`/`DOUT` 接 GPIO14，`L/R` 接 GND 使用左声道。若 `L/R` 改接 3V3，需要启用 `CONFIG_ORNAMENT_XIAOZHI_MIC_SLOT_RIGHT`。小智会话播放 TTS 时会占用 I2S 输出；此时任务完成提示音会跳过，避免两个音频源同时写同一喇叭。
+
+页面切换按键：按钮一端接 GPIO15，另一端接 GND。默认启用内部上拉，短按循环 `Auto -> Quota -> Tasks -> Clock -> Xiaozhi -> Auto`，手动切到的页面会保持显示到下一次按键。
+
 
 如果开启 Clash Verge Rev TUN 后 `.local` 访问失败，推荐在 Clash Verge Rev 全局扩展中添加静态 hosts，或在路由器中给 ESP32 绑定 DHCP 静态地址。不要只依赖 `DOMAIN-SUFFIX,local,DIRECT`，因为它不能解决 mDNS 解析被 TUN/DNS 劫持的问题。
 

@@ -8,7 +8,9 @@
 #include "web_console.h"
 #include "weather_client.h"
 #include "wifi.h"
+#include "xiaozhi_client.h"
 
+#include "driver/gpio.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -21,6 +23,28 @@
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+
+#ifndef CONFIG_ORNAMENT_XIAOZHI_AUTO_START
+#define CONFIG_ORNAMENT_XIAOZHI_AUTO_START 0
+#endif
+
+#ifndef CONFIG_ORNAMENT_PAGE_BUTTON_ENABLED
+#define CONFIG_ORNAMENT_PAGE_BUTTON_ENABLED 0
+#endif
+
+#ifndef CONFIG_ORNAMENT_PAGE_BUTTON_GPIO
+#define CONFIG_ORNAMENT_PAGE_BUTTON_GPIO 15
+#endif
+
+#ifndef CONFIG_ORNAMENT_PAGE_BUTTON_DEBOUNCE_MS
+#define CONFIG_ORNAMENT_PAGE_BUTTON_DEBOUNCE_MS 50
+#endif
+
+#ifdef CONFIG_ORNAMENT_PAGE_BUTTON_ACTIVE_LOW
+#define ORNAMENT_PAGE_BUTTON_ACTIVE_LOW 1
+#else
+#define ORNAMENT_PAGE_BUTTON_ACTIVE_LOW 0
+#endif
 
 static const char *TAG = "ornament";
 
@@ -46,6 +70,7 @@ typedef enum {
     VOICE_VIEW_QUOTA,
     VOICE_VIEW_TASKS,
     VOICE_VIEW_CLOCK,
+    VOICE_VIEW_XIAOZHI,
 } voice_view_t;
 
 typedef struct {
@@ -365,6 +390,45 @@ static bool voice_control_snapshot(voice_control_state_t *snapshot)
     return true;
 }
 
+static const char *voice_view_name(voice_view_t view)
+{
+    switch (view) {
+    case VOICE_VIEW_AUTO:
+        return "AUTO";
+    case VOICE_VIEW_STATUS:
+        return "STATUS";
+    case VOICE_VIEW_QUOTA:
+        return "QUOTA";
+    case VOICE_VIEW_TASKS:
+        return "TASKS";
+    case VOICE_VIEW_CLOCK:
+        return "CLOCK";
+    case VOICE_VIEW_XIAOZHI:
+        return "XIAOZHI";
+    default:
+        return "UNKNOWN";
+    }
+}
+
+static voice_view_t next_button_view(voice_view_t current)
+{
+    switch (current) {
+    case VOICE_VIEW_AUTO:
+        return VOICE_VIEW_QUOTA;
+    case VOICE_VIEW_QUOTA:
+        return VOICE_VIEW_TASKS;
+    case VOICE_VIEW_TASKS:
+        return VOICE_VIEW_CLOCK;
+    case VOICE_VIEW_CLOCK:
+        return VOICE_VIEW_XIAOZHI;
+    case VOICE_VIEW_XIAOZHI:
+        return VOICE_VIEW_AUTO;
+    case VOICE_VIEW_STATUS:
+    default:
+        return VOICE_VIEW_AUTO;
+    }
+}
+
 static void voice_control_set_view(voice_view_t view, TickType_t now, const char *command, const char *result)
 {
     if (voice_control_mutex == NULL) {
@@ -382,6 +446,27 @@ static void voice_control_set_view(voice_view_t view, TickType_t now, const char
     if (result != NULL) {
         strlcpy(voice_control.last_result, result, sizeof(voice_control.last_result));
     }
+    xSemaphoreGive(voice_control_mutex);
+}
+
+static void voice_control_cycle_page(TickType_t now)
+{
+    if (voice_control_mutex == NULL) {
+        return;
+    }
+    if (xSemaphoreTake(voice_control_mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
+        ESP_LOGW(TAG, "page cycle skipped: mutex timeout");
+        return;
+    }
+    voice_control.view = next_button_view(voice_control.view);
+    voice_control.hold_until_tick = voice_control.view == VOICE_VIEW_AUTO ? 0 : portMAX_DELAY;
+    strlcpy(voice_control.last_command, "PAGE BUTTON", sizeof(voice_control.last_command));
+    snprintf(
+        voice_control.last_result,
+        sizeof(voice_control.last_result),
+        "PAGE %s",
+        voice_view_name(voice_control.view));
+    ESP_LOGI(TAG, "page button switched to %s at tick %lu", voice_view_name(voice_control.view), (unsigned long)now);
     xSemaphoreGive(voice_control_mutex);
 }
 
@@ -479,7 +564,8 @@ static void voice_control_set_quiet(bool enabled)
 
 static bool voice_view_active(voice_view_t view, TickType_t hold_until_tick, TickType_t now)
 {
-    return view != VOICE_VIEW_AUTO && hold_until_tick != 0 && now < hold_until_tick;
+    return view != VOICE_VIEW_AUTO &&
+           (hold_until_tick == portMAX_DELAY || (hold_until_tick != 0 && now < hold_until_tick));
 }
 
 static bool render_voice_override(
@@ -509,6 +595,12 @@ static bool render_voice_override(
     case VOICE_VIEW_QUOTA:
         display_render_state(state);
         break;
+    case VOICE_VIEW_XIAOZHI: {
+        xiaozhi_client_snapshot_t snapshot;
+        xiaozhi_client_status_snapshot(&snapshot);
+        display_render_xiaozhi(state, &snapshot);
+        break;
+    }
     case VOICE_VIEW_AUTO:
     default:
         return false;
@@ -690,11 +782,81 @@ static void handle_voice_command(asrpro_voice_command_t command)
         voice_control_set_quiet(false);
         voice_control_set_view(VOICE_VIEW_STATUS, now, "QUIET OFF", "QUIET OFF");
         break;
+    case ASRPRO_VOICE_COMMAND_XIAOZHI_START: {
+        esp_err_t err = xiaozhi_client_start_session();
+        voice_control_set_view(
+            VOICE_VIEW_STATUS,
+            now,
+            "XIAOZHI START",
+            err == ESP_OK ? "AI LISTEN" : esp_err_to_name(err));
+        break;
+    }
+    case ASRPRO_VOICE_COMMAND_XIAOZHI_STOP: {
+        esp_err_t err = xiaozhi_client_stop_session();
+        voice_control_set_view(
+            VOICE_VIEW_STATUS,
+            now,
+            "XIAOZHI STOP",
+            err == ESP_OK ? "AI STOP" : esp_err_to_name(err));
+        break;
+    }
     case ASRPRO_VOICE_COMMAND_UNKNOWN:
     default:
         voice_control_set_view(VOICE_VIEW_STATUS, now, "UNKNOWN", "UNKNOWN CMD");
         break;
     }
+}
+
+static bool page_button_pressed_level(int level)
+{
+    return ORNAMENT_PAGE_BUTTON_ACTIVE_LOW ? level == 0 : level != 0;
+}
+
+static void page_button_task(void *arg)
+{
+    (void)arg;
+#if CONFIG_ORNAMENT_PAGE_BUTTON_ENABLED
+    const gpio_num_t gpio = (gpio_num_t)CONFIG_ORNAMENT_PAGE_BUTTON_GPIO;
+    const gpio_config_t config = {
+        .pin_bit_mask = 1ULL << gpio,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = ORNAMENT_PAGE_BUTTON_ACTIVE_LOW ? GPIO_PULLUP_ENABLE : GPIO_PULLUP_DISABLE,
+        .pull_down_en = ORNAMENT_PAGE_BUTTON_ACTIVE_LOW ? GPIO_PULLDOWN_DISABLE : GPIO_PULLDOWN_ENABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&config));
+
+    const TickType_t poll_ticks = pdMS_TO_TICKS(20);
+    const TickType_t debounce_ticks = pdMS_TO_TICKS(CONFIG_ORNAMENT_PAGE_BUTTON_DEBOUNCE_MS);
+    bool stable_pressed = page_button_pressed_level(gpio_get_level(gpio));
+    bool last_sample_pressed = stable_pressed;
+    TickType_t changed_tick = xTaskGetTickCount();
+
+    ESP_LOGI(
+        TAG,
+        "page button enabled: gpio=%d active_%s debounce=%dms",
+        CONFIG_ORNAMENT_PAGE_BUTTON_GPIO,
+        ORNAMENT_PAGE_BUTTON_ACTIVE_LOW ? "low" : "high",
+        CONFIG_ORNAMENT_PAGE_BUTTON_DEBOUNCE_MS);
+
+    while (true) {
+        TickType_t now = xTaskGetTickCount();
+        bool sample_pressed = page_button_pressed_level(gpio_get_level(gpio));
+        if (sample_pressed != last_sample_pressed) {
+            last_sample_pressed = sample_pressed;
+            changed_tick = now;
+        }
+        if (sample_pressed != stable_pressed && (now - changed_tick) >= debounce_ticks) {
+            stable_pressed = sample_pressed;
+            if (stable_pressed) {
+                voice_control_cycle_page(now);
+            }
+        }
+        vTaskDelay(poll_ticks);
+    }
+#else
+    vTaskDelete(NULL);
+#endif
 }
 
 static void voice_command_task(void *arg)
@@ -706,6 +868,16 @@ static void voice_command_task(void *arg)
             handle_voice_command(command);
         }
     }
+}
+
+static void create_app_task(
+    TaskFunction_t task_fn,
+    const char *name,
+    uint32_t stack_depth,
+    UBaseType_t priority)
+{
+    BaseType_t created = xTaskCreate(task_fn, name, stack_depth, NULL, priority, NULL);
+    ESP_ERROR_CHECK(created == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
 }
 
 static void poll_task(void *arg)
@@ -902,7 +1074,10 @@ void app_main(void)
 
     display_init();
     display_render_boot();
-    task_audio_start();
+    esp_err_t audio_err = task_audio_start();
+    if (audio_err != ESP_OK) {
+        ESP_LOGW(TAG, "task done audio unavailable: %s", esp_err_to_name(audio_err));
+    }
 
     if (wifi_connect() != ESP_OK) {
         ESP_LOGW(TAG, "provisioning mode active: SSID=%s URL=http://192.168.4.1", config_portal_ssid());
@@ -929,6 +1104,15 @@ void app_main(void)
     if (asrpro_err != ESP_OK) {
         ESP_LOGW(TAG, "ASRPRO UART link unavailable: %s", esp_err_to_name(asrpro_err));
     }
+    esp_err_t xiaozhi_err = xiaozhi_client_init();
+    if (xiaozhi_err != ESP_OK) {
+        ESP_LOGW(TAG, "Xiaozhi client unavailable: %s", esp_err_to_name(xiaozhi_err));
+    } else if (CONFIG_ORNAMENT_XIAOZHI_AUTO_START) {
+        xiaozhi_err = xiaozhi_client_start_session();
+        if (xiaozhi_err != ESP_OK) {
+            ESP_LOGW(TAG, "Xiaozhi auto-start skipped: %s", esp_err_to_name(xiaozhi_err));
+        }
+    }
     system_status_start_time_sync();
     ESP_ERROR_CHECK(weather_client_start());
     ESP_ERROR_CHECK(web_console_start());
@@ -939,9 +1123,10 @@ void app_main(void)
     ornament_state_init(&shared_state.state);
     shared_state.fetch_error = ESP_ERR_INVALID_STATE;
 
-    xTaskCreate(voice_command_task, "voice_cmd", 4096, NULL, 5, NULL);
-    xTaskCreate(poll_task, "bridge_poll", 8192, NULL, 5, NULL);
-    xTaskCreate(ui_render_task, "ui_render", 8192, NULL, 4, NULL);
+    create_app_task(voice_command_task, "voice_cmd", 4096, 5);
+    create_app_task(page_button_task, "page_button", 3072, 5);
+    create_app_task(poll_task, "bridge_poll", 8192, 5);
+    create_app_task(ui_render_task, "ui_render", 8192, 4);
 
     /* Main task must never return in ESP-IDF — returning tears down
      * FreeRTOS resources (mutexes, queues, semaphores) that child tasks

@@ -193,6 +193,16 @@ static void render_voice_status(const ornament_state_t *state, const char *bridg
     (void)flush_canvas();
 }
 
+static void render_xiaozhi(const ornament_state_t *state, const xiaozhi_client_snapshot_t *snapshot)
+{
+    if (!canvas_alloc()) {
+        ESP_LOGE(TAG, "failed to allocate display canvas");
+        return;
+    }
+    display_core_render_xiaozhi(&canvas, state, snapshot);
+    (void)flush_canvas();
+}
+
 static void render_tasks(const ornament_state_t *state)
 {
     if (!canvas_alloc()) {
@@ -300,6 +310,17 @@ void display_render_voice_status(const ornament_state_t *state, const char *brid
 {
     ESP_LOGI(TAG, "voice status: bridge=%s voice=%s", bridge_status, voice_status);
     render_voice_status(state, bridge_status, voice_status);
+}
+
+void display_render_xiaozhi(const ornament_state_t *state, const xiaozhi_client_snapshot_t *snapshot)
+{
+    ESP_LOGI(
+        TAG,
+        "xiaozhi display: state=%s up=%lu down=%lu",
+        snapshot != NULL ? xiaozhi_client_state_name(snapshot->state) : "none",
+        snapshot != NULL ? (unsigned long)snapshot->uplink_frames : 0UL,
+        snapshot != NULL ? (unsigned long)snapshot->downlink_frames : 0UL);
+    render_xiaozhi(state, snapshot);
 }
 
 void display_render_tasks(const ornament_state_t *state)

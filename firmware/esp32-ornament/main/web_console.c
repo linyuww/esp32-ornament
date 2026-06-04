@@ -12,6 +12,7 @@
 #include "task_audio.h"
 #include "weather_client.h"
 #include "wifi.h"
+#include "xiaozhi_client.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -293,6 +294,12 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     char weather_observed_at[ORNAMENT_TIME_MAX * 2];
     char weather_config_label[ORNAMENT_WEATHER_LABEL_MAX * 2];
     char bridge_url[ORNAMENT_BRIDGE_URL_MAX * 2];
+    char xiaozhi_ws_url[ORNAMENT_XIAOZHI_WS_URL_MAX * 2];
+    char xiaozhi_session_id[XIAOZHI_SESSION_ID_MAX * 2];
+    char xiaozhi_last_error[XIAOZHI_STATUS_TEXT_MAX * 2];
+    char xiaozhi_last_stt[XIAOZHI_STATUS_TEXT_MAX * 2];
+    char xiaozhi_last_tts[XIAOZHI_STATUS_TEXT_MAX * 2];
+    xiaozhi_client_snapshot_t xiaozhi = {0};
     web_console_bridge_debug_t bridge_diag = {0};
 
     ornament_state_init(&state);
@@ -312,12 +319,18 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     json_escape(settings_weather_label_or_default(&console_settings), weather_config_label, sizeof(weather_config_label));
 
     json_escape(settings_bridge_url_or_default(&console_settings), bridge_url, sizeof(bridge_url));
+    xiaozhi_client_status_snapshot(&xiaozhi);
+    json_escape(xiaozhi.ws_url, xiaozhi_ws_url, sizeof(xiaozhi_ws_url));
+    json_escape(xiaozhi.session_id, xiaozhi_session_id, sizeof(xiaozhi_session_id));
+    json_escape(xiaozhi.last_error, xiaozhi_last_error, sizeof(xiaozhi_last_error));
+    json_escape(xiaozhi.last_stt, xiaozhi_last_stt, sizeof(xiaozhi_last_stt));
+    json_escape(xiaozhi.last_tts, xiaozhi_last_tts, sizeof(xiaozhi_last_tts));
     if (state_mutex != NULL && xSemaphoreTake(state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         bridge_diag = bridge_debug;
         xSemaphoreGive(state_mutex);
     }
 
-    const size_t json_size = 4096;
+    const size_t json_size = 5120;
     char *json = calloc(1, json_size);
     if (json == NULL) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
@@ -346,6 +359,9 @@ static esp_err_t status_get_handler(httpd_req_t *req)
         "\"quota\":{\"has\":%s,\"status\":\"%s\",\"primary\":%d,\"weekly\":%d},"
         "\"task\":{\"has\":%s,\"active_count\":%d,\"done_seq\":%d,\"status\":\"%s\",\"title\":\"%s\",\"message\":\"%s\"},"
         "\"audio\":{\"enabled\":%s,\"volume_percent\":%d},"
+        "\"xiaozhi\":{\"enabled\":%s,\"configured\":%s,\"connected\":%s,\"state\":\"%s\","
+        "\"ws_url\":\"%s\",\"session_id\":\"%s\",\"last_error\":\"%s\",\"last_stt\":\"%s\","
+        "\"last_tts\":\"%s\",\"uplink_frames\":%u,\"downlink_frames\":%u},"
         "\"bridge_debug\":{\"last_fetch_error\":\"%s\",\"consecutive_fetch_failures\":%d,"
         "\"last_success_ms\":%lld,\"last_failure_ms\":%lld,"
         "\"last_auto_match_ok\":%s,\"last_auto_match_error\":\"%s\",\"last_auto_match_reason\":\"%s\"},"
@@ -402,6 +418,17 @@ static esp_err_t status_get_handler(httpd_req_t *req)
         task_message,
         CONFIG_ORNAMENT_AUDIO_ENABLED ? "true" : "false",
         settings_audio_volume_percent_or_default(&console_settings),
+        xiaozhi.enabled ? "true" : "false",
+        xiaozhi.configured ? "true" : "false",
+        xiaozhi.connected ? "true" : "false",
+        xiaozhi_client_state_name(xiaozhi.state),
+        xiaozhi_ws_url,
+        xiaozhi_session_id,
+        xiaozhi_last_error,
+        xiaozhi_last_stt,
+        xiaozhi_last_tts,
+        (unsigned int)xiaozhi.uplink_frames,
+        (unsigned int)xiaozhi.downlink_frames,
         esp_err_to_name(bridge_diag.last_fetch_error),
         bridge_diag.consecutive_fetch_failures,
         (long long)bridge_diag.last_success_ms,
@@ -439,6 +466,11 @@ static esp_err_t root_get_handler(httpd_req_t *req)
     char weather_icon[40];
     char weather_value[96];
     char weather_detail[192];
+    char xiaozhi_ws_url[ORNAMENT_XIAOZHI_WS_URL_MAX * 2];
+    char xiaozhi_last_error[XIAOZHI_STATUS_TEXT_MAX * 2];
+    char xiaozhi_last_stt[XIAOZHI_STATUS_TEXT_MAX * 2];
+    char xiaozhi_last_tts[XIAOZHI_STATUS_TEXT_MAX * 2];
+    xiaozhi_client_snapshot_t xiaozhi = {0};
     char settings_weather_label[ORNAMENT_WEATHER_LABEL_MAX * 2];
     const char *settings_weather_source = settings_weather_source_or_default(&console_settings);
     char weather_lat_text[24];
@@ -452,6 +484,11 @@ static esp_err_t root_get_handler(httpd_req_t *req)
     int codex_active_count = state.has_codex_summary ? state.codex_active_task_count : state.active_task_count;
     int codex_done_seq = state.has_codex_summary ? state.codex_done_seq : state.done_seq;
     html_escape(settings_bridge_url_or_default(&console_settings), bridge_url, sizeof(bridge_url));
+    xiaozhi_client_status_snapshot(&xiaozhi);
+    html_escape(settings_xiaozhi_ws_url_or_default(&console_settings), xiaozhi_ws_url, sizeof(xiaozhi_ws_url));
+    html_escape(xiaozhi.last_error, xiaozhi_last_error, sizeof(xiaozhi_last_error));
+    html_escape(xiaozhi.last_stt, xiaozhi_last_stt, sizeof(xiaozhi_last_stt));
+    html_escape(xiaozhi.last_tts, xiaozhi_last_tts, sizeof(xiaozhi_last_tts));
     html_escape(state.wifi_ssid, wifi_ssid, sizeof(wifi_ssid));
     html_escape(state.weather_label, weather_label, sizeof(weather_label));
     html_escape(state.weather_source, weather_source, sizeof(weather_source));
@@ -494,7 +531,7 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         snprintf(weather_detail, sizeof(weather_detail), "%s", weather_label[0] != '\0' ? weather_label : "--");
     }
 
-    const size_t html_size = 14336;
+    const size_t html_size = 15360;
     char *html = calloc(1, html_size);
     if (html == NULL) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
@@ -574,6 +611,50 @@ static esp_err_t root_get_handler(httpd_req_t *req)
     appendf(html, html_size, &used, "<div class=\"card\"><div class=\"k\">Last Failure</div><div class=\"v\">%lld ms</div><div class=\"k\">since boot</div></div>", (long long)bridge_diag.last_failure_ms);
     appendf(html, html_size, &used, "<div class=\"card\"><div class=\"k\">Auto Match</div><div class=\"v\">%s</div><div class=\"k\">%s / %s</div></div>", bridge_diag.last_auto_match_ok ? "ok" : "failed", esp_err_to_name(bridge_diag.last_auto_match_error), bridge_diag.last_auto_match_reason[0] != '\0' ? bridge_diag.last_auto_match_reason : "--");
     append(html, html_size, &used, "</section>");
+    append(html, html_size, &used, "<h2>Xiaozhi AI</h2><section class=\"grid\">");
+    appendf(
+        html,
+        html_size,
+        &used,
+        "<div class=\"card\"><div class=\"k\">State</div><div class=\"v\">%s</div><div class=\"k\">configured %s</div></div>",
+        xiaozhi_client_state_name(xiaozhi.state),
+        xiaozhi.configured ? "yes" : "no");
+    appendf(
+        html,
+        html_size,
+        &used,
+        "<div class=\"card\"><div class=\"k\">Frames</div><div class=\"v\">%u / %u</div><div class=\"k\">uplink / downlink</div></div>",
+        (unsigned int)xiaozhi.uplink_frames,
+        (unsigned int)xiaozhi.downlink_frames);
+    appendf(
+        html,
+        html_size,
+        &used,
+        "<div class=\"card\"><div class=\"k\">Last STT</div><div class=\"v\">%s</div></div>",
+        xiaozhi_last_stt[0] != '\0' ? xiaozhi_last_stt : "--");
+    appendf(
+        html,
+        html_size,
+        &used,
+        "<div class=\"card\"><div class=\"k\">Last TTS</div><div class=\"v\">%s</div><div class=\"k\">%s</div></div>",
+        xiaozhi_last_tts[0] != '\0' ? xiaozhi_last_tts : "--",
+        xiaozhi_last_error[0] != '\0' ? xiaozhi_last_error : "no error");
+    append(html, html_size, &used, "</section>");
+    append(
+        html,
+        html_size,
+        &used,
+        "<section class=\"ops\"><form method=\"post\" action=\"/save-xiaozhi\"><label class=\"k\">Xiaozhi WebSocket URL</label>"
+        "<input name=\"xiaozhi_ws_url\" maxlength=\"191\" value=\"");
+    append(html, html_size, &used, xiaozhi_ws_url);
+    append(
+        html,
+        html_size,
+        &used,
+        "\"><label class=\"k\">Xiaozhi Token</label><input name=\"xiaozhi_token\" maxlength=\"159\" type=\"password\" placeholder=\"Leave blank to keep current token\">"
+        "<div class=\"actions\"><button type=\"submit\">Save Xiaozhi</button>"
+        "<button class=\"warn\" type=\"submit\" formaction=\"/xiaozhi-start\">Start AI</button>"
+        "<button class=\"danger\" type=\"submit\" formaction=\"/xiaozhi-stop\">Stop AI</button></div></form></section>");
     appendf(
         html,
         html_size,
@@ -936,9 +1017,11 @@ static esp_err_t send_audio_saved_page(httpd_req_t *req, int volume_percent, boo
     return httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
 }
 
-static esp_err_t send_weather_saved_page(httpd_req_t *req, const char *title, const char *detail)
+static esp_err_t send_simple_page(httpd_req_t *req, const char *title, const char *detail)
 {
-    char escaped_detail[160];
+    char escaped_title[80];
+    char escaped_detail[240];
+    html_escape(title != NULL ? title : "Codex Ornament", escaped_title, sizeof(escaped_title));
     html_escape(detail != NULL ? detail : "", escaped_detail, sizeof(escaped_detail));
 
     char html[768];
@@ -948,11 +1031,45 @@ static esp_err_t send_weather_saved_page(httpd_req_t *req, const char *title, co
         "<!doctype html><html><head><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
         "<style>body{font-family:system-ui;margin:24px;background:#0b1116;color:#edf7fb}a{color:#49d3c8}</style>"
         "</head><body><h1>%s</h1><p>%s</p><p><a href=\"/\">Back</a></p></body></html>",
-        title != NULL ? title : "Weather",
+        escaped_title,
         escaped_detail);
 
     httpd_resp_set_type(req, "text/html; charset=utf-8");
     return httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t save_xiaozhi_settings(const char *ws_url, const char *token)
+{
+    ornament_settings_t settings;
+    esp_err_t err = settings_load(&settings);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    if (ws_url != NULL) {
+        strlcpy(settings.xiaozhi_ws_url, ws_url, sizeof(settings.xiaozhi_ws_url));
+        settings.has_xiaozhi_ws_url = settings.xiaozhi_ws_url[0] != '\0';
+    }
+    if (token != NULL && token[0] != '\0') {
+        strlcpy(settings.xiaozhi_token, token, sizeof(settings.xiaozhi_token));
+        settings.has_xiaozhi_token = true;
+    }
+
+    err = settings_save(&settings);
+    if (err == ESP_OK) {
+        console_settings = settings;
+    }
+    return err;
+}
+
+static esp_err_t send_xiaozhi_page(httpd_req_t *req, const char *title, const char *detail)
+{
+    return send_simple_page(req, title != NULL ? title : "Xiaozhi AI", detail);
+}
+
+static esp_err_t send_weather_saved_page(httpd_req_t *req, const char *title, const char *detail)
+{
+    return send_simple_page(req, title != NULL ? title : "Weather", detail);
 }
 
 static esp_err_t test_bridge_post_handler(httpd_req_t *req)
@@ -1081,7 +1198,10 @@ static esp_err_t test_audio_post_handler(httpd_req_t *req)
     char body[128] = {0};
     char value[8] = {0};
     int volume_percent = settings_audio_volume_percent_or_default(&console_settings);
-    if (req->content_len > 0 && read_form_body(req, body, sizeof(body)) == ESP_OK) {
+    if (req->content_len > 0) {
+        if (read_form_body(req, body, sizeof(body)) != ESP_OK) {
+            return ESP_FAIL;
+        }
         form_value(body, "audio_volume", value, sizeof(value));
         if (value[0] != '\0' && parse_audio_volume_percent(value, &volume_percent) != ESP_OK) {
             httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Audio volume must be 0..100");
@@ -1097,6 +1217,68 @@ static esp_err_t test_audio_post_handler(httpd_req_t *req)
 
     task_audio_play_done();
     return send_audio_saved_page(req, volume_percent, true);
+}
+
+static esp_err_t save_xiaozhi_post_handler(httpd_req_t *req)
+{
+    char body[1024] = {0};
+    char ws_url[ORNAMENT_XIAOZHI_WS_URL_MAX] = {0};
+    char token[ORNAMENT_XIAOZHI_TOKEN_MAX] = {0};
+    if (read_form_body(req, body, sizeof(body)) != ESP_OK) {
+        return ESP_FAIL;
+    }
+    form_value(body, "xiaozhi_ws_url", ws_url, sizeof(ws_url));
+    form_value(body, "xiaozhi_token", token, sizeof(token));
+
+    esp_err_t err = save_xiaozhi_settings(ws_url, token);
+    if (err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, esp_err_to_name(err));
+        return ESP_FAIL;
+    }
+    return send_xiaozhi_page(req, "Xiaozhi Saved", "The next AI session will use the saved WebSocket settings.");
+}
+
+static esp_err_t xiaozhi_start_post_handler(httpd_req_t *req)
+{
+    if (req->content_len > 0) {
+        char body[1024] = {0};
+        char ws_url[ORNAMENT_XIAOZHI_WS_URL_MAX] = {0};
+        char token[ORNAMENT_XIAOZHI_TOKEN_MAX] = {0};
+        if (read_form_body(req, body, sizeof(body)) != ESP_OK) {
+            return ESP_FAIL;
+        }
+        form_value(body, "xiaozhi_ws_url", ws_url, sizeof(ws_url));
+        form_value(body, "xiaozhi_token", token, sizeof(token));
+        esp_err_t save_err = save_xiaozhi_settings(ws_url, token);
+        if (save_err != ESP_OK) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, esp_err_to_name(save_err));
+            return ESP_FAIL;
+        }
+    }
+
+    esp_err_t err = xiaozhi_client_start_session();
+    if (err != ESP_OK) {
+        char detail[96];
+        snprintf(detail, sizeof(detail), "Start failed: %s", esp_err_to_name(err));
+        return send_xiaozhi_page(req, "Xiaozhi Start", detail);
+    }
+    return send_xiaozhi_page(req, "Xiaozhi Start", "AI session is starting.");
+}
+
+static esp_err_t xiaozhi_stop_post_handler(httpd_req_t *req)
+{
+    if (req->content_len > 0) {
+        char body[1024] = {0};
+        (void)read_form_body(req, body, sizeof(body));
+    }
+
+    esp_err_t err = xiaozhi_client_stop_session();
+    if (err != ESP_OK) {
+        char detail[96];
+        snprintf(detail, sizeof(detail), "Stop returned: %s", esp_err_to_name(err));
+        return send_xiaozhi_page(req, "Xiaozhi Stop", detail);
+    }
+    return send_xiaozhi_page(req, "Xiaozhi Stop", "AI session stop requested.");
 }
 
 static esp_err_t auto_bridge_post_handler(httpd_req_t *req)
@@ -1175,7 +1357,7 @@ esp_err_t web_console_start(void)
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
     config.lru_purge_enable = true;
-    config.max_uri_handlers = 14;
+    config.max_uri_handlers = 16;
     config.stack_size = 16384;
 
     esp_err_t err = httpd_start(&server, &config);
@@ -1229,6 +1411,21 @@ esp_err_t web_console_start(void)
         .method = HTTP_POST,
         .handler = auto_bridge_post_handler,
     };
+    const httpd_uri_t save_xiaozhi = {
+        .uri = "/save-xiaozhi",
+        .method = HTTP_POST,
+        .handler = save_xiaozhi_post_handler,
+    };
+    const httpd_uri_t xiaozhi_start = {
+        .uri = "/xiaozhi-start",
+        .method = HTTP_POST,
+        .handler = xiaozhi_start_post_handler,
+    };
+    const httpd_uri_t xiaozhi_stop = {
+        .uri = "/xiaozhi-stop",
+        .method = HTTP_POST,
+        .handler = xiaozhi_stop_post_handler,
+    };
     const httpd_uri_t reboot = {
         .uri = "/reboot",
         .method = HTTP_POST,
@@ -1249,6 +1446,9 @@ esp_err_t web_console_start(void)
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &save_weather));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &clear_weather_token));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &auto_bridge));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &save_xiaozhi));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &xiaozhi_start));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &xiaozhi_stop));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &reboot));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &clear_config));
     ESP_LOGI(TAG, "web console started on http://<device-ip>/");

@@ -86,6 +86,10 @@ const char *asrpro_voice_command_name(asrpro_voice_command_t command)
         return "quiet_on";
     case ASRPRO_VOICE_COMMAND_QUIET_OFF:
         return "quiet_off";
+    case ASRPRO_VOICE_COMMAND_XIAOZHI_START:
+        return "xiaozhi_start";
+    case ASRPRO_VOICE_COMMAND_XIAOZHI_STOP:
+        return "xiaozhi_stop";
     case ASRPRO_VOICE_COMMAND_UNKNOWN:
     default:
         return "unknown";
@@ -117,6 +121,12 @@ static asrpro_voice_command_t command_from_token(const char *token)
     }
     if (strcmp(token, "quiet_off") == 0) {
         return ASRPRO_VOICE_COMMAND_QUIET_OFF;
+    }
+    if (strcmp(token, "xiaozhi_start") == 0 || strcmp(token, "ai_start") == 0) {
+        return ASRPRO_VOICE_COMMAND_XIAOZHI_START;
+    }
+    if (strcmp(token, "xiaozhi_stop") == 0 || strcmp(token, "ai_stop") == 0) {
+        return ASRPRO_VOICE_COMMAND_XIAOZHI_STOP;
     }
     return ASRPRO_VOICE_COMMAND_UNKNOWN;
 }

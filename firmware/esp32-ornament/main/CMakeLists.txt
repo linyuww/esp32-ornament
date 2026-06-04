@@ -11,6 +11,7 @@ idf_component_register(
     "task_audio.c"
     "weather_client.c"
     "web_console.c"
+    "xiaozhi_client.c"
     "display.c"
     "display_core.c"
     "assets/standby_wallpaper_rgb565.c"
@@ -27,9 +28,11 @@ idf_component_register(
     esp_lcd
     esp_netif
     esp_timer
+    esp_websocket_client
     esp_wifi
     json
     lwip
     mdns
     nvs_flash
+    esp-opus
 )
