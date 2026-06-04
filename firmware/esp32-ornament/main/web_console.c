@@ -653,6 +653,7 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         &used,
         "\"><label class=\"k\">Xiaozhi Token</label><input name=\"xiaozhi_token\" maxlength=\"159\" type=\"password\" placeholder=\"Leave blank to keep current token\">"
         "<div class=\"actions\"><button type=\"submit\">Save Xiaozhi</button>"
+        "<button type=\"submit\" formaction=\"/test-xiaozhi\">Test AI</button>"
         "<button class=\"warn\" type=\"submit\" formaction=\"/xiaozhi-start\">Start AI</button>"
         "<button class=\"danger\" type=\"submit\" formaction=\"/xiaozhi-stop\">Stop AI</button></div></form></section>");
     appendf(
@@ -1067,6 +1068,46 @@ static esp_err_t send_xiaozhi_page(httpd_req_t *req, const char *title, const ch
     return send_simple_page(req, title != NULL ? title : "Xiaozhi AI", detail);
 }
 
+static esp_err_t send_xiaozhi_test_page(httpd_req_t *req, const xiaozhi_probe_result_t *result)
+{
+    if (result == NULL) {
+        return send_xiaozhi_page(req, "Xiaozhi Test", "No test result.");
+    }
+
+    char escaped_detail[XIAOZHI_STATUS_TEXT_MAX * 2];
+    char escaped_session_id[XIAOZHI_SESSION_ID_MAX * 2];
+    html_escape(result->detail, escaped_detail, sizeof(escaped_detail));
+    html_escape(result->session_id, escaped_session_id, sizeof(escaped_session_id));
+
+    char html[1536];
+    snprintf(
+        html,
+        sizeof(html),
+        "<!doctype html><html><head><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+        "<style>body{font-family:system-ui;margin:24px;background:#0b1116;color:#edf7fb}a{color:#49d3c8}"
+        ".grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(180px,1fr))}"
+        ".card{padding:14px;border:1px solid #22303c;border-radius:8px;background:#111923}"
+        ".k{font-size:12px;color:#8ea5b5;text-transform:uppercase}.v{font-size:20px;margin-top:6px}</style>"
+        "</head><body><h1>Xiaozhi Test</h1><section class=\"grid\">"
+        "<div class=\"card\"><div class=\"k\">Result</div><div class=\"v\">%s</div></div>"
+        "<div class=\"card\"><div class=\"k\">WebSocket</div><div class=\"v\">%s</div></div>"
+        "<div class=\"card\"><div class=\"k\">Hello</div><div class=\"v\">%s</div></div>"
+        "<div class=\"card\"><div class=\"k\">HTTP Status</div><div class=\"v\">%d</div></div>"
+        "</section><section class=\"grid\" style=\"margin-top:12px\">"
+        "<div class=\"card\"><div class=\"k\">Session ID</div><div class=\"v\">%s</div></div>"
+        "<div class=\"card\"><div class=\"k\">Detail</div><div class=\"v\">%s</div></div>"
+        "</section><p><a href=\"/\">Back</a></p></body></html>",
+        result->err == ESP_OK ? "ok" : esp_err_to_name(result->err),
+        result->websocket_connected ? "connected" : "not connected",
+        result->hello_received ? "received" : "not received",
+        result->http_status,
+        escaped_session_id[0] != '\0' ? escaped_session_id : "--",
+        escaped_detail[0] != '\0' ? escaped_detail : "--");
+
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
+    return httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
+}
+
 static esp_err_t send_weather_saved_page(httpd_req_t *req, const char *title, const char *detail)
 {
     return send_simple_page(req, title != NULL ? title : "Weather", detail);
@@ -1281,6 +1322,30 @@ static esp_err_t xiaozhi_stop_post_handler(httpd_req_t *req)
     return send_xiaozhi_page(req, "Xiaozhi Stop", "AI session stop requested.");
 }
 
+static esp_err_t xiaozhi_test_post_handler(httpd_req_t *req)
+{
+    char body[1024] = {0};
+    char ws_url[ORNAMENT_XIAOZHI_WS_URL_MAX] = {0};
+    char token[ORNAMENT_XIAOZHI_TOKEN_MAX] = {0};
+    if (req->content_len > 0) {
+        if (read_form_body(req, body, sizeof(body)) != ESP_OK) {
+            return ESP_FAIL;
+        }
+        form_value(body, "xiaozhi_ws_url", ws_url, sizeof(ws_url));
+        form_value(body, "xiaozhi_token", token, sizeof(token));
+    }
+
+    xiaozhi_probe_result_t result;
+    esp_err_t err = xiaozhi_client_probe(
+        ws_url[0] != '\0' ? ws_url : NULL,
+        token[0] != '\0' ? token : NULL,
+        &result);
+    if (err != ESP_OK && result.detail[0] == '\0') {
+        strlcpy(result.detail, esp_err_to_name(err), sizeof(result.detail));
+    }
+    return send_xiaozhi_test_page(req, &result);
+}
+
 static esp_err_t auto_bridge_post_handler(httpd_req_t *req)
 {
     if (req->content_len > 0) {
@@ -1357,7 +1422,7 @@ esp_err_t web_console_start(void)
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
     config.lru_purge_enable = true;
-    config.max_uri_handlers = 16;
+    config.max_uri_handlers = 17;
     config.stack_size = 16384;
 
     esp_err_t err = httpd_start(&server, &config);
@@ -1426,6 +1491,11 @@ esp_err_t web_console_start(void)
         .method = HTTP_POST,
         .handler = xiaozhi_stop_post_handler,
     };
+    const httpd_uri_t xiaozhi_test = {
+        .uri = "/test-xiaozhi",
+        .method = HTTP_POST,
+        .handler = xiaozhi_test_post_handler,
+    };
     const httpd_uri_t reboot = {
         .uri = "/reboot",
         .method = HTTP_POST,
@@ -1449,6 +1519,7 @@ esp_err_t web_console_start(void)
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &save_xiaozhi));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &xiaozhi_start));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &xiaozhi_stop));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &xiaozhi_test));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &reboot));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &clear_config));
     ESP_LOGI(TAG, "web console started on http://<device-ip>/");

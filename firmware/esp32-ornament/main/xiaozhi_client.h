@@ -33,7 +33,18 @@ typedef struct {
     uint32_t downlink_frames;
 } xiaozhi_client_snapshot_t;
 
+typedef struct {
+    bool configured;
+    bool websocket_connected;
+    bool hello_received;
+    esp_err_t err;
+    int http_status;
+    char session_id[XIAOZHI_SESSION_ID_MAX];
+    char detail[XIAOZHI_STATUS_TEXT_MAX];
+} xiaozhi_probe_result_t;
+
 esp_err_t xiaozhi_client_init(void);
+esp_err_t xiaozhi_client_probe(const char *ws_url_override, const char *token_override, xiaozhi_probe_result_t *result);
 esp_err_t xiaozhi_client_start_session(void);
 esp_err_t xiaozhi_client_stop_session(void);
 void xiaozhi_client_status_snapshot(xiaozhi_client_snapshot_t *snapshot);

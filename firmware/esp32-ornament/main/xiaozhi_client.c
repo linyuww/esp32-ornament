@@ -48,6 +48,12 @@ static esp_websocket_client_handle_t s_client;
 static xiaozhi_client_snapshot_t s_snapshot;
 static bool s_session_starting;
 
+typedef struct {
+    EventGroupHandle_t events;
+    xiaozhi_probe_result_t *result;
+    esp_websocket_client_handle_t client;
+} xiaozhi_probe_context_t;
+
 const char *xiaozhi_client_state_name(xiaozhi_client_state_t state)
 {
     switch (state) {
@@ -177,17 +183,17 @@ static void get_client_id(char *target, size_t target_size)
     }
 }
 
-static esp_err_t send_text_frame(const char *json)
+static esp_err_t send_text_frame_on_client(esp_websocket_client_handle_t client, const char *json)
 {
-    if (s_client == NULL || json == NULL) {
+    if (client == NULL || json == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
     int len = (int)strlen(json);
-    int sent = esp_websocket_client_send_text(s_client, json, len, pdMS_TO_TICKS(2000));
+    int sent = esp_websocket_client_send_text(client, json, len, pdMS_TO_TICKS(2000));
     return sent == len ? ESP_OK : ESP_FAIL;
 }
 
-static esp_err_t send_hello(void)
+static esp_err_t send_hello_on_client(esp_websocket_client_handle_t client)
 {
     char json[XIAOZHI_JSON_MAX];
     int written = snprintf(
@@ -202,7 +208,17 @@ static esp_err_t send_hello(void)
         return ESP_ERR_NO_MEM;
     }
     ESP_LOGI(TAG, "sending hello");
-    return send_text_frame(json);
+    return send_text_frame_on_client(client, json);
+}
+
+static esp_err_t send_text_frame(const char *json)
+{
+    return send_text_frame_on_client(s_client, json);
+}
+
+static esp_err_t send_hello(void)
+{
+    return send_hello_on_client(s_client);
 }
 
 static esp_err_t send_listen_state(const char *state)
@@ -307,6 +323,46 @@ static void handle_text_message(const char *data, int len)
     free(json);
 }
 
+static void handle_probe_text_message(xiaozhi_probe_context_t *probe, const char *data, int len)
+{
+    if (probe == NULL || probe->result == NULL || data == NULL || len <= 0) {
+        return;
+    }
+
+    char *json = calloc(1, (size_t)len + 1);
+    if (json == NULL) {
+        probe->result->err = ESP_ERR_NO_MEM;
+        strlcpy(probe->result->detail, "json alloc failed", sizeof(probe->result->detail));
+        return;
+    }
+    memcpy(json, data, (size_t)len);
+
+    cJSON *root = cJSON_Parse(json);
+    if (root == NULL) {
+        free(json);
+        return;
+    }
+
+    const cJSON *type = cJSON_GetObjectItem(root, "type");
+    if (cJSON_IsString(type) && type->valuestring != NULL) {
+        if (strcmp(type->valuestring, "hello") == 0) {
+            const cJSON *transport = cJSON_GetObjectItem(root, "transport");
+            if (cJSON_IsString(transport) && strcmp(transport->valuestring, "websocket") == 0) {
+                probe->result->hello_received = true;
+                probe->result->err = ESP_OK;
+                store_text_field(root, "session_id", probe->result->session_id, sizeof(probe->result->session_id));
+                strlcpy(probe->result->detail, "hello ok", sizeof(probe->result->detail));
+                xEventGroupSetBits(probe->events, XIAOZHI_EVENT_HELLO);
+            }
+        } else if (strcmp(type->valuestring, "alert") == 0) {
+            store_text_field(root, "message", probe->result->detail, sizeof(probe->result->detail));
+        }
+    }
+
+    cJSON_Delete(root);
+    free(json);
+}
+
 static void increment_downlink_frames(void)
 {
     if (s_mutex != NULL && xSemaphoreTake(s_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
@@ -377,6 +433,48 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
     }
 }
 
+static void probe_websocket_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
+{
+    (void)base;
+    xiaozhi_probe_context_t *probe = (xiaozhi_probe_context_t *)handler_args;
+    esp_websocket_event_data_t *data = (esp_websocket_event_data_t *)event_data;
+    if (probe == NULL || probe->result == NULL) {
+        return;
+    }
+
+    switch (event_id) {
+    case WEBSOCKET_EVENT_CONNECTED:
+        probe->result->websocket_connected = true;
+        probe->result->http_status = data->error_handle.esp_ws_handshake_status_code;
+        if (send_hello_on_client(probe->client) != ESP_OK) {
+            probe->result->err = ESP_FAIL;
+            strlcpy(probe->result->detail, "hello send failed", sizeof(probe->result->detail));
+            xEventGroupSetBits(probe->events, XIAOZHI_EVENT_ERROR);
+        }
+        break;
+    case WEBSOCKET_EVENT_DATA:
+        probe->result->http_status = data->error_handle.esp_ws_handshake_status_code;
+        if ((data->op_code == 0x1 || data->op_code == 0x0) && data->payload_offset == 0 && data->fin) {
+            handle_probe_text_message(probe, data->data_ptr, data->data_len);
+        }
+        break;
+    case WEBSOCKET_EVENT_ERROR:
+        probe->result->http_status = data->error_handle.esp_ws_handshake_status_code;
+        probe->result->err = ESP_FAIL;
+        if (probe->result->detail[0] == '\0') {
+            strlcpy(probe->result->detail, "websocket error", sizeof(probe->result->detail));
+        }
+        xEventGroupSetBits(probe->events, XIAOZHI_EVENT_ERROR);
+        break;
+    case WEBSOCKET_EVENT_DISCONNECTED:
+    case WEBSOCKET_EVENT_CLOSED:
+        xEventGroupSetBits(probe->events, XIAOZHI_EVENT_STOP);
+        break;
+    default:
+        break;
+    }
+}
+
 static esp_err_t build_headers(const ornament_settings_t *settings, char *headers, size_t headers_size)
 {
     char mac[24] = {0};
@@ -410,6 +508,23 @@ static esp_err_t build_headers(const ornament_settings_t *settings, char *header
             client_id);
     }
     return written > 0 && written < (int)headers_size ? ESP_OK : ESP_ERR_NO_MEM;
+}
+
+static esp_err_t build_headers_for_values(
+    const ornament_settings_t *settings,
+    const char *token_override,
+    char *headers,
+    size_t headers_size)
+{
+    ornament_settings_t temp = {0};
+    if (settings != NULL) {
+        temp = *settings;
+    }
+    if (token_override != NULL && token_override[0] != '\0') {
+        strlcpy(temp.xiaozhi_token, token_override, sizeof(temp.xiaozhi_token));
+        temp.has_xiaozhi_token = true;
+    }
+    return build_headers(&temp, headers, headers_size);
 }
 
 static esp_err_t run_capture_loop(OpusEncoder *encoder)
@@ -624,6 +739,146 @@ esp_err_t xiaozhi_client_init(void)
     return ESP_OK;
 }
 
+esp_err_t xiaozhi_client_probe(const char *ws_url_override, const char *token_override, xiaozhi_probe_result_t *result)
+{
+    if (result == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    memset(result, 0, sizeof(*result));
+    result->err = ESP_ERR_INVALID_STATE;
+    result->http_status = -1;
+
+    ESP_RETURN_ON_ERROR(xiaozhi_client_init(), TAG, "init failed");
+
+    if (s_mutex == NULL) {
+        result->err = ESP_ERR_INVALID_STATE;
+        strlcpy(result->detail, "client not initialized", sizeof(result->detail));
+        return result->err;
+    }
+
+    if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        result->err = ESP_ERR_TIMEOUT;
+        strlcpy(result->detail, "client busy", sizeof(result->detail));
+        return result->err;
+    }
+    bool session_busy = s_session_task != NULL || s_session_starting || s_client != NULL;
+    xSemaphoreGive(s_mutex);
+    if (session_busy) {
+        result->err = ESP_ERR_INVALID_STATE;
+        strlcpy(result->detail, "AI session running", sizeof(result->detail));
+        return result->err;
+    }
+
+    ornament_settings_t settings;
+    esp_err_t err = settings_load(&settings);
+    if (err != ESP_OK) {
+        result->err = err;
+        strlcpy(result->detail, "settings load failed", sizeof(result->detail));
+        return err;
+    }
+
+    const char *ws_url = (ws_url_override != NULL && ws_url_override[0] != '\0') ?
+        ws_url_override : settings_xiaozhi_ws_url_or_default(&settings);
+    const char *token = (token_override != NULL && token_override[0] != '\0') ?
+        token_override : settings_xiaozhi_token_or_default(&settings);
+    result->configured = ws_url[0] != '\0';
+    if (!result->configured) {
+        result->err = ESP_ERR_INVALID_ARG;
+        strlcpy(result->detail, "missing websocket url", sizeof(result->detail));
+        return result->err;
+    }
+    if (!is_supported_frame_ms(CONFIG_ORNAMENT_XIAOZHI_FRAME_MS)) {
+        result->err = ESP_ERR_NOT_SUPPORTED;
+        strlcpy(result->detail, "unsupported opus frame ms", sizeof(result->detail));
+        return result->err;
+    }
+
+    char headers[XIAOZHI_HEADER_MAX];
+    err = build_headers_for_values(&settings, token, headers, sizeof(headers));
+    if (err != ESP_OK) {
+        result->err = err;
+        strlcpy(result->detail, "header build failed", sizeof(result->detail));
+        return err;
+    }
+
+    EventGroupHandle_t probe_events = xEventGroupCreate();
+    if (probe_events == NULL) {
+        result->err = ESP_ERR_NO_MEM;
+        strlcpy(result->detail, "event alloc failed", sizeof(result->detail));
+        return result->err;
+    }
+
+    esp_websocket_client_config_t cfg = {
+        .uri = ws_url,
+        .headers = headers,
+        .buffer_size = CONFIG_ORNAMENT_XIAOZHI_WS_BUFFER_BYTES,
+        .task_stack = 8192,
+        .task_prio = 5,
+        .network_timeout_ms = CONFIG_ORNAMENT_XIAOZHI_CONNECT_TIMEOUT_MS,
+        .disable_auto_reconnect = true,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+    };
+
+    esp_websocket_client_handle_t probe_client = esp_websocket_client_init(&cfg);
+    if (probe_client == NULL) {
+        vEventGroupDelete(probe_events);
+        result->err = ESP_FAIL;
+        strlcpy(result->detail, "websocket init failed", sizeof(result->detail));
+        return result->err;
+    }
+
+    xiaozhi_probe_context_t probe = {
+        .events = probe_events,
+        .result = result,
+        .client = probe_client,
+    };
+
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_websocket_register_events(probe_client, WEBSOCKET_EVENT_ANY, probe_websocket_event_handler, &probe));
+
+    err = esp_websocket_client_start(probe_client);
+    if (err != ESP_OK) {
+        result->err = err;
+        strlcpy(result->detail, "websocket start failed", sizeof(result->detail));
+        goto cleanup;
+    }
+
+    EventBits_t bits = xEventGroupWaitBits(
+        probe_events,
+        XIAOZHI_EVENT_HELLO | XIAOZHI_EVENT_ERROR | XIAOZHI_EVENT_STOP,
+        pdFALSE,
+        pdFALSE,
+        pdMS_TO_TICKS(CONFIG_ORNAMENT_XIAOZHI_CONNECT_TIMEOUT_MS));
+    if (bits & XIAOZHI_EVENT_HELLO) {
+        result->err = ESP_OK;
+    } else if (bits & XIAOZHI_EVENT_ERROR) {
+        if (result->detail[0] == '\0') {
+            strlcpy(result->detail, "websocket error", sizeof(result->detail));
+        }
+        if (result->err == ESP_ERR_INVALID_STATE) {
+            result->err = ESP_FAIL;
+        }
+    } else if (bits & XIAOZHI_EVENT_STOP) {
+        result->err = ESP_FAIL;
+        if (result->detail[0] == '\0') {
+            strlcpy(result->detail, "connection closed", sizeof(result->detail));
+        }
+    } else {
+        result->err = ESP_ERR_TIMEOUT;
+        if (result->detail[0] == '\0') {
+            strlcpy(result->detail, "hello timeout", sizeof(result->detail));
+        }
+    }
+
+cleanup:
+    if (esp_websocket_client_is_connected(probe_client)) {
+        (void)esp_websocket_client_close(probe_client, pdMS_TO_TICKS(1000));
+    }
+    (void)esp_websocket_unregister_events(probe_client, WEBSOCKET_EVENT_ANY, probe_websocket_event_handler);
+    (void)esp_websocket_client_destroy(probe_client);
+    vEventGroupDelete(probe_events);
+    return result->err;
+}
+
 esp_err_t xiaozhi_client_start_session(void)
 {
     ESP_RETURN_ON_ERROR(xiaozhi_client_init(), TAG, "init failed");
@@ -680,6 +935,19 @@ esp_err_t xiaozhi_client_start_session(void)
 
 esp_err_t xiaozhi_client_stop_session(void)
 {
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
+esp_err_t xiaozhi_client_probe(const char *ws_url_override, const char *token_override, xiaozhi_probe_result_t *result)
+{
+    (void)ws_url_override;
+    (void)token_override;
+    if (result != NULL) {
+        memset(result, 0, sizeof(*result));
+        result->err = ESP_ERR_NOT_SUPPORTED;
+        result->http_status = -1;
+        strlcpy(result->detail, "disabled", sizeof(result->detail));
+    }
     return ESP_ERR_NOT_SUPPORTED;
 }
 
