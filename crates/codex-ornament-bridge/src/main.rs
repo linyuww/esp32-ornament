@@ -432,9 +432,14 @@ fn handle_connection(
             }
             let event = normalize_event(&payload);
             match dispatch_task_event(&task_events, event.clone()) {
-                Ok(TaskDispatchResult::Applied | TaskDispatchResult::Filtered) => {
+                Ok(TaskDispatchResult::Applied) => {
                     write_json(&mut stream, 200, &json!({"ok": true, "event": event}))
                 }
+                Ok(TaskDispatchResult::Filtered) => write_json(
+                    &mut stream,
+                    200,
+                    &json!({"ok": true, "filtered": true, "event": event}),
+                ),
                 Ok(TaskDispatchResult::Queued) => write_json(
                     &mut stream,
                     202,
@@ -618,6 +623,11 @@ fn consume_task_event(
     config: &BridgeConfig,
     event: TaskEvent,
 ) -> TaskDispatchResult {
+    if event_is_non_task_lifecycle_hook(&event) {
+        log_filtered_task_event("non-task lifecycle hook", &event);
+        return TaskDispatchResult::Filtered;
+    }
+
     if !event_in_scope(&event, config) {
         return TaskDispatchResult::Filtered;
     }
@@ -694,7 +704,7 @@ fn task_snapshot(state: &SharedBridgeState, config: &BridgeConfig) -> TaskSnapsh
 }
 
 fn apply_task_event(state: &mut BridgeState, event: TaskEvent) {
-    if event_is_empty_lifecycle_hook(&event) {
+    if event_is_non_task_lifecycle_hook(&event) {
         return;
     }
 
@@ -730,12 +740,46 @@ fn apply_task_event(state: &mut BridgeState, event: TaskEvent) {
     }
 }
 
-fn event_is_empty_lifecycle_hook(event: &TaskEvent) -> bool {
+fn event_is_non_task_lifecycle_hook(event: &TaskEvent) -> bool {
+    event_is_empty_codex_start_hook(event)
+        || event_is_control_payload_lifecycle_hook(event)
+        || event_is_codex_desktop_control_hook(event)
+}
+
+fn event_is_empty_codex_start_hook(event: &TaskEvent) -> bool {
     event.kind == "UserPromptSubmit"
-        && ((done_source(event) == DoneSource::Codex
-            && event.turn_id.is_none()
-            && event.message == event.kind)
-            || hook_payload_text_is_control_only(&event.message))
+        && done_source(event) == DoneSource::Codex
+        && event.turn_id.is_none()
+        && event.message == event.kind
+}
+
+fn event_is_control_payload_lifecycle_hook(event: &TaskEvent) -> bool {
+    event_is_lifecycle_hook(event)
+        && done_source(event) == DoneSource::Codex
+        && hook_payload_text_is_control_only(&event.message)
+}
+
+fn event_is_codex_desktop_control_hook(event: &TaskEvent) -> bool {
+    event_is_lifecycle_hook(event)
+        && done_source(event) == DoneSource::Codex
+        && event
+            .cwd
+            .as_deref()
+            .map(cwd_is_codex_desktop_app)
+            .unwrap_or(false)
+        && (event.message == event.kind || hook_payload_text_is_control_only(&event.message))
+}
+
+fn event_is_lifecycle_hook(event: &TaskEvent) -> bool {
+    matches!(
+        event.kind.as_str(),
+        "UserPromptSubmit" | "Stop" | "agent-turn-complete"
+    )
+}
+
+fn cwd_is_codex_desktop_app(cwd: &str) -> bool {
+    let normalized = cwd.replace('/', "\\").to_ascii_lowercase();
+    normalized.contains("\\windowsapps\\openai.codex_") && normalized.ends_with("\\app")
 }
 
 fn hook_payload_text_is_control_only(text: &str) -> bool {
@@ -743,6 +787,18 @@ fn hook_payload_text_is_control_only(text: &str) -> bool {
         .ok()
         .map(|payload| hook_payload_is_control_only(&payload))
         .unwrap_or(false)
+}
+
+fn log_filtered_task_event(reason: &str, event: &TaskEvent) {
+    eprintln!(
+        "task event filtered: reason={reason}; kind={}; status={}; session_id={}; turn_id={}; cwd={}; message={}",
+        event.kind,
+        event.status,
+        event.session_id.as_deref().unwrap_or("-"),
+        event.turn_id.as_deref().unwrap_or("-"),
+        event.cwd.as_deref().unwrap_or("-"),
+        clip(&event.message, 120),
+    );
 }
 
 fn event_has_task_identity(event: &TaskEvent) -> bool {
@@ -3864,6 +3920,99 @@ mod tests {
     }
 
     #[test]
+    fn control_only_stop_payload_is_not_recorded_as_done() {
+        let mut state = BridgeState::default();
+
+        apply_task_event(
+            &mut state,
+            normalize_event(&json!({
+                "hook_event_name": "Stop",
+                "session_id": "session-1",
+                "turn_id": "turn-1",
+                "message": "{\"exclude\":[]}"
+            })),
+        );
+
+        assert_eq!(state.done_seq, 0);
+        assert_eq!(state.done_tasks.len(), 0);
+        assert_eq!(state.unmatched_stops.len(), 0);
+        assert!(state.task.is_none());
+    }
+
+    #[test]
+    fn codex_desktop_history_control_lifecycle_does_not_flash_task_state() {
+        let mut state = BridgeState::default();
+        let desktop_cwd =
+            "C:\\Program Files\\WindowsApps\\OpenAI.Codex_26.601.2237.0_x64__2p2nqsd0c76g0\\app";
+
+        apply_task_event(
+            &mut state,
+            normalize_event(&json!({
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "history-session",
+                "turn_id": "history-turn",
+                "cwd": desktop_cwd,
+                "model": "gpt-5.4-mini",
+                "message": "{\"exclude\":[]}"
+            })),
+        );
+        apply_task_event(
+            &mut state,
+            normalize_event(&json!({
+                "hook_event_name": "Stop",
+                "session_id": "history-session",
+                "turn_id": "history-turn",
+                "cwd": desktop_cwd,
+                "model": "gpt-5.4-mini",
+                "message": "{\"exclude\":[]}"
+            })),
+        );
+
+        assert!(state.active_tasks.is_empty());
+        assert_eq!(state.done_seq, 0);
+        assert!(state.done_tasks.is_empty());
+        assert!(state.unmatched_stops.is_empty());
+        assert!(state.task.is_none());
+    }
+
+    #[test]
+    fn real_workspace_lifecycle_with_same_identity_still_runs_and_completes() {
+        let mut state = BridgeState::default();
+
+        apply_task_event(
+            &mut state,
+            normalize_event(&json!({
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "session-1",
+                "turn_id": "turn-1",
+                "cwd": "D:\\Desktop\\codex\\codex-quota-widget",
+                "prompt": "build the bridge"
+            })),
+        );
+        apply_task_event(
+            &mut state,
+            normalize_event(&json!({
+                "hook_event_name": "Stop",
+                "session_id": "session-1",
+                "turn_id": "turn-1",
+                "cwd": "D:\\Desktop\\codex\\codex-quota-widget",
+                "message": "build complete"
+            })),
+        );
+
+        assert!(state.active_tasks.is_empty());
+        assert_eq!(state.done_seq, 1);
+        assert_eq!(
+            state.done_tasks.back().map(|event| event.message.as_str()),
+            Some("build complete")
+        );
+        assert_eq!(
+            state.task.as_ref().map(|event| event.status.as_str()),
+            Some("done")
+        );
+    }
+
+    #[test]
     fn stop_with_no_active_task_does_not_emit_done() {
         let mut state = BridgeState::default();
 
@@ -5530,6 +5679,46 @@ mod tests {
     }
 
     #[test]
+    fn task_consumer_filters_codex_desktop_history_lifecycle_events() {
+        let state = Arc::new(Mutex::new(BridgeState::default()));
+        let config = test_config(None);
+        let (sender, receiver) = mpsc::sync_channel(TASK_EVENT_QUEUE_CAPACITY);
+        spawn_task_event_consumer(Arc::clone(&state), config, receiver);
+        let desktop_cwd =
+            "C:\\Program Files\\WindowsApps\\OpenAI.Codex_26.601.2237.0_x64__2p2nqsd0c76g0\\app";
+
+        let running = normalize_event(&json!({
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "history-session",
+            "turn_id": "history-turn",
+            "cwd": desktop_cwd,
+            "message": "{\"exclude\":[]}"
+        }));
+        let done = normalize_event(&json!({
+            "hook_event_name": "Stop",
+            "session_id": "history-session",
+            "turn_id": "history-turn",
+            "cwd": desktop_cwd,
+            "message": "{\"exclude\":[]}"
+        }));
+
+        assert_eq!(
+            dispatch_task_event(&sender, running),
+            Ok(TaskDispatchResult::Filtered)
+        );
+        assert_eq!(
+            dispatch_task_event(&sender, done),
+            Ok(TaskDispatchResult::Filtered)
+        );
+
+        let state = state.lock().unwrap();
+        assert!(state.active_tasks.is_empty());
+        assert!(state.done_tasks.is_empty());
+        assert!(state.unmatched_stops.is_empty());
+        assert!(state.task.is_none());
+    }
+
+    #[test]
     fn dispatch_reports_full_queue_without_blocking() {
         let (sender, _receiver) = mpsc::sync_channel(1);
         let event = normalize_event(&json!({"hook_event_name": "UserPromptSubmit"}));
@@ -5586,7 +5775,11 @@ mod tests {
         })
         .join();
 
-        let event = normalize_event(&json!({"hook_event_name": "UserPromptSubmit"}));
+        let event = normalize_event(&json!({
+            "hook_event_name": "UserPromptSubmit",
+            "turn_id": "turn-1",
+            "prompt": "real work"
+        }));
 
         assert_eq!(
             consume_task_event(&state, &test_config(None), event),
