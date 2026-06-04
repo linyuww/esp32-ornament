@@ -1,4 +1,4 @@
-use chrono::{DateTime, FixedOffset, Local};
+use chrono::{DateTime, FixedOffset, Local, Timelike};
 use quota_core::{
     get_quota_snapshot, read_state, state_path, write_state, QuotaSnapshot, SnapshotStatus,
 };
@@ -26,7 +26,15 @@ const TASK_EVENT_QUEUE_CAPACITY: usize = 64;
 const TASK_EVENT_ACK_TIMEOUT: Duration = Duration::from_millis(750);
 const QUOTA_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const QUOTA_CACHE_TTL: Duration = QUOTA_REFRESH_INTERVAL;
-const WEATHER_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
+const DEFAULT_WEATHER_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
+const CAIYUN_DAILY_CALL_BUDGET: u32 = 10_000;
+const CAIYUN_NIGHT_END_HOUR: u32 = 6;
+const CAIYUN_NIGHT_SECONDS: u64 = 6 * 60 * 60;
+const CAIYUN_DAY_SECONDS: u64 = 18 * 60 * 60;
+const CAIYUN_NIGHT_REFRESH_SECONDS: u64 = 30 * 60;
+const CAIYUN_NIGHT_CALL_BUDGET: u32 = (CAIYUN_NIGHT_SECONDS / CAIYUN_NIGHT_REFRESH_SECONDS) as u32;
+const CAIYUN_DAY_CALL_BUDGET: u32 = CAIYUN_DAILY_CALL_BUDGET - CAIYUN_NIGHT_CALL_BUDGET;
+const CAIYUN_NIGHT_REFRESH_INTERVAL: Duration = Duration::from_secs(CAIYUN_NIGHT_REFRESH_SECONDS);
 const WEATHER_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 const ACTIVE_RECOVERY_SCAN_TTL: Duration = Duration::from_secs(5);
 const DEFAULT_WEATHER_LATITUDE: f64 = 39.99540087499999;
@@ -61,6 +69,7 @@ struct BridgeState {
     quota_refreshing: bool,
     weather: Option<CachedWeather>,
     weather_refreshing: bool,
+    weather_last_attempt: Option<Instant>,
     active_recovery: Option<CachedActiveRecovery>,
 }
 
@@ -2432,9 +2441,10 @@ fn cached_or_refresh_weather(
     state: &Arc<Mutex<BridgeState>>,
     config: &BridgeConfig,
 ) -> WeatherSnapshot {
+    let cache_ttl = weather_refresh_interval(config);
     if let Ok(state) = state.lock() {
         if let Some(cache) = state.weather.as_ref() {
-            if cache.fetched_at.elapsed() < WEATHER_CACHE_TTL {
+            if cache.fetched_at.elapsed() < cache_ttl {
                 return cache.snapshot.clone();
             }
         }
@@ -2455,10 +2465,11 @@ fn maybe_spawn_weather_refresh(state: SharedBridgeState, config: BridgeConfig) {
         let Ok(mut state) = state.lock() else {
             return;
         };
-        if state.weather_refreshing {
+        if !weather_refresh_is_due(&state, &config) {
             false
         } else {
             state.weather_refreshing = true;
+            state.weather_last_attempt = Some(Instant::now());
             true
         }
     };
@@ -2484,6 +2495,55 @@ fn maybe_spawn_weather_refresh(state: SharedBridgeState, config: BridgeConfig) {
         }
         state.weather_refreshing = false;
     });
+}
+
+fn weather_refresh_is_due(state: &BridgeState, config: &BridgeConfig) -> bool {
+    if state.weather_refreshing {
+        return false;
+    }
+
+    let interval = weather_refresh_interval(config);
+    if let Some(cache) = state.weather.as_ref() {
+        if cache.fetched_at.elapsed() < interval {
+            return false;
+        }
+    }
+    if let Some(last_attempt) = state.weather_last_attempt {
+        if last_attempt.elapsed() < interval {
+            return false;
+        }
+    }
+    true
+}
+
+fn weather_refresh_interval(config: &BridgeConfig) -> Duration {
+    if caiyun_budget_applies(config) {
+        return caiyun_refresh_interval_for_hour(Local::now().hour());
+    }
+    DEFAULT_WEATHER_CACHE_TTL
+}
+
+fn caiyun_budget_applies(config: &BridgeConfig) -> bool {
+    config.caiyun_token.is_some()
+        && matches!(
+            config.weather_provider,
+            WeatherProvider::Auto | WeatherProvider::Caiyun
+        )
+}
+
+fn caiyun_refresh_interval_for_hour(hour: u32) -> Duration {
+    if hour < CAIYUN_NIGHT_END_HOUR {
+        return CAIYUN_NIGHT_REFRESH_INTERVAL;
+    }
+
+    Duration::from_nanos(ceil_div_u128(
+        u128::from(CAIYUN_DAY_SECONDS) * 1_000_000_000,
+        u128::from(CAIYUN_DAY_CALL_BUDGET),
+    ) as u64)
+}
+
+fn ceil_div_u128(numerator: u128, denominator: u128) -> u128 {
+    (numerator + denominator - 1) / denominator
 }
 
 fn fetch_weather_snapshot(config: &BridgeConfig) -> io::Result<WeatherSnapshot> {
@@ -3134,6 +3194,57 @@ mod tests {
         }
 
         assert_eq!(cached_or_refresh_weather(&state, &config), cached);
+    }
+
+    #[test]
+    fn caiyun_budget_refresh_interval_allocates_daily_calls() {
+        assert_eq!(CAIYUN_NIGHT_CALL_BUDGET, 12);
+        assert_eq!(CAIYUN_DAY_CALL_BUDGET, 9_988);
+        let day_interval = Duration::from_nanos(
+            ((u128::from(CAIYUN_DAY_SECONDS) * 1_000_000_000 + u128::from(CAIYUN_DAY_CALL_BUDGET)
+                - 1)
+                / u128::from(CAIYUN_DAY_CALL_BUDGET)) as u64,
+        );
+        assert_eq!(
+            caiyun_refresh_interval_for_hour(0),
+            Duration::from_secs(30 * 60)
+        );
+        assert_eq!(
+            caiyun_refresh_interval_for_hour(5),
+            Duration::from_secs(30 * 60)
+        );
+        assert_eq!(caiyun_refresh_interval_for_hour(6), day_interval);
+        assert_eq!(caiyun_refresh_interval_for_hour(23), day_interval);
+        assert_eq!(day_interval.as_secs(), 6);
+        assert_eq!(day_interval.subsec_millis(), 487);
+    }
+
+    #[test]
+    fn caiyun_budget_only_applies_when_caiyun_can_be_called() {
+        let mut config = test_config(None);
+        assert!(!caiyun_budget_applies(&config));
+
+        config.caiyun_token = Some("token-123".to_string());
+        assert!(caiyun_budget_applies(&config));
+
+        config.weather_provider = WeatherProvider::QWeather;
+        assert!(!caiyun_budget_applies(&config));
+    }
+
+    #[test]
+    fn weather_refresh_due_throttles_failed_attempts() {
+        let mut config = test_config(None);
+        config.caiyun_token = Some("token-123".to_string());
+
+        let mut state = BridgeState {
+            weather_last_attempt: Some(Instant::now()),
+            ..BridgeState::default()
+        };
+        assert!(!weather_refresh_is_due(&state, &config));
+
+        state.weather_last_attempt =
+            Some(Instant::now() - CAIYUN_NIGHT_REFRESH_INTERVAL - Duration::from_millis(1));
+        assert!(weather_refresh_is_due(&state, &config));
     }
 
     #[test]

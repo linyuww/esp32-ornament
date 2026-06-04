@@ -44,6 +44,13 @@ $env:CODEX_ORNAMENT_CAIYUN_TOKEN = "replace-with-your-token"
 
 The bridge keeps the token out of committed files and builds the URL at runtime.
 
+When Caiyun can be called, the bridge budgets the 10,000 daily calls as:
+
+- 00:00-06:00: refresh every 30 minutes, using 12 calls.
+- 06:00-24:00: use the remaining 9,988 calls evenly, with a minimum interval of about 6.488 seconds.
+
+The same minimum interval also throttles failed Caiyun attempts, so repeated ESP `/state` polling does not burn through the daily budget.
+
 ## Open-Meteo Fallback
 
 Open-Meteo does not need a key. It is kept as the default/fallback provider:
