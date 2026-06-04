@@ -17,13 +17,20 @@
 #include "nvs_flash.h"
 
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 static const char *TAG = "ornament";
 
 #define VOICE_PAGE_HOLD_MS 12000
 #define VOICE_STATUS_TEXT_MAX 40
+#define ORNAMENT_MIN_VALID_EPOCH 1577836800LL
+
+#ifndef CONFIG_ORNAMENT_EXPIRED_QUOTA_RETRY_MS
+#define CONFIG_ORNAMENT_EXPIRED_QUOTA_RETRY_MS 30000
+#endif
 
 typedef struct {
     ornament_state_t state;
@@ -86,6 +93,220 @@ static bool should_show_standby_clock(const ornament_state_t *state, TickType_t 
 static uint32_t ticks_to_ms(TickType_t ticks)
 {
     return (uint32_t)(ticks * portTICK_PERIOD_MS);
+}
+
+static bool parse_ndigits(const char *text, int count, int *value)
+{
+    if (text == NULL || value == NULL || count <= 0) {
+        return false;
+    }
+
+    int parsed = 0;
+    for (int i = 0; i < count; i++) {
+        char c = text[i];
+        if (c < '0' || c > '9') {
+            return false;
+        }
+        parsed = parsed * 10 + (c - '0');
+    }
+
+    *value = parsed;
+    return true;
+}
+
+static int64_t days_from_civil(int year, unsigned month, unsigned day)
+{
+    year -= month <= 2U;
+    const int era = (year >= 0 ? year : year - 399) / 400;
+    const unsigned yoe = (unsigned)(year - era * 400);
+    const int shifted_month = (int)month + (month > 2U ? -3 : 9);
+    const unsigned doy = (153U * (unsigned)shifted_month + 2U) / 5U + day - 1U;
+    const unsigned doe = yoe * 365U + yoe / 4U - yoe / 100U + doy;
+    return (int64_t)era * 146097LL + (int64_t)doe - 719468LL;
+}
+
+static bool valid_timestamp_parts(int year, int month, int day, int hour, int minute, int second)
+{
+    return year >= 1970 &&
+           month >= 1 && month <= 12 &&
+           day >= 1 && day <= 31 &&
+           hour >= 0 && hour <= 23 &&
+           minute >= 0 && minute <= 59 &&
+           second >= 0 && second <= 60;
+}
+
+static bool parse_iso8601_epoch(const char *timestamp, time_t *out)
+{
+    if (timestamp == NULL || out == NULL || strlen(timestamp) < 16 ||
+        timestamp[4] != '-' || timestamp[7] != '-' ||
+        (timestamp[10] != 'T' && timestamp[10] != ' ') ||
+        timestamp[13] != ':') {
+        return false;
+    }
+
+    int year = 0;
+    int month = 0;
+    int day = 0;
+    int hour = 0;
+    int minute = 0;
+    int second = 0;
+    if (!parse_ndigits(timestamp, 4, &year) ||
+        !parse_ndigits(timestamp + 5, 2, &month) ||
+        !parse_ndigits(timestamp + 8, 2, &day) ||
+        !parse_ndigits(timestamp + 11, 2, &hour) ||
+        !parse_ndigits(timestamp + 14, 2, &minute)) {
+        return false;
+    }
+
+    const char *cursor = timestamp + 16;
+    if (*cursor == ':') {
+        if (!parse_ndigits(cursor + 1, 2, &second)) {
+            return false;
+        }
+        cursor += 3;
+    }
+    if (!valid_timestamp_parts(year, month, day, hour, minute, second)) {
+        return false;
+    }
+
+    while (*cursor == '.') {
+        cursor++;
+        while (*cursor >= '0' && *cursor <= '9') {
+            cursor++;
+        }
+    }
+
+    if (*cursor == '\0') {
+        struct tm local = {
+            .tm_year = year - 1900,
+            .tm_mon = month - 1,
+            .tm_mday = day,
+            .tm_hour = hour,
+            .tm_min = minute,
+            .tm_sec = second,
+            .tm_isdst = -1,
+        };
+        time_t local_epoch = mktime(&local);
+        if (local_epoch == (time_t)-1) {
+            return false;
+        }
+        *out = local_epoch;
+        return true;
+    }
+
+    int offset_seconds = 0;
+    if (*cursor == 'Z' || *cursor == 'z') {
+        offset_seconds = 0;
+    } else if (*cursor == '+' || *cursor == '-') {
+        int offset_hour = 0;
+        int offset_minute = 0;
+        int sign = *cursor == '+' ? 1 : -1;
+        cursor++;
+        if (!parse_ndigits(cursor, 2, &offset_hour)) {
+            return false;
+        }
+        cursor += 2;
+        if (*cursor == ':') {
+            cursor++;
+        }
+        if (!parse_ndigits(cursor, 2, &offset_minute) ||
+            offset_hour > 23 || offset_minute > 59) {
+            return false;
+        }
+        offset_seconds = sign * (offset_hour * 3600 + offset_minute * 60);
+    } else {
+        return false;
+    }
+
+    int64_t epoch = days_from_civil(year, (unsigned)month, (unsigned)day) * 86400LL +
+                    (int64_t)hour * 3600LL +
+                    (int64_t)minute * 60LL +
+                    (int64_t)second -
+                    (int64_t)offset_seconds;
+    *out = (time_t)epoch;
+    return true;
+}
+
+static bool current_real_time(time_t *now)
+{
+    time_t current = time(NULL);
+    if (current < (time_t)ORNAMENT_MIN_VALID_EPOCH) {
+        return false;
+    }
+    if (now != NULL) {
+        *now = current;
+    }
+    return true;
+}
+
+static bool reset_timestamp_has_passed(const char *timestamp, time_t now)
+{
+    time_t reset_at = 0;
+    return parse_iso8601_epoch(timestamp, &reset_at) && reset_at <= now;
+}
+
+static bool reset_timestamp_is_current(const char *timestamp, time_t now)
+{
+    time_t reset_at = 0;
+    return parse_iso8601_epoch(timestamp, &reset_at) && reset_at > now;
+}
+
+static bool quota_reset_refresh_needed(const ornament_state_t *state)
+{
+    if (state == NULL || !state->has_quota) {
+        return false;
+    }
+
+    time_t now = 0;
+    if (!current_real_time(&now)) {
+        return false;
+    }
+
+    return reset_timestamp_has_passed(state->primary_resets_at, now) ||
+           reset_timestamp_has_passed(state->secondary_resets_at, now);
+}
+
+static bool quota_reset_times_current(const ornament_state_t *state)
+{
+    if (state == NULL || !state->has_quota) {
+        return false;
+    }
+
+    time_t now = 0;
+    if (!current_real_time(&now)) {
+        return false;
+    }
+
+    return reset_timestamp_is_current(state->primary_resets_at, now) &&
+           reset_timestamp_is_current(state->secondary_resets_at, now);
+}
+
+static void hide_expired_quota_reset_times(ornament_state_t *state)
+{
+    if (state == NULL || !state->has_quota) {
+        return;
+    }
+
+    time_t now = 0;
+    if (!current_real_time(&now)) {
+        return;
+    }
+
+    if (reset_timestamp_has_passed(state->primary_resets_at, now)) {
+        state->primary_resets_at[0] = '\0';
+    }
+    if (reset_timestamp_has_passed(state->secondary_resets_at, now)) {
+        state->secondary_resets_at[0] = '\0';
+    }
+}
+
+static TickType_t expired_quota_retry_ticks(void)
+{
+    int retry_ms = CONFIG_ORNAMENT_EXPIRED_QUOTA_RETRY_MS;
+    if (retry_ms <= 0) {
+        retry_ms = 30000;
+    }
+    return pdMS_TO_TICKS(retry_ms);
 }
 
 static void update_local_animation(
@@ -499,6 +720,7 @@ static void poll_task(void *arg)
     int consecutive_fetch_failures = 0;
     bool have_seen_state = false;
     bool have_last_done_tick = false;
+    bool quota_refresh_pending = false;
     TickType_t next_auto_match = 0;
 
     while (true) {
@@ -521,9 +743,24 @@ static void poll_task(void *arg)
             voice_control_set_result("REFRESHING");
         }
 
+        if (!quota_refresh_pending && quota_reset_refresh_needed(&fetched_state)) {
+            quota_refresh_pending = true;
+            next_bridge_poll = now;
+        }
+
         if (refresh_requested || now >= next_bridge_poll) {
+            bool was_refresh_pending = quota_refresh_pending;
             next_bridge_poll = now + pdMS_TO_TICKS(CONFIG_ORNAMENT_POLL_INTERVAL_MS);
             esp_err_t err = bridge_client_fetch_state(&fetched_state);
+            if (quota_reset_refresh_needed(&fetched_state)) {
+                quota_refresh_pending = true;
+            } else if (err == ESP_OK && quota_refresh_pending && quota_reset_times_current(&fetched_state)) {
+                quota_refresh_pending = false;
+            }
+            if (quota_refresh_pending) {
+                hide_expired_quota_reset_times(&fetched_state);
+                next_bridge_poll = now + expired_quota_retry_ticks();
+            }
             web_console_bridge_debug_t debug = {
                 .last_fetch_error = err,
                 .last_auto_match_error = ESP_ERR_INVALID_STATE,
@@ -589,6 +826,9 @@ static void poll_task(void *arg)
 
                 web_console_set_bridge_debug(&debug);
                 fetched_state.bridge_offline = bridge_is_offline(consecutive_fetch_failures, err);
+                if (was_refresh_pending || quota_refresh_pending) {
+                    hide_expired_quota_reset_times(&fetched_state);
+                }
                 if (have_seen_state &&
                     consecutive_fetch_failures < CONFIG_ORNAMENT_BRIDGE_OFFLINE_FAILURES &&
                     shared_state_has_displayable_snapshot()) {

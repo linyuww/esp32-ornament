@@ -77,6 +77,14 @@ config ORNAMENT_POLL_INTERVAL_MS
     default 3000
     range 1000 60000
 
+config ORNAMENT_EXPIRED_QUOTA_RETRY_MS
+    int "Expired quota refresh retry interval in milliseconds"
+    default 30000
+    range 500 60000
+    help
+        When the displayed quota reset time has already passed, poll the bridge
+        at this faster cadence until a fresh reset time is fetched.
+
 config ORNAMENT_UI_FRAME_MS
     int "Animated UI frame interval in milliseconds"
     default 250
