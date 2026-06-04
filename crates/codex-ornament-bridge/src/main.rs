@@ -43,7 +43,7 @@ const DEFAULT_WEATHER_LABEL: &str = "HAIDIAN";
 const DEFAULT_WEATHER_PROVIDER: WeatherProvider = WeatherProvider::Auto;
 const RECONCILED_DONE_NOTIFY_WINDOW: Duration = Duration::from_secs(120);
 const COMBINED_DONE_SOURCE_WINDOW: Duration = Duration::from_secs(5);
-const RECOVER_ACTIVE_TASK_WINDOW: Duration = Duration::from_secs(12 * 60 * 60);
+const RECOVER_UNSCOPED_ACTIVE_TASK_WINDOW: Duration = Duration::from_secs(10 * 60);
 const RECOVER_ACTIVE_SESSION_SCAN_LIMIT: usize = 24;
 const SESSION_TASK_SCAN_TAIL_BYTES: u64 = 2 * 1024 * 1024;
 const ACTIVE_SESSION_FILE_MISSING_GRACE: Duration = Duration::from_secs(30);
@@ -466,7 +466,86 @@ fn handle_connection(
 }
 
 fn parse_hook_payload(body: &[u8]) -> Result<Value, serde_json::Error> {
-    serde_json::from_slice::<Value>(body)
+    match serde_json::from_slice::<Value>(body) {
+        Ok(payload) => Ok(payload),
+        Err(error) => {
+            let text = String::from_utf8_lossy(body);
+            let sanitized = sanitize_unpaired_json_surrogates(text.as_ref());
+            if sanitized != text.as_ref() {
+                if let Ok(payload) = serde_json::from_str::<Value>(&sanitized) {
+                    return Ok(payload);
+                }
+            }
+            Err(error)
+        }
+    }
+}
+
+fn sanitize_unpaired_json_surrogates(text: &str) -> String {
+    let mut sanitized = String::with_capacity(text.len());
+    let mut index = 0;
+    while index < text.len() {
+        if let Some(codepoint) = json_unicode_escape_value(text, index) {
+            if is_high_surrogate(codepoint) {
+                let next_index = index + 6;
+                if let Some(next_codepoint) = json_unicode_escape_value(text, next_index) {
+                    if is_low_surrogate(next_codepoint) {
+                        sanitized.push_str(&text[index..next_index + 6]);
+                        index = next_index + 6;
+                        continue;
+                    }
+                }
+                sanitized.push_str("\\uFFFD");
+                index += 6;
+                continue;
+            }
+            if is_low_surrogate(codepoint) {
+                sanitized.push_str("\\uFFFD");
+                index += 6;
+                continue;
+            }
+        }
+
+        let Some(ch) = text[index..].chars().next() else {
+            break;
+        };
+        sanitized.push(ch);
+        index += ch.len_utf8();
+    }
+    sanitized
+}
+
+fn json_unicode_escape_value(text: &str, index: usize) -> Option<u16> {
+    let bytes = text.as_bytes();
+    if index + 6 > bytes.len()
+        || bytes.get(index) != Some(&b'\\')
+        || bytes.get(index + 1) != Some(&b'u')
+    {
+        return None;
+    }
+
+    let mut value = 0_u16;
+    for byte in &bytes[index + 2..index + 6] {
+        value = (value << 4) | hex_digit_value(*byte)?;
+    }
+    Some(value)
+}
+
+fn hex_digit_value(byte: u8) -> Option<u16> {
+    match byte {
+        b'0'..=b'9' => Some((byte - b'0') as u16),
+        b'a'..=b'f' => Some((byte - b'a' + 10) as u16),
+        b'A'..=b'F' => Some((byte - b'A' + 10) as u16),
+        _ => None,
+    }
+}
+
+fn is_high_surrogate(codepoint: u16) -> bool {
+    (0xD800..=0xDBFF).contains(&codepoint)
+}
+
+fn is_low_surrogate(codepoint: u16) -> bool {
+    (0xDC00..=0xDFFF).contains(&codepoint)
 }
 
 fn hook_payload_is_control_only(payload: &Value) -> bool {
@@ -897,6 +976,8 @@ fn recover_active_task_if_needed(state: &mut BridgeState, config: &BridgeConfig)
         active_task_for_session(&config.codex_home, session_id)
             .into_iter()
             .collect::<Vec<_>>()
+    } else if state_has_active_codex_task(state) {
+        Vec::new()
     } else {
         cached_active_recovery_events(state, config)
     };
@@ -907,6 +988,13 @@ fn recover_active_task_if_needed(state: &mut BridgeState, config: &BridgeConfig)
         }
         apply_task_event(state, event);
     }
+}
+
+fn state_has_active_codex_task(state: &BridgeState) -> bool {
+    state
+        .active_tasks
+        .values()
+        .any(|event| done_source(event) == DoneSource::Codex)
 }
 
 fn cached_active_recovery_events(state: &mut BridgeState, config: &BridgeConfig) -> Vec<TaskEvent> {
@@ -1615,7 +1703,9 @@ fn active_tasks_in_recent_session_files(codex_home: &Path) -> Vec<TaskEvent> {
                 .unwrap_or(false);
             (!has_newer_turn).then_some(active)
         })
-        .filter(|active| timestamp_is_recent(&active.received_at, RECOVER_ACTIVE_TASK_WINDOW))
+        .filter(|active| {
+            timestamp_is_recent(&active.received_at, RECOVER_UNSCOPED_ACTIVE_TASK_WINDOW)
+        })
         .collect()
 }
 
@@ -3336,6 +3426,20 @@ mod tests {
     }
 
     #[test]
+    fn parses_hook_json_after_replacing_unpaired_surrogate_escape() {
+        let payload = parse_hook_payload(
+            br#"{"hook_event_name":"Stop","turn_id":"turn-1","message":"bad \uD800 text"}"#,
+        )
+        .unwrap();
+        let event = normalize_event(&payload);
+
+        assert_eq!(event.kind, "Stop");
+        assert_eq!(event.status, "done");
+        assert_eq!(event.turn_id.as_deref(), Some("turn-1"));
+        assert!(event.message.contains('\u{FFFD}'));
+    }
+
+    #[test]
     fn quota_background_refresh_returns_placeholder_without_blocking() {
         let state = Arc::new(Mutex::new(BridgeState::default()));
         let snapshot = cached_or_refresh_quota_background(&state);
@@ -4526,7 +4630,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_recovers_recent_session_task_while_other_task_is_active() {
+    fn snapshot_skips_recent_session_recovery_while_other_task_is_active() {
         let codex_home = env::temp_dir().join(format!(
             "codex-ornament-recover-with-active-{}",
             std::process::id()
@@ -4563,17 +4667,62 @@ mod tests {
         let snapshot = task_snapshot(&state, &config);
         let _ = fs::remove_dir_all(&codex_home);
 
-        assert_eq!(snapshot.active_task_count, 2);
+        assert_eq!(snapshot.active_task_count, 1);
         assert_eq!(
             snapshot
                 .active_tasks
                 .iter()
                 .filter_map(|event| event.session_id.as_deref())
                 .collect::<Vec<_>>(),
-            vec![
-                "22222222-2222-2222-2222-222222222222",
-                "11111111-1111-1111-1111-111111111111"
-            ]
+            vec!["22222222-2222-2222-2222-222222222222"]
+        );
+    }
+
+    #[test]
+    fn snapshot_does_not_recover_other_session_when_codex_task_is_already_active() {
+        let codex_home = env::temp_dir().join(format!(
+            "codex-ornament-skip-recover-with-current-active-{}",
+            std::process::id()
+        ));
+        let session_dir = codex_home
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("31");
+        fs::create_dir_all(&session_dir).unwrap();
+        let recovered_at = recent_timestamp(1);
+        fs::write(
+            session_dir.join("rollout-2026-05-31T20-42-42-11111111-1111-1111-1111-111111111111.jsonl"),
+            format!(
+                "{{\"timestamp\":\"{recovered_at}\",\"payload\":{{\"type\":\"task_started\",\"turn_id\":\"ghost-turn\"}}}}\n"
+            ),
+        )
+        .unwrap();
+        let state = Arc::new(Mutex::new(BridgeState::default()));
+        {
+            let mut state = state.lock().unwrap();
+            apply_task_event(
+                &mut state,
+                normalize_event(&json!({
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": "22222222-2222-2222-2222-222222222222",
+                    "turn_id": "current-turn"
+                })),
+            );
+        }
+
+        let mut config = test_config(None);
+        config.codex_home = codex_home.clone();
+        let snapshot = task_snapshot(&state, &config);
+        let _ = fs::remove_dir_all(&codex_home);
+
+        assert_eq!(snapshot.active_task_count, 1);
+        assert_eq!(
+            snapshot
+                .active_tasks
+                .first()
+                .and_then(|event| event.turn_id.as_deref()),
+            Some("current-turn")
         );
     }
 
