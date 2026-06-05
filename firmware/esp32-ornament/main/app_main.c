@@ -51,6 +51,7 @@ static const char *TAG = "ornament";
 #define VOICE_PAGE_HOLD_MS 12000
 #define VOICE_STATUS_TEXT_MAX 40
 #define ORNAMENT_MIN_VALID_EPOCH 1577836800LL
+#define BRIDGE_SINGLE_RETRY_DELAY_MS 1000
 
 #ifndef CONFIG_ORNAMENT_EXPIRED_QUOTA_RETRY_MS
 #define CONFIG_ORNAMENT_EXPIRED_QUOTA_RETRY_MS 30000
@@ -89,10 +90,12 @@ static SemaphoreHandle_t voice_control_mutex;
 static voice_control_state_t voice_control;
 static QueueHandle_t voice_command_queue;
 
-static bool bridge_is_offline(int consecutive_fetch_failures, esp_err_t err)
-{
-    return err != ESP_OK && consecutive_fetch_failures >= CONFIG_ORNAMENT_BRIDGE_OFFLINE_FAILURES;
-}
+static void publish_state(
+    const ornament_state_t *state,
+    esp_err_t fetch_error,
+    TickType_t last_done_tick,
+    bool have_last_done_tick,
+    bool have_state);
 
 static bool standby_timer_eligible(const ornament_state_t *state)
 {
@@ -105,7 +108,7 @@ static bool standby_timer_eligible(const ornament_state_t *state)
 
 static bool should_show_standby_clock(const ornament_state_t *state, TickType_t idle_since_tick, TickType_t now)
 {
-    if (state != NULL && state->bridge_offline && !state->has_quota && state->active_task_count == 0) {
+    if (state != NULL && state->bridge_offline && state->active_task_count == 0) {
         return true;
     }
     return CONFIG_ORNAMENT_STANDBY_CLOCK_MS > 0 &&
@@ -332,6 +335,82 @@ static TickType_t expired_quota_retry_ticks(void)
         retry_ms = 30000;
     }
     return pdMS_TO_TICKS(retry_ms);
+}
+
+static TickType_t bridge_recovery_retry_ticks(void)
+{
+    int retry_ms = CONFIG_ORNAMENT_BRIDGE_AUTO_MATCH_RETRY_MS;
+    if (retry_ms <= 0) {
+        retry_ms = 30000;
+    }
+    return pdMS_TO_TICKS(retry_ms);
+}
+
+static void clear_task_snapshot(ornament_state_t *state)
+{
+    if (state == NULL) {
+        return;
+    }
+
+    state->status = ORNAMENT_STATUS_IDLE;
+    state->has_task = false;
+    state->active_task_count = 0;
+    state->task_title[0] = '\0';
+    state->task_message[0] = '\0';
+    state->task_received_at[0] = '\0';
+    state->task_session_id[0] = '\0';
+    state->task_turn_id[0] = '\0';
+
+    state->has_codex_task = false;
+    state->has_claude_task = false;
+    state->codex_active_task_count = 0;
+    state->claude_active_task_count = 0;
+    state->codex_task_title[0] = '\0';
+    state->codex_task_message[0] = '\0';
+    state->codex_task_session_id[0] = '\0';
+    state->codex_task_turn_id[0] = '\0';
+    state->claude_task_title[0] = '\0';
+    state->claude_task_message[0] = '\0';
+    state->claude_task_session_id[0] = '\0';
+    state->claude_task_turn_id[0] = '\0';
+    if (state->codex_task_status == ORNAMENT_STATUS_RUNNING) {
+        state->codex_task_status = ORNAMENT_STATUS_IDLE;
+    }
+    if (state->claude_task_status == ORNAMENT_STATUS_RUNNING) {
+        state->claude_task_status = ORNAMENT_STATUS_IDLE;
+    }
+}
+
+static void set_bridge_connection_state(ornament_state_t *state, bool offline, bool reconnecting)
+{
+    if (state == NULL) {
+        return;
+    }
+
+    state->bridge_offline = offline;
+    state->bridge_reconnecting = reconnecting;
+    if (offline) {
+        clear_task_snapshot(state);
+    }
+}
+
+static void publish_bridge_fallback_state(
+    const ornament_state_t *cached_state,
+    bool have_cached_state,
+    esp_err_t fetch_error,
+    TickType_t last_done_tick,
+    bool have_last_done_tick,
+    bool bridge_offline)
+{
+    ornament_state_t fallback_state;
+    if (have_cached_state && cached_state != NULL) {
+        fallback_state = *cached_state;
+    } else {
+        ornament_state_init(&fallback_state);
+    }
+
+    set_bridge_connection_state(&fallback_state, bridge_offline, true);
+    publish_state(&fallback_state, fetch_error, last_done_tick, have_last_done_tick, true);
 }
 
 static void update_local_animation(
@@ -621,19 +700,6 @@ static bool state_has_displayable_snapshot(const ornament_state_t *state)
     return state != NULL && (state->has_task || state->has_quota || state->has_weather || state->active_task_count > 0);
 }
 
-static bool shared_state_has_displayable_snapshot(void)
-{
-    if (shared_state_mutex == NULL) {
-        return false;
-    }
-    bool displayable = false;
-    if (xSemaphoreTake(shared_state_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-        displayable = shared_state.have_state && state_has_displayable_snapshot(&shared_state.state);
-        xSemaphoreGive(shared_state_mutex);
-    }
-    return displayable;
-}
-
 static bool should_announce_done_event(
     const ornament_state_t *state,
     bool have_seen_state,
@@ -887,13 +953,16 @@ static void poll_task(void *arg)
     ornament_state_init(&fetched_state);
     TickType_t last_done_tick = 0;
     TickType_t next_bridge_poll = 0;
+    TickType_t next_bridge_recovery = 0;
     int last_done_seq = 0;
     int previous_active_task_count = 0;
     int consecutive_fetch_failures = 0;
     bool have_seen_state = false;
     bool have_last_done_tick = false;
     bool quota_refresh_pending = false;
-    TickType_t next_auto_match = 0;
+    bool single_retry_pending = false;
+
+    publish_bridge_fallback_state(NULL, false, ESP_ERR_INVALID_STATE, last_done_tick, have_last_done_tick, false);
 
     while (true) {
         TickType_t now = xTaskGetTickCount();
@@ -920,8 +989,16 @@ static void poll_task(void *arg)
             next_bridge_poll = now;
         }
 
-        if (refresh_requested || now >= next_bridge_poll) {
+        bool recovery_due = next_bridge_recovery != 0 && now >= next_bridge_recovery;
+        if (refresh_requested || recovery_due || now >= next_bridge_poll) {
             bool was_refresh_pending = quota_refresh_pending;
+            bool retrying_bridge = single_retry_pending;
+            bool recovering_bridge = recovery_due;
+
+            if (retrying_bridge || recovering_bridge) {
+                (void)auto_match_bridge(false, retrying_bridge ? "single retry" : "offline recovery");
+            }
+
             next_bridge_poll = now + pdMS_TO_TICKS(CONFIG_ORNAMENT_POLL_INTERVAL_MS);
             esp_err_t err = bridge_client_fetch_state(&fetched_state);
             if (quota_reset_refresh_needed(&fetched_state)) {
@@ -942,6 +1019,8 @@ static void poll_task(void *arg)
                 .last_auto_match_ok = false,
             };
             if (err == ESP_OK) {
+                single_retry_pending = false;
+                next_bridge_recovery = 0;
                 if (consecutive_fetch_failures > 0) {
                     ESP_LOGI(TAG, "bridge fetch recovered after %d failure(s)", consecutive_fetch_failures);
                 }
@@ -971,7 +1050,7 @@ static void poll_task(void *arg)
                 }
                 previous_active_task_count = fetched_state.active_task_count;
                 have_seen_state = true;
-                fetched_state.bridge_offline = false;
+                set_bridge_connection_state(&fetched_state, false, false);
                 web_console_set_bridge_debug(&debug);
                 publish_state(&fetched_state, err, last_done_tick, have_last_done_tick, true);
             } else {
@@ -987,32 +1066,37 @@ static void poll_task(void *arg)
                     consecutive_fetch_failures,
                     CONFIG_ORNAMENT_BRIDGE_OFFLINE_FAILURES,
                     esp_err_to_name(err));
-                if (now >= next_auto_match) {
-                    next_auto_match = now + pdMS_TO_TICKS(CONFIG_ORNAMENT_BRIDGE_AUTO_MATCH_RETRY_MS);
-                    if (auto_match_bridge(false, "poll failure")) {
-                        next_bridge_poll = now;
-                        vTaskDelay(pdMS_TO_TICKS(200));
-                        continue;
-                    }
-                }
 
                 web_console_set_bridge_debug(&debug);
-                fetched_state.bridge_offline = bridge_is_offline(consecutive_fetch_failures, err);
                 if (was_refresh_pending || quota_refresh_pending) {
                     hide_expired_quota_reset_times(&fetched_state);
                 }
-                if (have_seen_state &&
-                    consecutive_fetch_failures < CONFIG_ORNAMENT_BRIDGE_OFFLINE_FAILURES &&
-                    shared_state_has_displayable_snapshot()) {
-                    publish_state(&fetched_state, ESP_OK, last_done_tick, have_last_done_tick, true);
-                } else if (have_seen_state) {
-                    publish_state(&fetched_state, err, last_done_tick, have_last_done_tick, true);
+
+                if (!retrying_bridge && !recovering_bridge) {
+                    single_retry_pending = true;
+                    next_bridge_poll = now + pdMS_TO_TICKS(BRIDGE_SINGLE_RETRY_DELAY_MS);
+                    ESP_LOGW(TAG, "bridge fetch failed, scheduling a single retry in %d ms", BRIDGE_SINGLE_RETRY_DELAY_MS);
+                    publish_bridge_fallback_state(
+                        &fetched_state,
+                        have_seen_state,
+                        err,
+                        last_done_tick,
+                        have_last_done_tick,
+                        false);
                 } else {
-                    ornament_state_t error_state;
-                    ornament_state_init(&error_state);
-                    error_state.status = ORNAMENT_STATUS_IDLE;
-                    error_state.bridge_offline = bridge_is_offline(consecutive_fetch_failures, err);
-                    publish_state(&error_state, err, last_done_tick, have_last_done_tick, true);
+                    single_retry_pending = false;
+                    next_bridge_recovery = now + bridge_recovery_retry_ticks();
+                    ESP_LOGW(
+                        TAG,
+                        "bridge retry exhausted, entering standby; next recovery in %lu ms",
+                        (unsigned long)(bridge_recovery_retry_ticks() * portTICK_PERIOD_MS));
+                    publish_bridge_fallback_state(
+                        &fetched_state,
+                        have_seen_state,
+                        err,
+                        last_done_tick,
+                        have_last_done_tick,
+                        true);
                 }
             }
         }
@@ -1090,15 +1174,6 @@ void app_main(void)
     voice_control_init();
     voice_command_queue = xQueueCreate(4, sizeof(asrpro_voice_command_t));
     ESP_ERROR_CHECK(voice_command_queue == NULL ? ESP_ERR_NO_MEM : ESP_OK);
-    if (CONFIG_ORNAMENT_BRIDGE_AUTO_MATCH_ON_BOOT) {
-        display_render_status("Matching bridge...");
-        if (auto_match_bridge(true, "boot")) {
-            display_render_status("Bridge matched");
-        } else {
-            display_render_status("Bridge search failed");
-        }
-        vTaskDelay(pdMS_TO_TICKS(600));
-    }
 
     esp_err_t asrpro_err = asrpro_link_init(asrpro_voice_command_received, NULL);
     if (asrpro_err != ESP_OK) {
@@ -1122,6 +1197,7 @@ void app_main(void)
     memset(&shared_state, 0, sizeof(shared_state));
     ornament_state_init(&shared_state.state);
     shared_state.fetch_error = ESP_ERR_INVALID_STATE;
+    shared_state.have_state = true;
 
     create_app_task(voice_command_task, "voice_cmd", 4096, 5);
     create_app_task(page_button_task, "page_button", 3072, 5);

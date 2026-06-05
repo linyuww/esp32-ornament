@@ -1094,6 +1094,33 @@ static void draw_bridge_offline_icon(int center_x, int center_y)
     draw_hline(x - ss(4), x + body_w + ss(4), center_y + ss(10), thickness, HUD_AMBER);
 }
 
+static void draw_bridge_reconnecting_icon(const ornament_state_t *state, int center_x, int center_y)
+{
+    int phase = state != NULL ? (state->active_dot_phase & 0x03) : 0;
+    const int orbit = ss(12);
+    const int dot_radius = ss(3);
+    const int trail_radius = ss(2);
+
+    fill_circle(center_x, center_y, ss(9), HUD_DIM_BLUE);
+    draw_rect_outline(center_x - ss(9), center_y - ss(9), ss(18), ss(18), ss(1), HUD_CYAN);
+
+    static const int offsets[4][2] = {
+        {0, -1},
+        {1, 0},
+        {0, 1},
+        {-1, 0},
+    };
+
+    for (int i = 0; i < 4; i++) {
+        int index = (phase + i) & 0x03;
+        int dx = offsets[index][0] * orbit;
+        int dy = offsets[index][1] * orbit;
+        uint16_t color = i == 0 ? HUD_CYAN : (i == 1 ? HUD_TEAL : HUD_DIM_CYAN);
+        int radius = i == 0 ? dot_radius : trail_radius;
+        fill_circle(center_x + dx, center_y + dy, radius, color);
+    }
+}
+
 static void draw_standby_background(void)
 {
     draw_standby_wallpaper();
@@ -1129,7 +1156,9 @@ static void draw_standby_weather_row(const ornament_state_t *state, const char *
 static void draw_standby_connectivity(const ornament_state_t *state)
 {
     draw_wifi_signal_icon(active_canvas->center_x, sy(342), wifi_signal_bars(state));
-    if (state != NULL && state->bridge_offline) {
+    if (state != NULL && state->bridge_offline && state->bridge_reconnecting) {
+        draw_bridge_reconnecting_icon(state, active_canvas->center_x + ss(55), sy(342));
+    } else if (state != NULL && state->bridge_offline) {
         draw_bridge_offline_icon(active_canvas->center_x + ss(55), sy(342));
     }
 }
