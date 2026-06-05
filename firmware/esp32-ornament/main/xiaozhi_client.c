@@ -35,18 +35,25 @@
 #define XIAOZHI_HEADER_MAX 512
 #define XIAOZHI_OPUS_SAMPLE_RATE_HZ ORNAMENT_AUDIO_SAMPLE_RATE_HZ
 #define XIAOZHI_OPUS_CHANNELS 1
-#define XIAOZHI_TASK_STACK 12288
+#define XIAOZHI_TASK_STACK 24576
 #define XIAOZHI_TASK_PRIO 5
 #define XIAOZHI_OPUS_DECODE_MAX_FRAMES (ORNAMENT_AUDIO_SAMPLE_RATE_HZ * 60 / 1000)
+#define XIAOZHI_WS_TASK_STACK 12288
 
 static const char *TAG = "xiaozhi";
 
 static SemaphoreHandle_t s_mutex;
 static EventGroupHandle_t s_events;
+static SemaphoreHandle_t s_codec_mutex;
 static TaskHandle_t s_session_task;
 static esp_websocket_client_handle_t s_client;
 static xiaozhi_client_snapshot_t s_snapshot;
 static bool s_session_starting;
+
+static uint32_t current_stack_high_water_bytes(void)
+{
+    return uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t);
+}
 
 typedef struct {
     EventGroupHandle_t events;
@@ -397,7 +404,12 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
     case WEBSOCKET_EVENT_DATA:
         if (data->op_code == 0x2 && data->payload_offset == 0 && data->fin) {
             int16_t pcm[XIAOZHI_OPUS_DECODE_MAX_FRAMES];
+            if (s_codec_mutex == NULL || xSemaphoreTake(s_codec_mutex, pdMS_TO_TICKS(200)) != pdTRUE) {
+                ESP_LOGW(TAG, "opus decode skipped: codec mutex busy");
+                break;
+            }
             int decoded = opus_decode((OpusDecoder *)data->user_context, (const unsigned char *)data->data_ptr, data->data_len, pcm, XIAOZHI_OPUS_DECODE_MAX_FRAMES, 0);
+            xSemaphoreGive(s_codec_mutex);
             if (decoded > 0 && (xEventGroupGetBits(s_events) & XIAOZHI_EVENT_SPEAKING)) {
                 if (task_audio_output_acquire() == ESP_OK) {
                     esp_err_t err = task_audio_output_write_mono(pcm, (size_t)decoded, 1000);
@@ -553,6 +565,8 @@ static esp_err_t run_capture_loop(OpusEncoder *encoder)
         return err;
     }
 
+    ESP_LOGI(TAG, "capture loop start: stack_hwm=%lu bytes", (unsigned long)current_stack_high_water_bytes());
+
     while ((xEventGroupGetBits(s_events) & XIAOZHI_EVENT_STOP) == 0 &&
            s_client != NULL &&
            esp_websocket_client_is_connected(s_client)) {
@@ -568,7 +582,13 @@ static esp_err_t run_capture_loop(OpusEncoder *encoder)
             break;
         }
 
+        if (s_codec_mutex == NULL || xSemaphoreTake(s_codec_mutex, pdMS_TO_TICKS(200)) != pdTRUE) {
+            ESP_LOGW(TAG, "opus encode skipped: codec mutex busy");
+            err = ESP_ERR_TIMEOUT;
+            break;
+        }
         int opus_len = opus_encode(encoder, pcm, frame_samples, opus, CONFIG_ORNAMENT_XIAOZHI_OPUS_MAX_BYTES);
+        xSemaphoreGive(s_codec_mutex);
         if (opus_len < 0) {
             ESP_LOGW(TAG, "opus encode failed: %d", opus_len);
             err = ESP_FAIL;
@@ -593,6 +613,7 @@ static esp_err_t run_capture_loop(OpusEncoder *encoder)
 static void session_task(void *arg)
 {
     (void)arg;
+    ESP_LOGI(TAG, "session task start: stack_bytes=%d", XIAOZHI_TASK_STACK);
     ornament_settings_t settings;
     esp_err_t err = settings_load(&settings);
     if (err != ESP_OK) {
@@ -639,7 +660,7 @@ static void session_task(void *arg)
         .uri = settings_xiaozhi_ws_url_or_default(&settings),
         .headers = headers,
         .buffer_size = CONFIG_ORNAMENT_XIAOZHI_WS_BUFFER_BYTES,
-        .task_stack = 8192,
+        .task_stack = XIAOZHI_WS_TASK_STACK,
         .task_prio = 5,
         .network_timeout_ms = CONFIG_ORNAMENT_XIAOZHI_CONNECT_TIMEOUT_MS,
         .disable_auto_reconnect = true,
@@ -719,6 +740,14 @@ esp_err_t xiaozhi_client_init(void)
     s_events = xEventGroupCreate();
     if (s_events == NULL) {
         vSemaphoreDelete(s_mutex);
+        s_mutex = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+    s_codec_mutex = xSemaphoreCreateMutex();
+    if (s_codec_mutex == NULL) {
+        vEventGroupDelete(s_events);
+        vSemaphoreDelete(s_mutex);
+        s_events = NULL;
         s_mutex = NULL;
         return ESP_ERR_NO_MEM;
     }
@@ -812,7 +841,7 @@ esp_err_t xiaozhi_client_probe(const char *ws_url_override, const char *token_ov
         .uri = ws_url,
         .headers = headers,
         .buffer_size = CONFIG_ORNAMENT_XIAOZHI_WS_BUFFER_BYTES,
-        .task_stack = 8192,
+        .task_stack = XIAOZHI_WS_TASK_STACK,
         .task_prio = 5,
         .network_timeout_ms = CONFIG_ORNAMENT_XIAOZHI_CONNECT_TIMEOUT_MS,
         .disable_auto_reconnect = true,

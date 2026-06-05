@@ -664,7 +664,8 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "<input type=\"range\" name=\"audio_volume\" min=\"0\" max=\"100\" step=\"5\" value=\"%d\" oninput=\"audioVol.value=this.value\">"
         "<div class=\"v\"><output id=\"audioVol\">%d</output>%%</div>"
         "<div class=\"actions\"><button type=\"submit\">Save Volume</button>"
-        "<button class=\"warn\" type=\"submit\" formaction=\"/test-audio\">Test Voice</button></div></form></section>",
+        "<button class=\"warn\" type=\"submit\" formaction=\"/test-audio\">Test Voice</button>"
+        "<button class=\"warn\" type=\"submit\" formaction=\"/test-mic\">Test Mic</button></div></form></section>",
         audio_volume_percent,
         audio_volume_percent);
     appendf(
@@ -1260,6 +1261,44 @@ static esp_err_t test_audio_post_handler(httpd_req_t *req)
     return send_audio_saved_page(req, volume_percent, true);
 }
 
+static esp_err_t test_mic_post_handler(httpd_req_t *req)
+{
+    if (req->content_len > 0) {
+        char body[128] = {0};
+        (void)read_form_body(req, body, sizeof(body));
+    }
+
+    task_audio_mic_probe_result_t direct;
+    task_audio_mic_probe_result_t with_tx_clock;
+    (void)task_audio_input_probe(&direct, 500);
+    (void)task_audio_input_probe_with_tx_clock(&with_tx_clock, 500);
+
+    char detail[640];
+    snprintf(
+        detail,
+        sizeof(detail),
+        "direct: start=%s read=%s frames=%u/%u nonzero=%u min=%d max=%d mean_abs=%u | "
+        "with_tx_clock: start=%s read=%s frames=%u/%u nonzero=%u min=%d max=%d mean_abs=%u",
+        esp_err_to_name(direct.start_err),
+        esp_err_to_name(direct.read_err),
+        (unsigned int)direct.frames_captured,
+        (unsigned int)direct.frames_requested,
+        (unsigned int)direct.nonzero_samples,
+        direct.min_sample,
+        direct.max_sample,
+        (unsigned int)direct.mean_abs_sample,
+        esp_err_to_name(with_tx_clock.start_err),
+        esp_err_to_name(with_tx_clock.read_err),
+        (unsigned int)with_tx_clock.frames_captured,
+        (unsigned int)with_tx_clock.frames_requested,
+        (unsigned int)with_tx_clock.nonzero_samples,
+        with_tx_clock.min_sample,
+        with_tx_clock.max_sample,
+        (unsigned int)with_tx_clock.mean_abs_sample);
+
+    return send_simple_page(req, "Mic Test", detail);
+}
+
 static esp_err_t save_xiaozhi_post_handler(httpd_req_t *req)
 {
     char body[1024] = {0};
@@ -1461,6 +1500,11 @@ esp_err_t web_console_start(void)
         .method = HTTP_POST,
         .handler = test_audio_post_handler,
     };
+    const httpd_uri_t test_mic = {
+        .uri = "/test-mic",
+        .method = HTTP_POST,
+        .handler = test_mic_post_handler,
+    };
     const httpd_uri_t save_weather = {
         .uri = "/save-weather",
         .method = HTTP_POST,
@@ -1513,6 +1557,7 @@ esp_err_t web_console_start(void)
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &save_bridge));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &save_audio));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &test_audio));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &test_mic));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &save_weather));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &clear_weather_token));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &auto_bridge));
