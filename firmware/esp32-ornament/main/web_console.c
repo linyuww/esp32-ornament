@@ -1274,27 +1274,39 @@ static esp_err_t test_mic_post_handler(httpd_req_t *req)
     (void)task_audio_input_probe_with_tx_clock(&with_tx_clock, 500);
 
     char detail[640];
-    snprintf(
-        detail,
-        sizeof(detail),
-        "direct: start=%s read=%s frames=%u/%u nonzero=%u min=%d max=%d mean_abs=%u | "
-        "with_tx_clock: start=%s read=%s frames=%u/%u nonzero=%u min=%d max=%d mean_abs=%u",
-        esp_err_to_name(direct.start_err),
-        esp_err_to_name(direct.read_err),
-        (unsigned int)direct.frames_captured,
-        (unsigned int)direct.frames_requested,
-        (unsigned int)direct.nonzero_samples,
-        direct.min_sample,
-        direct.max_sample,
-        (unsigned int)direct.mean_abs_sample,
-        esp_err_to_name(with_tx_clock.start_err),
-        esp_err_to_name(with_tx_clock.read_err),
-        (unsigned int)with_tx_clock.frames_captured,
-        (unsigned int)with_tx_clock.frames_requested,
-        (unsigned int)with_tx_clock.nonzero_samples,
-        with_tx_clock.min_sample,
-        with_tx_clock.max_sample,
-        (unsigned int)with_tx_clock.mean_abs_sample);
+    if (direct.start_err == ESP_ERR_TIMEOUT && with_tx_clock.start_err == ESP_ERR_TIMEOUT) {
+        snprintf(
+            detail,
+            sizeof(detail),
+            "Mic busy: the Xiaozhi AI session is already using the microphone. Stop AI first, then run Test Mic again. "
+            "Last probe direct=%s/%s with_tx_clock=%s/%s",
+            esp_err_to_name(direct.start_err),
+            esp_err_to_name(direct.read_err),
+            esp_err_to_name(with_tx_clock.start_err),
+            esp_err_to_name(with_tx_clock.read_err));
+    } else {
+        snprintf(
+            detail,
+            sizeof(detail),
+            "direct: start=%s read=%s frames=%u/%u nonzero=%u min=%d max=%d mean_abs=%u | "
+            "with_tx_clock: start=%s read=%s frames=%u/%u nonzero=%u min=%d max=%d mean_abs=%u",
+            esp_err_to_name(direct.start_err),
+            esp_err_to_name(direct.read_err),
+            (unsigned int)direct.frames_captured,
+            (unsigned int)direct.frames_requested,
+            (unsigned int)direct.nonzero_samples,
+            direct.min_sample,
+            direct.max_sample,
+            (unsigned int)direct.mean_abs_sample,
+            esp_err_to_name(with_tx_clock.start_err),
+            esp_err_to_name(with_tx_clock.read_err),
+            (unsigned int)with_tx_clock.frames_captured,
+            (unsigned int)with_tx_clock.frames_requested,
+            (unsigned int)with_tx_clock.nonzero_samples,
+            with_tx_clock.min_sample,
+            with_tx_clock.max_sample,
+            (unsigned int)with_tx_clock.mean_abs_sample);
+    }
 
     return send_simple_page(req, "Mic Test", detail);
 }

@@ -71,6 +71,7 @@ static int16_t apply_volume(int16_t sample)
 
 static int16_t narrow_mic_sample(int32_t raw)
 {
+    /* INMP441 outputs 24-bit two's-complement I2S data in a 32-bit slot. */
     int32_t narrowed = raw >> 8;
 
     if (narrowed > INT16_MAX) {
@@ -474,6 +475,8 @@ static esp_err_t probe_input_internal(task_audio_mic_probe_result_t *result, uin
     (void)hold_tx_clock;
 
     memset(result, 0, sizeof(*result));
+    result->start_err = ESP_FAIL;
+    result->read_err = ESP_FAIL;
     result->frames_requested = TASK_AUDIO_MIC_PROBE_FRAMES;
     result->min_sample = INT16_MAX;
     result->max_sample = INT16_MIN;
@@ -483,6 +486,7 @@ static esp_err_t probe_input_internal(task_audio_mic_probe_result_t *result, uin
     esp_err_t err = task_audio_input_start();
     result->start_err = err;
     if (err != ESP_OK) {
+        result->read_err = err;
         return err;
     }
 
