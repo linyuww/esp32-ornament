@@ -505,13 +505,30 @@ static int draw_utf8_text(int x, int y, const lv_font_t *font, const char *text,
             cursor += adv > 0 ? adv : font->line_height / 2;
             continue;
         }
-        const uint8_t *bitmap = (const uint8_t *)lv_font_get_glyph_bitmap(&glyph, NULL);
+        uint8_t glyph_bitmap_storage[256];
+        lv_draw_buf_t glyph_draw_buf;
+        lv_draw_buf_t *glyph_draw_buf_ptr = NULL;
+        uint32_t glyph_stride = lv_draw_buf_width_to_stride(glyph.box_w, LV_COLOR_FORMAT_A8);
+        uint32_t glyph_bitmap_size = glyph_stride * glyph.box_h;
+        if (glyph.box_w > 0 && glyph.box_h > 0 && glyph_bitmap_size <= sizeof(glyph_bitmap_storage) &&
+            lv_draw_buf_init(
+                &glyph_draw_buf,
+                glyph.box_w,
+                glyph.box_h,
+                LV_COLOR_FORMAT_A8,
+                glyph_stride,
+                glyph_bitmap_storage,
+                sizeof(glyph_bitmap_storage)) == LV_RESULT_OK) {
+            glyph_draw_buf_ptr = &glyph_draw_buf;
+        }
+        const uint8_t *bitmap = (const uint8_t *)lv_font_get_glyph_bitmap(&glyph, glyph_draw_buf_ptr);
         if (bitmap != NULL) {
             int glyph_x = cursor + glyph.ofs_x;
             int glyph_y = y + font->line_height - font->base_line - glyph.box_h - glyph.ofs_y;
-            uint32_t bitmap_index = 0;
             for (int row = 0; row < glyph.box_h; row++) {
-                for (int col = 0; col < glyph.box_w; col++, bitmap_index++) {
+                uint32_t row_offset = (uint32_t)row * glyph_stride;
+                for (int col = 0; col < glyph.box_w; col++) {
+                    uint32_t bitmap_index = row_offset + (uint32_t)col;
                     uint8_t alpha = lv_alpha_from_bitmap(bitmap, bitmap_index, glyph.format);
                     blend_pixel(glyph_x + col, glyph_y + row, color, alpha);
                 }

@@ -647,6 +647,25 @@ static bool voice_view_active(voice_view_t view, TickType_t hold_until_tick, Tic
            (hold_until_tick == portMAX_DELAY || (hold_until_tick != 0 && now < hold_until_tick));
 }
 
+static bool xiaozhi_session_page_active(const xiaozhi_client_snapshot_t *snapshot)
+{
+    if (snapshot == NULL) {
+        return false;
+    }
+    switch (snapshot->state) {
+    case XIAOZHI_CLIENT_STATE_CONNECTING:
+    case XIAOZHI_CLIENT_STATE_LISTENING:
+    case XIAOZHI_CLIENT_STATE_SPEAKING:
+        return true;
+    case XIAOZHI_CLIENT_STATE_DISABLED:
+    case XIAOZHI_CLIENT_STATE_IDLE:
+    case XIAOZHI_CLIENT_STATE_CONFIG_MISSING:
+    case XIAOZHI_CLIENT_STATE_ERROR:
+    default:
+        return false;
+    }
+}
+
 static bool render_voice_override(
     const ornament_state_t *state,
     esp_err_t fetch_error,
@@ -1125,6 +1144,8 @@ static void ui_render_task(void *arg)
         update_local_animation(&state, now, last_done_tick, have_last_done_tick);
         apply_local_state(&state, state.bridge_offline);
         web_console_set_last_state(&state, fetch_error);
+        xiaozhi_client_snapshot_t xiaozhi_snapshot;
+        xiaozhi_client_status_snapshot(&xiaozhi_snapshot);
         voice_control_state_t voice_state;
         bool have_voice_state = voice_control_snapshot(&voice_state);
 
@@ -1138,7 +1159,9 @@ static void ui_render_task(void *arg)
         }
         previous_standby_eligible = standby_eligible;
 
-        if (!(have_voice_state && render_voice_override(&state, fetch_error, &voice_state, now))) {
+        if (xiaozhi_session_page_active(&xiaozhi_snapshot)) {
+            display_render_xiaozhi(&state, &xiaozhi_snapshot);
+        } else if (!(have_voice_state && render_voice_override(&state, fetch_error, &voice_state, now))) {
             render_current_state(&state, idle_since_tick, now);
         }
 

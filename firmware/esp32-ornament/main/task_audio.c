@@ -52,7 +52,7 @@ static int16_t apply_volume(int16_t sample)
     return (int16_t)scaled;
 }
 
-static esp_err_t write_stereo_frames(const int16_t *mono_samples, size_t frame_count, TickType_t timeout_ticks)
+static esp_err_t write_stereo_frames(const int16_t *mono_samples, size_t frame_count, uint32_t timeout_ms)
 {
     int16_t stereo[TASK_DONE_AUDIO_CHUNK_FRAMES * 2];
 
@@ -70,7 +70,7 @@ static esp_err_t write_stereo_frames(const int16_t *mono_samples, size_t frame_c
 
         size_t bytes_to_write = frames * 2 * sizeof(int16_t);
         size_t bytes_written = 0;
-        esp_err_t err = i2s_channel_write(s_tx_chan, stereo, bytes_to_write, &bytes_written, timeout_ticks);
+        esp_err_t err = i2s_channel_write(s_tx_chan, stereo, bytes_to_write, &bytes_written, timeout_ms);
         if (err != ESP_OK) {
             return err;
         }
@@ -113,9 +113,9 @@ static void play_task_done_audio(void)
         (unsigned)sample_count,
         s_play_volume_percent);
 
-    esp_err_t err = write_stereo_frames(samples, sample_count, pdMS_TO_TICKS(1000));
+    esp_err_t err = write_stereo_frames(samples, sample_count, 1000);
     if (err == ESP_OK) {
-        err = write_stereo_frames(NULL, TASK_DONE_AUDIO_TAIL_SILENCE_FRAMES, pdMS_TO_TICKS(1000));
+        err = write_stereo_frames(NULL, TASK_DONE_AUDIO_TAIL_SILENCE_FRAMES, 1000);
     }
 
     if (err != ESP_OK) {
@@ -248,7 +248,7 @@ esp_err_t task_audio_output_write_mono(const int16_t *samples, size_t frame_coun
     if (samples == NULL || !s_output_enabled) {
         return ESP_ERR_INVALID_STATE;
     }
-    return write_stereo_frames(samples, frame_count, pdMS_TO_TICKS(timeout_ms));
+    return write_stereo_frames(samples, frame_count, timeout_ms);
 }
 
 esp_err_t task_audio_output_write_silence(size_t frame_count, uint32_t timeout_ms)
@@ -256,7 +256,7 @@ esp_err_t task_audio_output_write_silence(size_t frame_count, uint32_t timeout_m
     if (!s_output_enabled) {
         return ESP_ERR_INVALID_STATE;
     }
-    return write_stereo_frames(NULL, frame_count, pdMS_TO_TICKS(timeout_ms));
+    return write_stereo_frames(NULL, frame_count, timeout_ms);
 }
 
 void task_audio_output_release(void)
@@ -308,7 +308,7 @@ esp_err_t task_audio_input_read_mono(int16_t *samples, size_t frame_count, uint3
         }
         size_t bytes_to_read = frames * 2 * sizeof(int16_t);
         size_t bytes_read = 0;
-        esp_err_t err = i2s_channel_read(s_rx_chan, stereo, bytes_to_read, &bytes_read, pdMS_TO_TICKS(timeout_ms));
+        esp_err_t err = i2s_channel_read(s_rx_chan, stereo, bytes_to_read, &bytes_read, timeout_ms);
         if (err != ESP_OK) {
             return err;
         }
