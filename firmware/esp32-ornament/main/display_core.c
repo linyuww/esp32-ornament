@@ -11,7 +11,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-LV_FONT_DECLARE(font_puhui_14_1);
+LV_FONT_DECLARE(font_puhui_16_4);
+LV_FONT_DECLARE(font_puhui_basic_16_4);
 
 #ifndef CONFIG_ORNAMENT_QUOTA_CRITICAL_PERCENT
 #define CONFIG_ORNAMENT_QUOTA_CRITICAL_PERCENT 10
@@ -465,6 +466,21 @@ static uint8_t lv_alpha_from_bitmap(const uint8_t *bitmap, uint32_t index, lv_fo
     }
 }
 
+static uint8_t glyph_alpha_at(
+    const uint8_t *bitmap,
+    uint32_t row,
+    uint32_t col,
+    uint32_t stride,
+    bool bitmap_is_a8,
+    lv_font_glyph_format_t format)
+{
+    uint32_t bitmap_index = row * stride + col;
+    if (bitmap_is_a8) {
+        return bitmap[bitmap_index];
+    }
+    return lv_alpha_from_bitmap(bitmap, bitmap_index, format);
+}
+
 static void blend_pixel(int x, int y, uint16_t color, uint8_t alpha)
 {
     if (x < 0 || y < 0 || x >= active_canvas->width || y >= active_canvas->height || alpha == 0) {
@@ -510,6 +526,7 @@ static int draw_utf8_text(int x, int y, const lv_font_t *font, const char *text,
         lv_draw_buf_t *glyph_draw_buf_ptr = NULL;
         uint32_t glyph_stride = lv_draw_buf_width_to_stride(glyph.box_w, LV_COLOR_FORMAT_A8);
         uint32_t glyph_bitmap_size = glyph_stride * glyph.box_h;
+        bool bitmap_is_a8 = false;
         if (glyph.box_w > 0 && glyph.box_h > 0 && glyph_bitmap_size <= sizeof(glyph_bitmap_storage) &&
             lv_draw_buf_init(
                 &glyph_draw_buf,
@@ -520,16 +537,15 @@ static int draw_utf8_text(int x, int y, const lv_font_t *font, const char *text,
                 glyph_bitmap_storage,
                 sizeof(glyph_bitmap_storage)) == LV_RESULT_OK) {
             glyph_draw_buf_ptr = &glyph_draw_buf;
+            bitmap_is_a8 = true;
         }
         const uint8_t *bitmap = (const uint8_t *)lv_font_get_glyph_bitmap(&glyph, glyph_draw_buf_ptr);
         if (bitmap != NULL) {
             int glyph_x = cursor + glyph.ofs_x;
             int glyph_y = y + font->line_height - font->base_line - glyph.box_h - glyph.ofs_y;
             for (int row = 0; row < glyph.box_h; row++) {
-                uint32_t row_offset = (uint32_t)row * glyph_stride;
                 for (int col = 0; col < glyph.box_w; col++) {
-                    uint32_t bitmap_index = row_offset + (uint32_t)col;
-                    uint8_t alpha = lv_alpha_from_bitmap(bitmap, bitmap_index, glyph.format);
+                    uint8_t alpha = glyph_alpha_at(bitmap, (uint32_t)row, (uint32_t)col, glyph_stride, bitmap_is_a8, glyph.format);
                     blend_pixel(glyph_x + col, glyph_y + row, color, alpha);
                 }
             }
@@ -1138,6 +1154,32 @@ static void draw_bridge_reconnecting_icon(const ornament_state_t *state, int cen
     }
 }
 
+static void fill_round_rect(int x, int y, int w, int h, int radius, uint16_t color)
+{
+    if (w <= 0 || h <= 0) {
+        return;
+    }
+    if (radius < 0) {
+        radius = 0;
+    }
+    int max_radius = w < h ? w / 2 : h / 2;
+    if (radius > max_radius) {
+        radius = max_radius;
+    }
+    if (radius == 0) {
+        fill_rect(x, y, w, h, color);
+        return;
+    }
+
+    fill_rect(x + radius, y, w - radius * 2, h, color);
+    fill_rect(x, y + radius, radius, h - radius * 2, color);
+    fill_rect(x + w - radius, y + radius, radius, h - radius * 2, color);
+    fill_circle(x + radius, y + radius, radius, color);
+    fill_circle(x + w - radius - 1, y + radius, radius, color);
+    fill_circle(x + radius, y + h - radius - 1, radius, color);
+    fill_circle(x + w - radius - 1, y + h - radius - 1, radius, color);
+}
+
 static void draw_standby_background(void)
 {
     draw_standby_wallpaper();
@@ -1470,13 +1512,21 @@ void display_core_render_xiaozhi(
     }
 
     char status_text[32];
-    char frames_text[40];
-    char config_text[40];
-    const char *stt_text = snapshot->last_stt[0] != '\0' ? snapshot->last_stt : "NO STT";
-    const char *tts_text = snapshot->last_tts[0] != '\0' ? snapshot->last_tts : "NO TTS";
+    char frames_text[48];
+    char config_text[64];
+    const char *stt_text = snapshot->last_stt[0] != '\0' ? snapshot->last_stt :
+        (snapshot->activation_pending ? "\xE7\xAD\x89\xE5\xBE\x85\xE7\xBB\x91\xE5\xAE\x9A..." : "\xE8\xAF\xB7\xE8\xAF\xB4\xE8\xAF\x9D...");
+    const char *tts_text = snapshot->last_tts[0] != '\0' ? snapshot->last_tts :
+        (snapshot->activation_pending ?
+            (snapshot->activation_code[0] != '\0' ? snapshot->activation_code : "\xE8\xAF\xB7\xE7\xBB\x91\xE5\xAE\x9A\xE5\xAE\x98\xE6\x96\xB9") :
+            "\xE7\xAD\x89\xE5\xBE\x85\xE5\x9B\x9E\xE7\xAD\x94...");
     snprintf(status_text, sizeof(status_text), "AI %s", xiaozhi_client_state_name(snapshot->state));
-    snprintf(frames_text, sizeof(frames_text), "UP %lu DOWN %lu", (unsigned long)snapshot->uplink_frames, (unsigned long)snapshot->downlink_frames);
-    snprintf(config_text, sizeof(config_text), "%s %s", snapshot->configured ? "CONFIG OK" : "NO CONFIG", snapshot->connected ? "ONLINE" : "OFFLINE");
+    snprintf(frames_text, sizeof(frames_text), "UP %lu  DOWN %lu", (unsigned long)snapshot->uplink_frames, (unsigned long)snapshot->downlink_frames);
+    if (snapshot->activation_pending) {
+        snprintf(config_text, sizeof(config_text), "BIND %s", snapshot->activation_code[0] != '\0' ? snapshot->activation_code : "PENDING");
+    } else {
+        snprintf(config_text, sizeof(config_text), "%s %s", snapshot->configured ? "CONFIG OK" : "NO CONFIG", snapshot->connected ? "ONLINE" : "OFFLINE");
+    }
 
     uint16_t state_color = HUD_MUTED;
     switch (snapshot->state) {
@@ -1500,16 +1550,30 @@ void display_core_render_xiaozhi(
         break;
     }
 
+    const int bubble_w = sx(250);
+    const int bubble_h = sy(84);
+    const int bubble_r = ss(12);
+    const int user_y = sy(98);
+    const int ai_y = sy(194);
+    const int user_x = sx(74);
+    const int ai_x = sx(28);
+    const int user_text_x = user_x + ss(16);
+    const int ai_text_x = ai_x + ss(16);
+
     clear_canvas(HUD_BLACK);
     draw_ring_ticks(state);
-    draw_text_center_fit(sy(34), "XIAOZHI AI", ss(3), HUD_WHITE);
-    draw_text_center_fit(sy(78), status_text, ss(2), state_color);
-    draw_text_center_fit(sy(110), "YOU", ss(1), HUD_MUTED);
-    draw_utf8_text_wrapped(sx(32), sy(128), &font_puhui_14_1, stt_text, HUD_GREEN, sx(296), 2);
-    draw_text_center_fit(sy(188), "AI", ss(1), HUD_MUTED);
-    draw_utf8_text_wrapped(sx(32), sy(204), &font_puhui_14_1, tts_text, HUD_CYAN, sx(296), 2);
-    draw_text_center_fit(sy(268), frames_text, ss(1), HUD_TEAL);
-    draw_text_center_fit(sy(298), config_text, ss(1), snapshot->configured ? HUD_WHITE : HUD_AMBER);
+    draw_text_center_fit(sy(30), "XIAOZHI AI", ss(3), HUD_WHITE);
+    draw_text_center_fit(sy(62), status_text, ss(2), state_color);
+
+    fill_round_rect(user_x, user_y, bubble_w, bubble_h, bubble_r, HUD_DIM_GREEN);
+    fill_round_rect(ai_x, ai_y, bubble_w, bubble_h, bubble_r, HUD_DIM_CYAN);
+    draw_text_xy(user_x + ss(12), user_y + ss(10), "YOU", 1, 1, HUD_MUTED);
+    draw_text_xy(ai_x + ss(12), ai_y + ss(10), "AI", 1, 1, HUD_MUTED);
+    draw_utf8_text_wrapped(user_text_x, user_y + ss(28), &font_puhui_16_4, stt_text, HUD_WHITE, bubble_w - ss(30), 2);
+    draw_utf8_text_wrapped(ai_text_x, ai_y + ss(28), &font_puhui_16_4, tts_text, HUD_WHITE, bubble_w - ss(30), 2);
+
+    draw_text_center_fit(sy(300), frames_text, ss(1), HUD_TEAL);
+    draw_text_center_fit(sy(324), config_text, ss(1), snapshot->configured ? HUD_WHITE : HUD_AMBER);
 }
 
 static void render_message(display_core_canvas_t *canvas, const char *line1, const char *line2, uint16_t color)

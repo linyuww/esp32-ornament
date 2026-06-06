@@ -52,6 +52,8 @@ static const char *TAG = "ornament";
 #define VOICE_STATUS_TEXT_MAX 40
 #define ORNAMENT_MIN_VALID_EPOCH 1577836800LL
 #define BRIDGE_SINGLE_RETRY_DELAY_MS 1000
+#define UI_RENDER_TASK_STACK 16384
+#define UI_RENDER_LOW_STACK_WARN_BYTES 2048
 
 #ifndef CONFIG_ORNAMENT_EXPIRED_QUOTA_RETRY_MS
 #define CONFIG_ORNAMENT_EXPIRED_QUOTA_RETRY_MS 30000
@@ -669,6 +671,7 @@ static bool xiaozhi_session_page_active(const xiaozhi_client_snapshot_t *snapsho
 static bool render_voice_override(
     const ornament_state_t *state,
     esp_err_t fetch_error,
+    const xiaozhi_client_snapshot_t *xiaozhi_snapshot,
     const voice_control_state_t *voice_state,
     TickType_t now)
 {
@@ -693,12 +696,9 @@ static bool render_voice_override(
     case VOICE_VIEW_QUOTA:
         display_render_state(state);
         break;
-    case VOICE_VIEW_XIAOZHI: {
-        xiaozhi_client_snapshot_t snapshot;
-        xiaozhi_client_status_snapshot(&snapshot);
-        display_render_xiaozhi(state, &snapshot);
+    case VOICE_VIEW_XIAOZHI:
+        display_render_xiaozhi(state, xiaozhi_snapshot);
         break;
-    }
     case VOICE_VIEW_AUTO:
     default:
         return false;
@@ -712,11 +712,6 @@ static bool is_new_done_event(const ornament_state_t *state, bool have_seen_stat
         return false;
     }
     return state->done_seq > last_done_seq;
-}
-
-static bool state_has_displayable_snapshot(const ornament_state_t *state)
-{
-    return state != NULL && (state->has_task || state->has_quota || state->has_weather || state->active_task_count > 0);
 }
 
 static bool should_announce_done_event(
@@ -1128,10 +1123,13 @@ static void ui_render_task(void *arg)
 {
     (void)arg;
     ornament_state_t state;
+    xiaozhi_client_snapshot_t xiaozhi_snapshot;
+    voice_control_state_t voice_state;
     TickType_t idle_since_tick = 0;
     TickType_t last_done_tick = 0;
     bool have_last_done_tick = false;
     bool previous_standby_eligible = false;
+    bool previous_xiaozhi_page_active = false;
     esp_err_t fetch_error = ESP_OK;
 
     while (true) {
@@ -1144,10 +1142,9 @@ static void ui_render_task(void *arg)
         update_local_animation(&state, now, last_done_tick, have_last_done_tick);
         apply_local_state(&state, state.bridge_offline);
         web_console_set_last_state(&state, fetch_error);
-        xiaozhi_client_snapshot_t xiaozhi_snapshot;
         xiaozhi_client_status_snapshot(&xiaozhi_snapshot);
-        voice_control_state_t voice_state;
         bool have_voice_state = voice_control_snapshot(&voice_state);
+        bool xiaozhi_page_active = xiaozhi_session_page_active(&xiaozhi_snapshot);
 
         bool standby_eligible = standby_timer_eligible(&state);
         if (standby_eligible) {
@@ -1159,9 +1156,18 @@ static void ui_render_task(void *arg)
         }
         previous_standby_eligible = standby_eligible;
 
-        if (xiaozhi_session_page_active(&xiaozhi_snapshot)) {
+        if (xiaozhi_page_active && !previous_xiaozhi_page_active) {
+            size_t stack_hwm_bytes = uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t);
+            ESP_LOGI(TAG, "ui render entering xiaozhi page: stack_hwm=%u bytes", (unsigned int)stack_hwm_bytes);
+            if (stack_hwm_bytes < UI_RENDER_LOW_STACK_WARN_BYTES) {
+                ESP_LOGW(TAG, "ui render stack is low entering xiaozhi page: %u bytes", (unsigned int)stack_hwm_bytes);
+            }
+        }
+        previous_xiaozhi_page_active = xiaozhi_page_active;
+
+        if (xiaozhi_page_active) {
             display_render_xiaozhi(&state, &xiaozhi_snapshot);
-        } else if (!(have_voice_state && render_voice_override(&state, fetch_error, &voice_state, now))) {
+        } else if (!(have_voice_state && render_voice_override(&state, fetch_error, &xiaozhi_snapshot, &voice_state, now))) {
             render_current_state(&state, idle_since_tick, now);
         }
 
@@ -1225,7 +1231,7 @@ void app_main(void)
     create_app_task(voice_command_task, "voice_cmd", 4096, 5);
     create_app_task(page_button_task, "page_button", 3072, 5);
     create_app_task(poll_task, "bridge_poll", 8192, 5);
-    create_app_task(ui_render_task, "ui_render", 8192, 4);
+    create_app_task(ui_render_task, "ui_render", UI_RENDER_TASK_STACK, 4);
 
     /* Main task must never return in ESP-IDF — returning tears down
      * FreeRTOS resources (mutexes, queues, semaphores) that child tasks

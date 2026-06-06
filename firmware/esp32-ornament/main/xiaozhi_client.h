@@ -6,8 +6,10 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#define XIAOZHI_STATUS_TEXT_MAX 96
+#define XIAOZHI_STATUS_TEXT_MAX 256
 #define XIAOZHI_SESSION_ID_MAX 64
+#define XIAOZHI_CLIENT_ID_MAX 40
+#define XIAOZHI_ACTIVATION_CODE_MAX 16
 
 typedef enum {
     XIAOZHI_CLIENT_STATE_DISABLED = 0,
@@ -24,8 +26,13 @@ typedef struct {
     bool configured;
     bool connected;
     xiaozhi_client_state_t state;
+    int protocol_version;
+    bool activation_pending;
     char ws_url[ORNAMENT_XIAOZHI_WS_URL_MAX];
+    char client_id[XIAOZHI_CLIENT_ID_MAX];
     char session_id[XIAOZHI_SESSION_ID_MAX];
+    char activation_code[XIAOZHI_ACTIVATION_CODE_MAX];
+    char activation_message[XIAOZHI_STATUS_TEXT_MAX];
     char last_error[XIAOZHI_STATUS_TEXT_MAX];
     char last_stt[XIAOZHI_STATUS_TEXT_MAX];
     char last_tts[XIAOZHI_STATUS_TEXT_MAX];

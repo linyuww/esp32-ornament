@@ -5,8 +5,11 @@
 #include "esp_check.h"
 #include "esp_crt_bundle.h"
 #include "esp_event.h"
+#include "esp_http_client.h"
+#include "esp_idf_version.h"
 #include "esp_log.h"
 #include "esp_mac.h"
+#include "esp_random.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_websocket_client.h"
@@ -14,6 +17,7 @@
 #include "freertos/event_groups.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "nvs.h"
 #include "task_audio.h"
 
 #include <opus.h>
@@ -33,22 +37,40 @@
 #define XIAOZHI_EVENT_ERROR BIT4
 #define XIAOZHI_JSON_MAX 640
 #define XIAOZHI_HEADER_MAX 512
+#define XIAOZHI_HTTP_RESPONSE_MAX 4096
 #define XIAOZHI_OPUS_SAMPLE_RATE_HZ ORNAMENT_AUDIO_SAMPLE_RATE_HZ
 #define XIAOZHI_OPUS_CHANNELS 1
 #define XIAOZHI_TASK_STACK 24576
 #define XIAOZHI_TASK_PRIO 5
 #define XIAOZHI_OPUS_DECODE_MAX_FRAMES (ORNAMENT_AUDIO_SAMPLE_RATE_HZ * 60 / 1000)
 #define XIAOZHI_WS_TASK_STACK 12288
+#define XIAOZHI_DEFAULT_OTA_URL "https://api.tenclass.net/xiaozhi/ota/"
 
 static const char *TAG = "xiaozhi";
+static const char *XIAOZHI_SETTINGS_NAMESPACE = "xiaozhi";
+static const char *XIAOZHI_UUID_KEY = "client_id";
 
 static SemaphoreHandle_t s_mutex;
 static EventGroupHandle_t s_events;
 static SemaphoreHandle_t s_codec_mutex;
+static bool s_tts_output_active;
 static TaskHandle_t s_session_task;
 static esp_websocket_client_handle_t s_client;
 static xiaozhi_client_snapshot_t s_snapshot;
 static bool s_session_starting;
+static char s_runtime_client_id[XIAOZHI_CLIENT_ID_MAX];
+static char s_runtime_ws_url[ORNAMENT_XIAOZHI_WS_URL_MAX];
+static char s_runtime_token[ORNAMENT_XIAOZHI_TOKEN_MAX];
+static int s_runtime_protocol_version = CONFIG_ORNAMENT_XIAOZHI_PROTOCOL_VERSION;
+
+static void release_tts_output_if_active(void);
+static void get_device_mac(char *target, size_t target_size);
+
+typedef struct {
+    char *data;
+    int length;
+    int capacity;
+} http_response_buffer_t;
 
 static uint32_t current_stack_high_water_bytes(void)
 {
@@ -60,6 +82,347 @@ typedef struct {
     xiaozhi_probe_result_t *result;
     esp_websocket_client_handle_t client;
 } xiaozhi_probe_context_t;
+
+static esp_err_t http_event_handler(esp_http_client_event_t *event)
+{
+    http_response_buffer_t *buffer = (http_response_buffer_t *)event->user_data;
+    if (event->event_id != HTTP_EVENT_ON_DATA || buffer == NULL || event->data == NULL) {
+        return ESP_OK;
+    }
+    if (buffer->length + event->data_len >= buffer->capacity) {
+        ESP_LOGW(TAG, "OTA response too large");
+        return ESP_FAIL;
+    }
+    memcpy(buffer->data + buffer->length, event->data, event->data_len);
+    buffer->length += event->data_len;
+    buffer->data[buffer->length] = '\0';
+    return ESP_OK;
+}
+
+static const char *ota_url(void)
+{
+    return XIAOZHI_DEFAULT_OTA_URL;
+}
+
+static bool is_official_backend_url(const char *ws_url)
+{
+    return ws_url != NULL && strstr(ws_url, "api.tenclass.net") != NULL;
+}
+
+static void generate_uuid_v4(char *target, size_t target_size)
+{
+    uint8_t uuid[16] = {0};
+    esp_fill_random(uuid, sizeof(uuid));
+    uuid[6] = (uint8_t)((uuid[6] & 0x0F) | 0x40);
+    uuid[8] = (uint8_t)((uuid[8] & 0x3F) | 0x80);
+    snprintf(
+        target,
+        target_size,
+        "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+        uuid[0],
+        uuid[1],
+        uuid[2],
+        uuid[3],
+        uuid[4],
+        uuid[5],
+        uuid[6],
+        uuid[7],
+        uuid[8],
+        uuid[9],
+        uuid[10],
+        uuid[11],
+        uuid[12],
+        uuid[13],
+        uuid[14],
+        uuid[15]);
+}
+
+static esp_err_t load_or_create_client_id(char *target, size_t target_size)
+{
+    if (target == NULL || target_size == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (CONFIG_ORNAMENT_XIAOZHI_CLIENT_ID[0] != '\0') {
+        strlcpy(target, CONFIG_ORNAMENT_XIAOZHI_CLIENT_ID, target_size);
+        return ESP_OK;
+    }
+
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(XIAOZHI_SETTINGS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    size_t required = target_size;
+    err = nvs_get_str(handle, XIAOZHI_UUID_KEY, target, &required);
+    if (err == ESP_OK && target[0] != '\0') {
+        nvs_close(handle);
+        return ESP_OK;
+    }
+
+    if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) {
+        nvs_close(handle);
+        return err;
+    }
+
+    generate_uuid_v4(target, target_size);
+    err = nvs_set_str(handle, XIAOZHI_UUID_KEY, target);
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    return err;
+}
+
+static void store_text_field_or_clear(const cJSON *root, const char *name, char *target, size_t target_size)
+{
+    if (target == NULL || target_size == 0) {
+        return;
+    }
+    target[0] = '\0';
+    const cJSON *value = cJSON_GetObjectItem(root, name);
+    if (cJSON_IsString(value) && value->valuestring != NULL) {
+        strlcpy(target, value->valuestring, target_size);
+    }
+}
+
+static esp_err_t build_ota_request_body(
+    const ornament_settings_t *settings,
+    const char *client_id,
+    char *body,
+    size_t body_size)
+{
+    (void)settings;
+    if (client_id == NULL || body == NULL || body_size == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    char mac[24] = {0};
+    get_device_mac(mac, sizeof(mac));
+
+    int written = snprintf(
+        body,
+        body_size,
+        "{"
+        "\"version\":2,"
+        "\"language\":\"zh-CN\","
+        "\"flash_size\":16777216,"
+        "\"minimum_free_heap_size\":%u,"
+        "\"mac_address\":\"%s\","
+        "\"uuid\":\"%s\","
+        "\"chip_model_name\":\"" CONFIG_IDF_TARGET "\","
+        "\"chip_info\":{\"model\":9,\"cores\":2,\"revision\":0,\"features\":0},"
+        "\"application\":{\"name\":\"esp32-ornament\",\"version\":\"0.1.0\",\"compile_time\":\"%sT%sZ\",\"idf_version\":\"%s\",\"elf_sha256\":\"\"},"
+        "\"partition_table\":[{\"label\":\"factory\",\"type\":0,\"subtype\":0,\"address\":65536,\"size\":4194304}],"
+        "\"ota\":{\"label\":\"factory\"},"
+        "\"display\":{\"monochrome\":false,\"width\":%d,\"height\":%d},"
+        "\"board\":{\"type\":\"esp32-ornament\"}"
+        "}",
+        (unsigned int)esp_get_minimum_free_heap_size(),
+        mac,
+        client_id,
+        __DATE__,
+        __TIME__,
+        esp_get_idf_version(),
+        CONFIG_ORNAMENT_LCD_H_RES,
+        CONFIG_ORNAMENT_LCD_V_RES);
+    return written > 0 && written < (int)body_size ? ESP_OK : ESP_ERR_NO_MEM;
+}
+
+static void reset_runtime_config_locked(const ornament_settings_t *settings)
+{
+    strlcpy(s_runtime_ws_url, settings_xiaozhi_ws_url_or_default(settings), sizeof(s_runtime_ws_url));
+    strlcpy(s_runtime_token, settings_xiaozhi_token_or_default(settings), sizeof(s_runtime_token));
+    s_runtime_protocol_version = CONFIG_ORNAMENT_XIAOZHI_PROTOCOL_VERSION;
+    s_snapshot.protocol_version = s_runtime_protocol_version;
+    s_snapshot.activation_pending = false;
+    s_snapshot.activation_code[0] = '\0';
+    s_snapshot.activation_message[0] = '\0';
+}
+
+static void apply_runtime_websocket_config_locked(const cJSON *websocket, const ornament_settings_t *settings)
+{
+    reset_runtime_config_locked(settings);
+    if (!cJSON_IsObject(websocket)) {
+        return;
+    }
+
+    const cJSON *url = cJSON_GetObjectItem(websocket, "url");
+    const cJSON *token = cJSON_GetObjectItem(websocket, "token");
+    const cJSON *version = cJSON_GetObjectItem(websocket, "version");
+    if (cJSON_IsString(url) && url->valuestring != NULL) {
+        strlcpy(s_runtime_ws_url, url->valuestring, sizeof(s_runtime_ws_url));
+    }
+    if (cJSON_IsString(token) && token->valuestring != NULL) {
+        strlcpy(s_runtime_token, token->valuestring, sizeof(s_runtime_token));
+    }
+    if (cJSON_IsNumber(version)) {
+        s_runtime_protocol_version = version->valueint;
+    }
+    s_snapshot.protocol_version = s_runtime_protocol_version;
+}
+
+static void apply_activation_status_locked(const cJSON *root)
+{
+    s_snapshot.activation_pending = false;
+    s_snapshot.activation_code[0] = '\0';
+    s_snapshot.activation_message[0] = '\0';
+
+    const cJSON *activation = cJSON_GetObjectItem(root, "activation");
+    if (!cJSON_IsObject(activation)) {
+        return;
+    }
+
+    store_text_field_or_clear(activation, "code", s_snapshot.activation_code, sizeof(s_snapshot.activation_code));
+    store_text_field_or_clear(activation, "message", s_snapshot.activation_message, sizeof(s_snapshot.activation_message));
+    s_snapshot.activation_pending = s_snapshot.activation_code[0] != '\0';
+}
+
+static esp_err_t fetch_runtime_config(ornament_settings_t *settings, int *http_status, bool *activation_pending)
+{
+    if (settings == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    char *response = calloc(1, XIAOZHI_HTTP_RESPONSE_MAX);
+    char *request_body = calloc(1, 2048);
+    if (response == NULL || request_body == NULL) {
+        free(response);
+        free(request_body);
+        return ESP_ERR_NO_MEM;
+    }
+    http_response_buffer_t buffer = {
+        .data = response,
+        .length = 0,
+        .capacity = XIAOZHI_HTTP_RESPONSE_MAX,
+    };
+
+    esp_err_t err = build_ota_request_body(settings, s_runtime_client_id, request_body, 2048);
+    if (err != ESP_OK) {
+        free(response);
+        free(request_body);
+        return err;
+    }
+
+    esp_http_client_config_t config = {
+        .url = ota_url(),
+        .event_handler = http_event_handler,
+        .user_data = &buffer,
+        .timeout_ms = CONFIG_ORNAMENT_XIAOZHI_CONNECT_TIMEOUT_MS,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+    };
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (client == NULL) {
+        return ESP_FAIL;
+    }
+
+    char mac[24] = {0};
+    get_device_mac(mac, sizeof(mac));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_http_client_set_method(client, HTTP_METHOD_POST));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_http_client_set_header(client, "Activation-Version", "1"));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_http_client_set_header(client, "Device-Id", mac));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_http_client_set_header(client, "Client-Id", s_runtime_client_id));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_http_client_set_header(client, "User-Agent", "esp32-ornament/0.1.0"));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_http_client_set_header(client, "Accept-Language", "zh-CN"));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_http_client_set_header(client, "Content-Type", "application/json"));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_http_client_set_post_field(client, request_body, (int)strlen(request_body)));
+
+    err = esp_http_client_perform(client);
+    int status = esp_http_client_get_status_code(client);
+    if (http_status != NULL) {
+        *http_status = status;
+    }
+    if (err != ESP_OK) {
+        esp_http_client_cleanup(client);
+        free(response);
+        free(request_body);
+        return err;
+    }
+    if (status != 200) {
+        esp_http_client_cleanup(client);
+        free(response);
+        free(request_body);
+        return ESP_FAIL;
+    }
+
+    cJSON *root = cJSON_Parse(response);
+    esp_http_client_cleanup(client);
+    free(request_body);
+    if (root == NULL) {
+        free(response);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    if (s_mutex != NULL && xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        apply_runtime_websocket_config_locked(cJSON_GetObjectItem(root, "websocket"), settings);
+        apply_activation_status_locked(root);
+        xSemaphoreGive(s_mutex);
+    }
+
+    if (activation_pending != NULL) {
+        *activation_pending = false;
+        if (s_mutex != NULL && xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            *activation_pending = s_snapshot.activation_pending;
+            xSemaphoreGive(s_mutex);
+        }
+    }
+
+    cJSON_Delete(root);
+    free(response);
+    return ESP_OK;
+}
+
+static esp_err_t activate_runtime_config(int *http_status)
+{
+    char response[256] = {0};
+    http_response_buffer_t buffer = {
+        .data = response,
+        .length = 0,
+        .capacity = sizeof(response),
+    };
+
+    esp_http_client_config_t config = {
+        .url = "https://api.tenclass.net/xiaozhi/ota/activate",
+        .event_handler = http_event_handler,
+        .user_data = &buffer,
+        .timeout_ms = CONFIG_ORNAMENT_XIAOZHI_CONNECT_TIMEOUT_MS,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+    };
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (client == NULL) {
+        return ESP_FAIL;
+    }
+
+    char mac[24] = {0};
+    get_device_mac(mac, sizeof(mac));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_http_client_set_method(client, HTTP_METHOD_POST));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_http_client_set_header(client, "Activation-Version", "1"));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_http_client_set_header(client, "Device-Id", mac));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_http_client_set_header(client, "Client-Id", s_runtime_client_id));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_http_client_set_header(client, "User-Agent", "esp32-ornament/0.1.0"));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_http_client_set_header(client, "Accept-Language", "zh-CN"));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_http_client_set_header(client, "Content-Type", "application/json"));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_http_client_set_post_field(client, "{}", 2));
+
+    esp_err_t err = esp_http_client_perform(client);
+    int status = esp_http_client_get_status_code(client);
+    if (http_status != NULL) {
+        *http_status = status;
+    }
+    esp_http_client_cleanup(client);
+    if (err != ESP_OK) {
+        return err;
+    }
+    if (status == 200) {
+        return ESP_OK;
+    }
+    if (status == 202) {
+        return ESP_ERR_TIMEOUT;
+    }
+    return ESP_FAIL;
+}
 
 const char *xiaozhi_client_state_name(xiaozhi_client_state_t state)
 {
@@ -120,7 +483,12 @@ static void copy_settings_to_snapshot(const ornament_settings_t *settings)
     }
     if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         s_snapshot.enabled = true;
-        strlcpy(s_snapshot.ws_url, settings_xiaozhi_ws_url_or_default(settings), sizeof(s_snapshot.ws_url));
+        if (s_runtime_ws_url[0] != '\0') {
+            strlcpy(s_snapshot.ws_url, s_runtime_ws_url, sizeof(s_snapshot.ws_url));
+        } else {
+            strlcpy(s_snapshot.ws_url, settings_xiaozhi_ws_url_or_default(settings), sizeof(s_snapshot.ws_url));
+        }
+        s_snapshot.protocol_version = s_runtime_protocol_version;
         s_snapshot.configured = s_snapshot.ws_url[0] != '\0' && CONFIG_ORNAMENT_XIAOZHI_MIC_PIN_DIN >= 0;
         if (!s_snapshot.configured) {
             set_state_locked(XIAOZHI_CLIENT_STATE_CONFIG_MISSING);
@@ -185,6 +553,8 @@ static void get_client_id(char *target, size_t target_size)
 {
     if (CONFIG_ORNAMENT_XIAOZHI_CLIENT_ID[0] != '\0') {
         strlcpy(target, CONFIG_ORNAMENT_XIAOZHI_CLIENT_ID, target_size);
+    } else if (s_runtime_client_id[0] != '\0') {
+        strlcpy(target, s_runtime_client_id, target_size);
     } else {
         strlcpy(target, device_identity_hostname(), target_size);
     }
@@ -208,7 +578,7 @@ static esp_err_t send_hello_on_client(esp_websocket_client_handle_t client)
         sizeof(json),
         "{\"type\":\"hello\",\"version\":%d,\"transport\":\"websocket\","
         "\"audio_params\":{\"format\":\"opus\",\"sample_rate\":%d,\"channels\":1,\"frame_duration\":%d}}",
-        CONFIG_ORNAMENT_XIAOZHI_PROTOCOL_VERSION,
+        s_runtime_protocol_version,
         XIAOZHI_OPUS_SAMPLE_RATE_HZ,
         CONFIG_ORNAMENT_XIAOZHI_FRAME_MS);
     if (written <= 0 || written >= (int)sizeof(json)) {
@@ -240,7 +610,8 @@ static esp_err_t send_listen_state(const char *state)
     int written = snprintf(
         json,
         sizeof(json),
-        "{\"session_id\":\"%s\",\"type\":\"listen\",\"state\":\"%s\",\"mode\":\"manual\"}",
+        /* The Xiaozhi websocket protocol uses auto mode for open-mic, start-then-talk sessions. */
+        "{\"session_id\":\"%s\",\"type\":\"listen\",\"state\":\"%s\",\"mode\":\"auto\"}",
         session_id,
         state);
     if (written <= 0 || written >= (int)sizeof(json)) {
@@ -304,6 +675,7 @@ static void handle_text_message(const char *data, int len)
                 set_state(XIAOZHI_CLIENT_STATE_SPEAKING);
                 xEventGroupSetBits(s_events, XIAOZHI_EVENT_SPEAKING);
             } else if (strcmp(state->valuestring, "stop") == 0) {
+                release_tts_output_if_active();
                 set_state(XIAOZHI_CLIENT_STATE_LISTENING);
                 xEventGroupClearBits(s_events, XIAOZHI_EVENT_SPEAKING);
             } else if (strcmp(state->valuestring, "sentence_start") == 0) {
@@ -386,6 +758,14 @@ static void increment_uplink_frames(void)
     }
 }
 
+static void release_tts_output_if_active(void)
+{
+    if (s_tts_output_active) {
+        task_audio_output_release();
+        s_tts_output_active = false;
+    }
+}
+
 static void websocket_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
 {
     (void)handler_args;
@@ -411,13 +791,24 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
             int decoded = opus_decode((OpusDecoder *)data->user_context, (const unsigned char *)data->data_ptr, data->data_len, pcm, XIAOZHI_OPUS_DECODE_MAX_FRAMES, 0);
             xSemaphoreGive(s_codec_mutex);
             if (decoded > 0 && (xEventGroupGetBits(s_events) & XIAOZHI_EVENT_SPEAKING)) {
-                if (task_audio_output_acquire() == ESP_OK) {
+                if (!s_tts_output_active) {
+                    ornament_settings_t settings = {0};
+                    esp_err_t acquire_err = settings_load(&settings) == ESP_OK ?
+                        task_audio_output_acquire_with_volume(&settings) :
+                        task_audio_output_acquire();
+                    if (acquire_err == ESP_OK) {
+                        s_tts_output_active = true;
+                    } else {
+                        ESP_LOGW(TAG, "tts output acquire failed: %s", esp_err_to_name(acquire_err));
+                    }
+                }
+                if (s_tts_output_active) {
                     esp_err_t err = task_audio_output_write_mono(pcm, (size_t)decoded, 1000);
-                    task_audio_output_release();
                     if (err == ESP_OK) {
                         increment_downlink_frames();
                     } else {
                         ESP_LOGW(TAG, "tts write failed: %s", esp_err_to_name(err));
+                        release_tts_output_if_active();
                     }
                 }
             }
@@ -432,11 +823,13 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
     case WEBSOCKET_EVENT_DISCONNECTED:
     case WEBSOCKET_EVENT_CLOSED:
         ESP_LOGI(TAG, "websocket disconnected");
+        release_tts_output_if_active();
         xEventGroupSetBits(s_events, XIAOZHI_EVENT_STOP);
         set_state(XIAOZHI_CLIENT_STATE_IDLE);
         break;
     case WEBSOCKET_EVENT_ERROR:
         ESP_LOGW(TAG, "websocket error type=%d status=%d", data->error_handle.error_type, data->error_handle.esp_ws_handshake_status_code);
+        release_tts_output_if_active();
         set_error("websocket error");
         xEventGroupSetBits(s_events, XIAOZHI_EVENT_ERROR | XIAOZHI_EVENT_STOP);
         break;
@@ -495,7 +888,7 @@ static esp_err_t build_headers(const ornament_settings_t *settings, char *header
     get_device_mac(mac, sizeof(mac));
     get_client_id(client_id, sizeof(client_id));
 
-    const char *token = settings_xiaozhi_token_or_default(settings);
+    const char *token = s_runtime_token[0] != '\0' ? s_runtime_token : settings_xiaozhi_token_or_default(settings);
     if (token[0] != '\0') {
         snprintf(bearer, sizeof(bearer), "Bearer %s", token);
     }
@@ -507,7 +900,7 @@ static esp_err_t build_headers(const ornament_settings_t *settings, char *header
             headers_size,
             "Authorization: %s\r\nProtocol-Version: %d\r\nDevice-Id: %s\r\nClient-Id: %s\r\n",
             bearer,
-            CONFIG_ORNAMENT_XIAOZHI_PROTOCOL_VERSION,
+            s_runtime_protocol_version,
             mac,
             client_id);
     } else {
@@ -515,7 +908,7 @@ static esp_err_t build_headers(const ornament_settings_t *settings, char *header
             headers,
             headers_size,
             "Protocol-Version: %d\r\nDevice-Id: %s\r\nClient-Id: %s\r\n",
-            CONFIG_ORNAMENT_XIAOZHI_PROTOCOL_VERSION,
+            s_runtime_protocol_version,
             mac,
             client_id);
     }
@@ -634,6 +1027,50 @@ static void session_task(void *arg)
         goto done;
     }
 
+    if (is_official_backend_url(settings_xiaozhi_ws_url_or_default(&settings))) {
+        bool activation_pending = false;
+        int ota_status = -1;
+        err = fetch_runtime_config(&settings, &ota_status, &activation_pending);
+        if (err != ESP_OK) {
+            char detail[64];
+            snprintf(detail, sizeof(detail), "ota config failed (%d)", ota_status);
+            set_error(detail);
+            goto done;
+        }
+        copy_settings_to_snapshot(&settings);
+        if (activation_pending) {
+            for (int attempt = 0; attempt < 10 && activation_pending; attempt++) {
+                int activate_status = -1;
+                err = activate_runtime_config(&activate_status);
+                if (err == ESP_OK) {
+                    err = fetch_runtime_config(&settings, &ota_status, &activation_pending);
+                    if (err != ESP_OK) {
+                        char detail[64];
+                        snprintf(detail, sizeof(detail), "ota refresh failed (%d)", ota_status);
+                        set_error(detail);
+                        goto done;
+                    }
+                    copy_settings_to_snapshot(&settings);
+                    break;
+                }
+                if (err != ESP_ERR_TIMEOUT) {
+                    char detail[64];
+                    snprintf(detail, sizeof(detail), "activate failed (%d)", activate_status);
+                    set_error(detail);
+                    goto done;
+                }
+                vTaskDelay(pdMS_TO_TICKS(3000));
+            }
+            if (activation_pending) {
+                if (s_mutex != NULL && xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                    set_state_locked(XIAOZHI_CLIENT_STATE_IDLE);
+                    xSemaphoreGive(s_mutex);
+                }
+                goto done;
+            }
+        }
+    }
+
     int opus_err = 0;
     OpusEncoder *encoder = opus_encoder_create(XIAOZHI_OPUS_SAMPLE_RATE_HZ, XIAOZHI_OPUS_CHANNELS, OPUS_APPLICATION_VOIP, &opus_err);
     if (encoder == NULL || opus_err != OPUS_OK) {
@@ -657,7 +1094,7 @@ static void session_task(void *arg)
     }
 
     esp_websocket_client_config_t cfg = {
-        .uri = settings_xiaozhi_ws_url_or_default(&settings),
+        .uri = s_runtime_ws_url[0] != '\0' ? s_runtime_ws_url : settings_xiaozhi_ws_url_or_default(&settings),
         .headers = headers,
         .buffer_size = CONFIG_ORNAMENT_XIAOZHI_WS_BUFFER_BYTES,
         .task_stack = XIAOZHI_WS_TASK_STACK,
@@ -700,6 +1137,7 @@ static void session_task(void *arg)
     }
 
 cleanup_ws:
+    release_tts_output_if_active();
     if (s_client != NULL) {
         if (esp_websocket_client_is_connected(s_client)) {
             (void)esp_websocket_client_close(s_client, pdMS_TO_TICKS(1000));
@@ -755,9 +1193,23 @@ esp_err_t xiaozhi_client_init(void)
     memset(&s_snapshot, 0, sizeof(s_snapshot));
     s_snapshot.enabled = true;
     s_snapshot.state = XIAOZHI_CLIENT_STATE_IDLE;
+    s_snapshot.protocol_version = CONFIG_ORNAMENT_XIAOZHI_PROTOCOL_VERSION;
 
     ornament_settings_t settings;
     if (settings_load(&settings) == ESP_OK) {
+        if (load_or_create_client_id(s_runtime_client_id, sizeof(s_runtime_client_id)) == ESP_OK) {
+            strlcpy(s_snapshot.client_id, s_runtime_client_id, sizeof(s_snapshot.client_id));
+        }
+        reset_runtime_config_locked(&settings);
+        copy_settings_to_snapshot(&settings);
+        if (is_official_backend_url(settings_xiaozhi_ws_url_or_default(&settings))) {
+            int ota_status = -1;
+            bool activation_pending = false;
+            esp_err_t ota_err = fetch_runtime_config(&settings, &ota_status, &activation_pending);
+            if (ota_err != ESP_OK) {
+                ESP_LOGW(TAG, "initial ota config fetch failed: %s status=%d", esp_err_to_name(ota_err), ota_status);
+            }
+        }
         copy_settings_to_snapshot(&settings);
         if (s_snapshot.configured) {
             set_state(XIAOZHI_CLIENT_STATE_IDLE);
@@ -806,10 +1258,35 @@ esp_err_t xiaozhi_client_probe(const char *ws_url_override, const char *token_ov
         return err;
     }
 
+    if (s_runtime_client_id[0] == '\0') {
+        err = load_or_create_client_id(s_runtime_client_id, sizeof(s_runtime_client_id));
+        if (err != ESP_OK) {
+            result->err = err;
+            strlcpy(result->detail, "client id init failed", sizeof(result->detail));
+            return err;
+        }
+    }
+    if (ws_url_override == NULL && token_override == NULL &&
+        is_official_backend_url(settings_xiaozhi_ws_url_or_default(&settings))) {
+        int ota_status = -1;
+        bool activation_pending = false;
+        err = fetch_runtime_config(&settings, &ota_status, &activation_pending);
+        if (err != ESP_OK) {
+            result->err = err;
+            snprintf(result->detail, sizeof(result->detail), "ota config failed (%d)", ota_status);
+            return err;
+        }
+        if (activation_pending) {
+            result->err = ESP_OK;
+            strlcpy(result->detail, "activation code ready", sizeof(result->detail));
+            return ESP_OK;
+        }
+    }
+
     const char *ws_url = (ws_url_override != NULL && ws_url_override[0] != '\0') ?
-        ws_url_override : settings_xiaozhi_ws_url_or_default(&settings);
+        ws_url_override : (s_runtime_ws_url[0] != '\0' ? s_runtime_ws_url : settings_xiaozhi_ws_url_or_default(&settings));
     const char *token = (token_override != NULL && token_override[0] != '\0') ?
-        token_override : settings_xiaozhi_token_or_default(&settings);
+        token_override : (s_runtime_token[0] != '\0' ? s_runtime_token : settings_xiaozhi_token_or_default(&settings));
     result->configured = ws_url[0] != '\0';
     if (!result->configured) {
         result->err = ESP_ERR_INVALID_ARG;

@@ -71,8 +71,13 @@ static int16_t apply_volume(int16_t sample)
 
 static int16_t narrow_mic_sample(int32_t raw)
 {
-    /* INMP441 outputs 24-bit two's-complement I2S data in a 32-bit slot. */
-    int32_t narrowed = raw >> 8;
+    /*
+     * INMP441 outputs 24-bit two's-complement I2S data.
+     * ESP-IDF RX places the valid 24 bits in the high 24 bits of each 32-bit word,
+     * so convert to signed 16-bit PCM by dropping the low padding byte and the low
+     * 8 bits of the 24-bit sample.
+     */
+    int32_t narrowed = raw >> 16;
 
     if (narrowed > INT16_MAX) {
         narrowed = INT16_MAX;
@@ -116,6 +121,11 @@ static esp_err_t write_stereo_frames(const int16_t *mono_samples, size_t frame_c
     }
 
     return ESP_OK;
+}
+
+static void refresh_output_volume_from_settings(const ornament_settings_t *settings)
+{
+    s_play_volume_percent = settings_audio_volume_percent_or_default(settings);
 }
 
 static esp_err_t disable_route_locked(audio_route_t route)
@@ -174,16 +184,16 @@ static esp_err_t switch_route_locked(audio_route_t target)
 
 static void play_task_done_audio(void)
 {
+    ornament_settings_t settings;
+    if (settings_load(&settings) == ESP_OK) {
+        refresh_output_volume_from_settings(&settings);
+    } else {
+        s_play_volume_percent = CONFIG_ORNAMENT_AUDIO_VOLUME_PERCENT;
+    }
+
     if (task_audio_output_acquire() != ESP_OK) {
         ESP_LOGW(TAG, "task done voice skipped: audio output busy");
         return;
-    }
-
-    ornament_settings_t settings;
-    if (settings_load(&settings) == ESP_OK) {
-        s_play_volume_percent = settings_audio_volume_percent_or_default(&settings);
-    } else {
-        s_play_volume_percent = CONFIG_ORNAMENT_AUDIO_VOLUME_PERCENT;
     }
 
     const size_t pcm_bytes = (size_t)(task_done_pcm_end - task_done_pcm_start);
@@ -349,11 +359,26 @@ void task_audio_play_done(void)
 
 esp_err_t task_audio_output_acquire(void)
 {
+    return task_audio_output_acquire_with_volume(NULL);
+}
+
+esp_err_t task_audio_output_acquire_with_volume(const ornament_settings_t *settings)
+{
     if (s_bus_mutex == NULL || s_tx_chan == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
     if (xSemaphoreTake(s_bus_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
         return ESP_ERR_TIMEOUT;
+    }
+    if (settings != NULL) {
+        refresh_output_volume_from_settings(settings);
+    } else {
+        ornament_settings_t loaded;
+        if (settings_load(&loaded) == ESP_OK) {
+            refresh_output_volume_from_settings(&loaded);
+        } else {
+            s_play_volume_percent = CONFIG_ORNAMENT_AUDIO_VOLUME_PERCENT;
+        }
     }
     esp_err_t err = switch_route_locked(AUDIO_ROUTE_TX);
     if (err != ESP_OK) {

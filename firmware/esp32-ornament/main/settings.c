@@ -24,6 +24,7 @@ static const char *KEY_WEATHER_SOURCE = "weather_source";
 static const char *KEY_WEATHER_LAT_E6 = "weather_lat_e6";
 static const char *KEY_WEATHER_LON_E6 = "weather_lon_e6";
 static const char *KEY_CAIYUN_TOKEN = "caiyun_token";
+static const char *LEGACY_XIAOZHI_WS_URL = "ws://123.60.62.147:8000/xiaozhi/v1/";
 
 static void load_default_settings(ornament_settings_t *settings)
 {
@@ -52,6 +53,14 @@ static void read_nvs_string(nvs_handle_t handle, const char *key, char *target, 
     if (err != ESP_OK && target_size > 0) {
         target[0] = '\0';
     }
+}
+
+static bool xiaozhi_ws_url_needs_migration(const char *ws_url)
+{
+    return ws_url != NULL &&
+           ws_url[0] != '\0' &&
+           strcmp(ws_url, LEGACY_XIAOZHI_WS_URL) == 0 &&
+           strcmp(CONFIG_ORNAMENT_XIAOZHI_WS_URL, LEGACY_XIAOZHI_WS_URL) != 0;
 }
 
 esp_err_t settings_load(ornament_settings_t *settings)
@@ -101,7 +110,11 @@ esp_err_t settings_load(ornament_settings_t *settings)
         settings->has_bridge_url = true;
     }
     if (xiaozhi_ws_url[0] != '\0') {
-        strlcpy(settings->xiaozhi_ws_url, xiaozhi_ws_url, sizeof(settings->xiaozhi_ws_url));
+        if (xiaozhi_ws_url_needs_migration(xiaozhi_ws_url)) {
+            strlcpy(settings->xiaozhi_ws_url, CONFIG_ORNAMENT_XIAOZHI_WS_URL, sizeof(settings->xiaozhi_ws_url));
+        } else {
+            strlcpy(settings->xiaozhi_ws_url, xiaozhi_ws_url, sizeof(settings->xiaozhi_ws_url));
+        }
         settings->has_xiaozhi_ws_url = true;
     }
     if (xiaozhi_token[0] != '\0') {

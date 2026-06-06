@@ -295,7 +295,10 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     char weather_config_label[ORNAMENT_WEATHER_LABEL_MAX * 2];
     char bridge_url[ORNAMENT_BRIDGE_URL_MAX * 2];
     char xiaozhi_ws_url[ORNAMENT_XIAOZHI_WS_URL_MAX * 2];
+    char xiaozhi_client_id[XIAOZHI_CLIENT_ID_MAX * 2];
     char xiaozhi_session_id[XIAOZHI_SESSION_ID_MAX * 2];
+    char xiaozhi_activation_code[XIAOZHI_ACTIVATION_CODE_MAX * 2];
+    char xiaozhi_activation_message[XIAOZHI_STATUS_TEXT_MAX * 2];
     char xiaozhi_last_error[XIAOZHI_STATUS_TEXT_MAX * 2];
     char xiaozhi_last_stt[XIAOZHI_STATUS_TEXT_MAX * 2];
     char xiaozhi_last_tts[XIAOZHI_STATUS_TEXT_MAX * 2];
@@ -321,7 +324,10 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     json_escape(settings_bridge_url_or_default(&console_settings), bridge_url, sizeof(bridge_url));
     xiaozhi_client_status_snapshot(&xiaozhi);
     json_escape(xiaozhi.ws_url, xiaozhi_ws_url, sizeof(xiaozhi_ws_url));
+    json_escape(xiaozhi.client_id, xiaozhi_client_id, sizeof(xiaozhi_client_id));
     json_escape(xiaozhi.session_id, xiaozhi_session_id, sizeof(xiaozhi_session_id));
+    json_escape(xiaozhi.activation_code, xiaozhi_activation_code, sizeof(xiaozhi_activation_code));
+    json_escape(xiaozhi.activation_message, xiaozhi_activation_message, sizeof(xiaozhi_activation_message));
     json_escape(xiaozhi.last_error, xiaozhi_last_error, sizeof(xiaozhi_last_error));
     json_escape(xiaozhi.last_stt, xiaozhi_last_stt, sizeof(xiaozhi_last_stt));
     json_escape(xiaozhi.last_tts, xiaozhi_last_tts, sizeof(xiaozhi_last_tts));
@@ -330,53 +336,27 @@ static esp_err_t status_get_handler(httpd_req_t *req)
         xSemaphoreGive(state_mutex);
     }
 
-    const size_t json_size = 5120;
+    const size_t json_size = 8192;
     char *json = calloc(1, json_size);
     if (json == NULL) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
         return ESP_FAIL;
     }
-
-    snprintf(
+    size_t used = 0;
+    append(json, json_size, &used, "{");
+    appendf(json, json_size, &used, "\"uptime_ms\":%lld,", (long long)(esp_timer_get_time() / 1000));
+    appendf(json, json_size, &used, "\"last_state_age_ms\":%lld,", (long long)age_ms);
+    appendf(json, json_size, &used, "\"fetch_error\":\"%s\",", esp_err_to_name(fetch_error));
+    appendf(json, json_size, &used, "\"bridge_offline\":%s,", state.bridge_offline ? "true" : "false");
+    appendf(json, json_size, &used, "\"hostname\":\"%s\",", device_identity_hostname());
+    appendf(json, json_size, &used, "\"mdns_url\":\"%s\",", device_identity_mdns_url());
+    appendf(json, json_size, &used, "\"bridge_url\":\"%s\",", bridge_url);
+    appendf(json, json_size, &used, "\"wifi\":{\"connected\":%s,\"ssid\":\"%s\",\"rssi\":%d},", state.wifi_connected ? "true" : "false", wifi_ssid, state.wifi_rssi);
+    appendf(
         json,
         json_size,
-        "{"
-        "\"uptime_ms\":%lld,"
-        "\"last_state_age_ms\":%lld,"
-        "\"fetch_error\":\"%s\","
-        "\"bridge_offline\":%s,"
-        "\"hostname\":\"%s\","
-        "\"mdns_url\":\"%s\","
-        "\"bridge_url\":\"%s\","
-        "\"wifi\":{\"connected\":%s,\"ssid\":\"%s\",\"rssi\":%d},"
-        "\"network\":{\"connected\":%s,\"ip\":\"%s\",\"netmask\":\"%s\",\"gateway\":\"%s\",\"bssid\":\"%s\","
-        "\"channel\":%d,\"authmode\":%d,\"retry_count\":%d,\"last_disconnect_reason\":%u,"
-        "\"last_disconnect_name\":\"%s\",\"last_disconnect_rssi\":%d},"
-        "\"time\":{\"synced\":%s,\"local_time\":\"%s\",\"local_date\":\"%s\"},"
-        "\"weather\":{\"has\":%s,\"status\":\"%s\",\"label\":\"%s\",\"source\":\"%s\",\"summary\":\"%s\",\"icon\":\"%s\","
-        "\"observed_at\":\"%s\",\"temperature_c\":%d,\"wind_kmh\":%d,\"code\":%d},"
-        "\"weather_config\":{\"caiyun_configured\":%s,\"source\":\"%s\",\"label\":\"%s\",\"lat_e6\":%d,\"lon_e6\":%d},"
-        "\"quota\":{\"has\":%s,\"status\":\"%s\",\"primary\":%d,\"weekly\":%d},"
-        "\"task\":{\"has\":%s,\"active_count\":%d,\"done_seq\":%d,\"status\":\"%s\",\"title\":\"%s\",\"message\":\"%s\"},"
-        "\"audio\":{\"enabled\":%s,\"volume_percent\":%d},"
-        "\"xiaozhi\":{\"enabled\":%s,\"configured\":%s,\"connected\":%s,\"state\":\"%s\","
-        "\"ws_url\":\"%s\",\"session_id\":\"%s\",\"last_error\":\"%s\",\"last_stt\":\"%s\","
-        "\"last_tts\":\"%s\",\"uplink_frames\":%u,\"downlink_frames\":%u},"
-        "\"bridge_debug\":{\"last_fetch_error\":\"%s\",\"consecutive_fetch_failures\":%d,"
-        "\"last_success_ms\":%lld,\"last_failure_ms\":%lld,"
-        "\"last_auto_match_ok\":%s,\"last_auto_match_error\":\"%s\",\"last_auto_match_reason\":\"%s\"},"
-        "\"heap\":{\"free\":%u,\"min_free\":%u,\"largest_free_block\":%u}"
-        "}",
-        (long long)(esp_timer_get_time() / 1000),
-        (long long)age_ms,
-        esp_err_to_name(fetch_error),
-        state.bridge_offline ? "true" : "false",
-        device_identity_hostname(),
-        device_identity_mdns_url(),
-        bridge_url,
-        state.wifi_connected ? "true" : "false",
-        wifi_ssid,
-        state.wifi_rssi,
+        &used,
+        "\"network\":{\"connected\":%s,\"ip\":\"%s\",\"netmask\":\"%s\",\"gateway\":\"%s\",\"bssid\":\"%s\",\"channel\":%d,\"authmode\":%d,\"retry_count\":%d,\"last_disconnect_reason\":%u,\"last_disconnect_name\":\"%s\",\"last_disconnect_rssi\":%d},",
         wifi_debug.connected ? "true" : "false",
         wifi_debug.ip,
         wifi_debug.netmask,
@@ -387,10 +367,13 @@ static esp_err_t status_get_handler(httpd_req_t *req)
         wifi_debug.retry_count,
         wifi_debug.last_disconnect_reason,
         wifi_debug.last_disconnect_name,
-        wifi_debug.last_disconnect_rssi,
-        state.time_synced ? "true" : "false",
-        state.local_time,
-        state.local_date,
+        wifi_debug.last_disconnect_rssi);
+    appendf(json, json_size, &used, "\"time\":{\"synced\":%s,\"local_time\":\"%s\",\"local_date\":\"%s\"},", state.time_synced ? "true" : "false", state.local_time, state.local_date);
+    appendf(
+        json,
+        json_size,
+        &used,
+        "\"weather\":{\"has\":%s,\"status\":\"%s\",\"label\":\"%s\",\"source\":\"%s\",\"summary\":\"%s\",\"icon\":\"%s\",\"observed_at\":\"%s\",\"temperature_c\":%d,\"wind_kmh\":%d,\"code\":%d},",
         state.has_weather ? "true" : "false",
         weather_status,
         weather_label,
@@ -400,42 +383,76 @@ static esp_err_t status_get_handler(httpd_req_t *req)
         weather_observed_at,
         state.weather_temperature_c,
         state.weather_wind_kmh,
-        state.weather_code,
+        state.weather_code);
+    appendf(
+        json,
+        json_size,
+        &used,
+        "\"weather_config\":{\"caiyun_configured\":%s,\"source\":\"%s\",\"label\":\"%s\",\"lat_e6\":%d,\"lon_e6\":%d},",
         console_settings.has_caiyun_token ? "true" : "false",
         settings_weather_source_or_default(&console_settings),
         weather_config_label,
         console_settings.weather_lat_e6,
-        console_settings.weather_lon_e6,
+        console_settings.weather_lon_e6);
+    appendf(
+        json,
+        json_size,
+        &used,
+        "\"quota\":{\"has\":%s,\"status\":\"%s\",\"primary\":%d,\"weekly\":%d},",
         state.has_quota ? "true" : "false",
         quota_status,
         state.primary_remaining_percent,
-        state.secondary_remaining_percent,
+        state.secondary_remaining_percent);
+    appendf(
+        json,
+        json_size,
+        &used,
+        "\"task\":{\"has\":%s,\"active_count\":%d,\"done_seq\":%d,\"status\":\"%s\",\"title\":\"%s\",\"message\":\"%s\"},",
         state.has_task ? "true" : "false",
         state.active_task_count,
         state.done_seq,
         status,
         task_title,
-        task_message,
-        CONFIG_ORNAMENT_AUDIO_ENABLED ? "true" : "false",
-        settings_audio_volume_percent_or_default(&console_settings),
+        task_message);
+    appendf(json, json_size, &used, "\"audio\":{\"enabled\":%s,\"volume_percent\":%d},", CONFIG_ORNAMENT_AUDIO_ENABLED ? "true" : "false", settings_audio_volume_percent_or_default(&console_settings));
+    appendf(
+        json,
+        json_size,
+        &used,
+        "\"xiaozhi\":{\"enabled\":%s,\"configured\":%s,\"connected\":%s,\"state\":\"%s\",\"protocol_version\":%d,\"activation_pending\":%s,\"ws_url\":\"%s\",\"client_id\":\"%s\",\"session_id\":\"%s\",\"activation_code\":\"%s\",\"activation_message\":\"%s\",\"last_error\":\"%s\",\"last_stt\":\"%s\",\"last_tts\":\"%s\",\"uplink_frames\":%u,\"downlink_frames\":%u},",
         xiaozhi.enabled ? "true" : "false",
         xiaozhi.configured ? "true" : "false",
         xiaozhi.connected ? "true" : "false",
         xiaozhi_client_state_name(xiaozhi.state),
+        xiaozhi.protocol_version,
+        xiaozhi.activation_pending ? "true" : "false",
         xiaozhi_ws_url,
+        xiaozhi_client_id,
         xiaozhi_session_id,
+        xiaozhi_activation_code,
+        xiaozhi_activation_message,
         xiaozhi_last_error,
         xiaozhi_last_stt,
         xiaozhi_last_tts,
         (unsigned int)xiaozhi.uplink_frames,
-        (unsigned int)xiaozhi.downlink_frames,
+        (unsigned int)xiaozhi.downlink_frames);
+    appendf(
+        json,
+        json_size,
+        &used,
+        "\"bridge_debug\":{\"last_fetch_error\":\"%s\",\"consecutive_fetch_failures\":%d,\"last_success_ms\":%lld,\"last_failure_ms\":%lld,\"last_auto_match_ok\":%s,\"last_auto_match_error\":\"%s\",\"last_auto_match_reason\":\"%s\"},",
         esp_err_to_name(bridge_diag.last_fetch_error),
         bridge_diag.consecutive_fetch_failures,
         (long long)bridge_diag.last_success_ms,
         (long long)bridge_diag.last_failure_ms,
         bridge_diag.last_auto_match_ok ? "true" : "false",
         esp_err_to_name(bridge_diag.last_auto_match_error),
-        bridge_diag.last_auto_match_reason,
+        bridge_diag.last_auto_match_reason);
+    appendf(
+        json,
+        json_size,
+        &used,
+        "\"heap\":{\"free\":%u,\"min_free\":%u,\"largest_free_block\":%u}}",
         (unsigned int)esp_get_free_heap_size(),
         (unsigned int)esp_get_minimum_free_heap_size(),
         (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
@@ -467,6 +484,9 @@ static esp_err_t root_get_handler(httpd_req_t *req)
     char weather_value[96];
     char weather_detail[192];
     char xiaozhi_ws_url[ORNAMENT_XIAOZHI_WS_URL_MAX * 2];
+    char xiaozhi_client_id[XIAOZHI_CLIENT_ID_MAX * 2];
+    char xiaozhi_activation_code[XIAOZHI_ACTIVATION_CODE_MAX * 2];
+    char xiaozhi_activation_message[XIAOZHI_STATUS_TEXT_MAX * 2];
     char xiaozhi_last_error[XIAOZHI_STATUS_TEXT_MAX * 2];
     char xiaozhi_last_stt[XIAOZHI_STATUS_TEXT_MAX * 2];
     char xiaozhi_last_tts[XIAOZHI_STATUS_TEXT_MAX * 2];
@@ -485,7 +505,10 @@ static esp_err_t root_get_handler(httpd_req_t *req)
     int codex_done_seq = state.has_codex_summary ? state.codex_done_seq : state.done_seq;
     html_escape(settings_bridge_url_or_default(&console_settings), bridge_url, sizeof(bridge_url));
     xiaozhi_client_status_snapshot(&xiaozhi);
-    html_escape(settings_xiaozhi_ws_url_or_default(&console_settings), xiaozhi_ws_url, sizeof(xiaozhi_ws_url));
+    html_escape(xiaozhi.ws_url[0] != '\0' ? xiaozhi.ws_url : settings_xiaozhi_ws_url_or_default(&console_settings), xiaozhi_ws_url, sizeof(xiaozhi_ws_url));
+    html_escape(xiaozhi.client_id, xiaozhi_client_id, sizeof(xiaozhi_client_id));
+    html_escape(xiaozhi.activation_code, xiaozhi_activation_code, sizeof(xiaozhi_activation_code));
+    html_escape(xiaozhi.activation_message, xiaozhi_activation_message, sizeof(xiaozhi_activation_message));
     html_escape(xiaozhi.last_error, xiaozhi_last_error, sizeof(xiaozhi_last_error));
     html_escape(xiaozhi.last_stt, xiaozhi_last_stt, sizeof(xiaozhi_last_stt));
     html_escape(xiaozhi.last_tts, xiaozhi_last_tts, sizeof(xiaozhi_last_tts));
@@ -619,6 +642,22 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "<div class=\"card\"><div class=\"k\">State</div><div class=\"v\">%s</div><div class=\"k\">configured %s</div></div>",
         xiaozhi_client_state_name(xiaozhi.state),
         xiaozhi.configured ? "yes" : "no");
+    appendf(
+        html,
+        html_size,
+        &used,
+        "<div class=\"card\"><div class=\"k\">Client ID</div><div class=\"v\">%s</div><div class=\"k\">proto v%d</div></div>",
+        xiaozhi_client_id[0] != '\0' ? xiaozhi_client_id : "--",
+        xiaozhi.protocol_version);
+    appendf(
+        html,
+        html_size,
+        &used,
+        "<div class=\"card\"><div class=\"k\">Activation Code</div><div class=\"v\">%s</div><div class=\"k\">%s</div></div>",
+        xiaozhi_activation_code[0] != '\0' ? xiaozhi_activation_code : "--",
+        xiaozhi.activation_pending ?
+            (xiaozhi_activation_message[0] != '\0' ? xiaozhi_activation_message : "pending bind on xiaozhi.me") :
+            "not pending");
     appendf(
         html,
         html_size,
@@ -1075,35 +1114,45 @@ static esp_err_t send_xiaozhi_test_page(httpd_req_t *req, const xiaozhi_probe_re
         return send_xiaozhi_page(req, "Xiaozhi Test", "No test result.");
     }
 
-    char escaped_detail[XIAOZHI_STATUS_TEXT_MAX * 2];
-    char escaped_session_id[XIAOZHI_SESSION_ID_MAX * 2];
+    char escaped_detail[XIAOZHI_STATUS_TEXT_MAX * 6 + 1];
+    char escaped_session_id[XIAOZHI_SESSION_ID_MAX * 6 + 1];
     html_escape(result->detail, escaped_detail, sizeof(escaped_detail));
     html_escape(result->session_id, escaped_session_id, sizeof(escaped_session_id));
 
-    char html[1536];
-    snprintf(
+    char html[3072];
+    size_t used = 0;
+    append(
         html,
         sizeof(html),
+        &used,
         "<!doctype html><html><head><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
         "<style>body{font-family:system-ui;margin:24px;background:#0b1116;color:#edf7fb}a{color:#49d3c8}"
         ".grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(180px,1fr))}"
         ".card{padding:14px;border:1px solid #22303c;border-radius:8px;background:#111923}"
         ".k{font-size:12px;color:#8ea5b5;text-transform:uppercase}.v{font-size:20px;margin-top:6px}</style>"
-        "</head><body><h1>Xiaozhi Test</h1><section class=\"grid\">"
+        "</head><body><h1>Xiaozhi Test</h1><section class=\"grid\">");
+    appendf(
+        html,
+        sizeof(html),
+        &used,
         "<div class=\"card\"><div class=\"k\">Result</div><div class=\"v\">%s</div></div>"
         "<div class=\"card\"><div class=\"k\">WebSocket</div><div class=\"v\">%s</div></div>"
         "<div class=\"card\"><div class=\"k\">Hello</div><div class=\"v\">%s</div></div>"
-        "<div class=\"card\"><div class=\"k\">HTTP Status</div><div class=\"v\">%d</div></div>"
-        "</section><section class=\"grid\" style=\"margin-top:12px\">"
-        "<div class=\"card\"><div class=\"k\">Session ID</div><div class=\"v\">%s</div></div>"
-        "<div class=\"card\"><div class=\"k\">Detail</div><div class=\"v\">%s</div></div>"
-        "</section><p><a href=\"/\">Back</a></p></body></html>",
+        "<div class=\"card\"><div class=\"k\">HTTP Status</div><div class=\"v\">%d</div></div>",
         result->err == ESP_OK ? "ok" : esp_err_to_name(result->err),
         result->websocket_connected ? "connected" : "not connected",
         result->hello_received ? "received" : "not received",
-        result->http_status,
+        result->http_status);
+    append(html, sizeof(html), &used, "</section><section class=\"grid\" style=\"margin-top:12px\">");
+    appendf(
+        html,
+        sizeof(html),
+        &used,
+        "<div class=\"card\"><div class=\"k\">Session ID</div><div class=\"v\">%s</div></div>"
+        "<div class=\"card\"><div class=\"k\">Detail</div><div class=\"v\">%s</div></div>",
         escaped_session_id[0] != '\0' ? escaped_session_id : "--",
         escaped_detail[0] != '\0' ? escaped_detail : "--");
+    append(html, sizeof(html), &used, "</section><p><a href=\"/\">Back</a></p></body></html>");
 
     httpd_resp_set_type(req, "text/html; charset=utf-8");
     return httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
