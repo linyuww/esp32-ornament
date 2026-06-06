@@ -481,6 +481,31 @@ static uint8_t glyph_alpha_at(
     return lv_alpha_from_bitmap(bitmap, bitmap_index, format);
 }
 
+static const uint8_t *glyph_bitmap_bytes(
+    const void *bitmap_ref,
+    const lv_draw_buf_t *draw_buf,
+    uint32_t *stride,
+    bool *bitmap_is_a8)
+{
+    if (bitmap_ref == NULL) {
+        return NULL;
+    }
+    if (draw_buf != NULL &&
+        (bitmap_ref == (const void *)draw_buf || bitmap_ref == (const void *)draw_buf->data)) {
+        if (stride != NULL) {
+            *stride = draw_buf->header.stride;
+        }
+        if (bitmap_is_a8 != NULL) {
+            *bitmap_is_a8 = true;
+        }
+        return draw_buf->data;
+    }
+    if (bitmap_is_a8 != NULL) {
+        *bitmap_is_a8 = false;
+    }
+    return (const uint8_t *)bitmap_ref;
+}
+
 static void blend_pixel(int x, int y, uint16_t color, uint8_t alpha)
 {
     if (x < 0 || y < 0 || x >= active_canvas->width || y >= active_canvas->height || alpha == 0) {
@@ -521,25 +546,37 @@ static int draw_utf8_text(int x, int y, const lv_font_t *font, const char *text,
             cursor += adv > 0 ? adv : font->line_height / 2;
             continue;
         }
-        uint8_t glyph_bitmap_storage[256];
+        uint8_t glyph_bitmap_storage[384];
+        uint8_t *glyph_bitmap_buffer = glyph_bitmap_storage;
         lv_draw_buf_t glyph_draw_buf;
         lv_draw_buf_t *glyph_draw_buf_ptr = NULL;
         uint32_t glyph_stride = lv_draw_buf_width_to_stride(glyph.box_w, LV_COLOR_FORMAT_A8);
-        uint32_t glyph_bitmap_size = glyph_stride * glyph.box_h;
+        uint32_t glyph_bitmap_size = LV_DRAW_BUF_SIZE(glyph.box_w, glyph.box_h, LV_COLOR_FORMAT_A8);
         bool bitmap_is_a8 = false;
-        if (glyph.box_w > 0 && glyph.box_h > 0 && glyph_bitmap_size <= sizeof(glyph_bitmap_storage) &&
-            lv_draw_buf_init(
+        if (glyph.box_w <= 0 || glyph.box_h <= 0) {
+            cursor += adv;
+            continue;
+        }
+        if (glyph_bitmap_size > sizeof(glyph_bitmap_storage)) {
+            glyph_bitmap_buffer = lv_malloc(glyph_bitmap_size);
+            if (glyph_bitmap_buffer == NULL) {
+                lv_font_glyph_release_draw_data(&glyph);
+                cursor += adv;
+                continue;
+            }
+        }
+        if (lv_draw_buf_init(
                 &glyph_draw_buf,
                 glyph.box_w,
                 glyph.box_h,
                 LV_COLOR_FORMAT_A8,
                 glyph_stride,
-                glyph_bitmap_storage,
-                sizeof(glyph_bitmap_storage)) == LV_RESULT_OK) {
+                glyph_bitmap_buffer,
+                glyph_bitmap_size) == LV_RESULT_OK) {
             glyph_draw_buf_ptr = &glyph_draw_buf;
-            bitmap_is_a8 = true;
         }
-        const uint8_t *bitmap = (const uint8_t *)lv_font_get_glyph_bitmap(&glyph, glyph_draw_buf_ptr);
+        const void *bitmap_ref = lv_font_get_glyph_bitmap(&glyph, glyph_draw_buf_ptr);
+        const uint8_t *bitmap = glyph_bitmap_bytes(bitmap_ref, glyph_draw_buf_ptr, &glyph_stride, &bitmap_is_a8);
         if (bitmap != NULL) {
             int glyph_x = cursor + glyph.ofs_x;
             int glyph_y = y + font->line_height - font->base_line - glyph.box_h - glyph.ofs_y;
@@ -551,6 +588,9 @@ static int draw_utf8_text(int x, int y, const lv_font_t *font, const char *text,
             }
         }
         lv_font_glyph_release_draw_data(&glyph);
+        if (glyph_bitmap_buffer != glyph_bitmap_storage) {
+            lv_free(glyph_bitmap_buffer);
+        }
         cursor += adv;
     }
     return cursor - x;

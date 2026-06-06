@@ -52,6 +52,8 @@ static bool s_input_session_active;
 static bool s_rx_enabled;
 static int s_play_volume_percent = CONFIG_ORNAMENT_AUDIO_VOLUME_PERCENT;
 static audio_route_t s_active_route;
+static int32_t s_mic_prev_input;
+static int32_t s_mic_prev_output;
 static i2s_std_gpio_config_t s_tx_gpio_active_cfg;
 static i2s_std_gpio_config_t s_tx_gpio_idle_cfg;
 static i2s_std_gpio_config_t s_rx_gpio_active_cfg;
@@ -73,18 +75,26 @@ static int16_t narrow_mic_sample(int32_t raw)
 {
     /*
      * INMP441 outputs 24-bit two's-complement I2S data.
-     * ESP-IDF RX places the valid 24 bits in the high 24 bits of each 32-bit word,
-     * so convert to signed 16-bit PCM by dropping the low padding byte and the low
-     * 8 bits of the 24-bit sample.
+     * On ESP32 I2S STD RX the payload is effectively left-aligned in the 32-bit
+     * slot. The official Xiaozhi simplex path narrows microphone samples with
+     * `>> 12`, which preserves more usable speech energy than `>> 16`.
+     *
+     * On this ESP32-S3 + INMP441 wiring, the captured stream also carries a
+     * strong DC bias. Remove it with a lightweight single-pole high-pass
+     * filter before clamping to 16-bit PCM, otherwise STT receives a waveform
+     * pinned mostly on the positive half-axis.
      */
-    int32_t narrowed = raw >> 16;
+    int32_t narrowed = raw >> 12;
+    int32_t filtered = narrowed - s_mic_prev_input + ((s_mic_prev_output * 255) / 256);
+    s_mic_prev_input = narrowed;
+    s_mic_prev_output = filtered;
 
-    if (narrowed > INT16_MAX) {
-        narrowed = INT16_MAX;
-    } else if (narrowed < INT16_MIN) {
-        narrowed = INT16_MIN;
+    if (filtered > INT16_MAX) {
+        filtered = INT16_MAX;
+    } else if (filtered < INT16_MIN) {
+        filtered = INT16_MIN;
     }
-    return (int16_t)narrowed;
+    return (int16_t)filtered;
 }
 
 static esp_err_t write_stereo_frames(const int16_t *mono_samples, size_t frame_count, uint32_t timeout_ms)
@@ -426,6 +436,8 @@ esp_err_t task_audio_input_start(void)
     if (xSemaphoreTake(s_input_session_mutex, pdMS_TO_TICKS(20)) != pdTRUE) {
         return ESP_ERR_TIMEOUT;
     }
+    s_mic_prev_input = 0;
+    s_mic_prev_output = 0;
     s_input_session_active = true;
     return ESP_OK;
 }
@@ -519,10 +531,21 @@ static esp_err_t probe_input_internal(task_audio_mic_probe_result_t *result, uin
     result->read_err = err;
     if (err == ESP_OK) {
         uint32_t abs_acc = 0;
+        int32_t sum = 0;
+        int16_t prev = 0;
+        bool prev_valid = false;
         for (size_t i = 0; i < TASK_AUDIO_MIC_PROBE_FRAMES; i++) {
             int16_t sample = samples[i];
             if (sample != 0) {
                 result->nonzero_samples++;
+            }
+            if (sample > 0) {
+                result->positive_samples++;
+            } else if (sample < 0) {
+                result->negative_samples++;
+            }
+            if (sample == INT16_MAX || sample == INT16_MIN) {
+                result->saturated_samples++;
             }
             if (sample < result->min_sample) {
                 result->min_sample = sample;
@@ -530,9 +553,17 @@ static esp_err_t probe_input_internal(task_audio_mic_probe_result_t *result, uin
             if (sample > result->max_sample) {
                 result->max_sample = sample;
             }
+            if (prev_valid &&
+                ((prev < 0 && sample > 0) || (prev > 0 && sample < 0))) {
+                result->zero_crossings++;
+            }
+            prev = sample;
+            prev_valid = sample != 0;
+            sum += sample;
             abs_acc += (uint32_t)(sample < 0 ? -(int32_t)sample : sample);
         }
         result->frames_captured = TASK_AUDIO_MIC_PROBE_FRAMES;
+        result->mean_sample = sum / (int32_t)TASK_AUDIO_MIC_PROBE_FRAMES;
         result->mean_abs_sample = abs_acc / TASK_AUDIO_MIC_PROBE_FRAMES;
     } else {
         result->min_sample = 0;

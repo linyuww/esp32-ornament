@@ -505,7 +505,7 @@ static esp_err_t root_get_handler(httpd_req_t *req)
     int codex_done_seq = state.has_codex_summary ? state.codex_done_seq : state.done_seq;
     html_escape(settings_bridge_url_or_default(&console_settings), bridge_url, sizeof(bridge_url));
     xiaozhi_client_status_snapshot(&xiaozhi);
-    html_escape(xiaozhi.ws_url[0] != '\0' ? xiaozhi.ws_url : settings_xiaozhi_ws_url_or_default(&console_settings), xiaozhi_ws_url, sizeof(xiaozhi_ws_url));
+    html_escape(settings_xiaozhi_ws_url_or_default(&console_settings), xiaozhi_ws_url, sizeof(xiaozhi_ws_url));
     html_escape(xiaozhi.client_id, xiaozhi_client_id, sizeof(xiaozhi_client_id));
     html_escape(xiaozhi.activation_code, xiaozhi_activation_code, sizeof(xiaozhi_activation_code));
     html_escape(xiaozhi.activation_message, xiaozhi_activation_message, sizeof(xiaozhi_activation_message));
@@ -1099,6 +1099,11 @@ static esp_err_t save_xiaozhi_settings(const char *ws_url, const char *token)
     err = settings_save(&settings);
     if (err == ESP_OK) {
         console_settings = settings;
+        (void)xiaozhi_client_init();
+        err = xiaozhi_client_reconnect_session(false);
+        if (err == ESP_ERR_INVALID_STATE || err == ESP_ERR_NOT_SUPPORTED) {
+            err = ESP_OK;
+        }
     }
     return err;
 }
@@ -1337,25 +1342,35 @@ static esp_err_t test_mic_post_handler(httpd_req_t *req)
         snprintf(
             detail,
             sizeof(detail),
-            "direct: start=%s read=%s frames=%u/%u nonzero=%u min=%d max=%d mean_abs=%u | "
-            "with_tx_clock: start=%s read=%s frames=%u/%u nonzero=%u min=%d max=%d mean_abs=%u",
+            "direct: start=%s read=%s frames=%u/%u nonzero=%u pos=%u neg=%u sat=%u zero_x=%u min=%d max=%d mean=%ld mean_abs=%u | "
+            "with_tx_clock: start=%s read=%s frames=%u/%u nonzero=%u pos=%u neg=%u sat=%u zero_x=%u min=%d max=%d mean=%ld mean_abs=%u",
             esp_err_to_name(direct.start_err),
             esp_err_to_name(direct.read_err),
             (unsigned int)direct.frames_captured,
             (unsigned int)direct.frames_requested,
             (unsigned int)direct.nonzero_samples,
+            (unsigned int)direct.positive_samples,
+            (unsigned int)direct.negative_samples,
+            (unsigned int)direct.saturated_samples,
+            (unsigned int)direct.zero_crossings,
             direct.min_sample,
             direct.max_sample,
+            (long)direct.mean_sample,
             (unsigned int)direct.mean_abs_sample,
             esp_err_to_name(with_tx_clock.start_err),
             esp_err_to_name(with_tx_clock.read_err),
             (unsigned int)with_tx_clock.frames_captured,
             (unsigned int)with_tx_clock.frames_requested,
             (unsigned int)with_tx_clock.nonzero_samples,
+            (unsigned int)with_tx_clock.positive_samples,
+            (unsigned int)with_tx_clock.negative_samples,
+            (unsigned int)with_tx_clock.saturated_samples,
+            (unsigned int)with_tx_clock.zero_crossings,
             with_tx_clock.min_sample,
             with_tx_clock.max_sample,
+            (long)with_tx_clock.mean_sample,
             (unsigned int)with_tx_clock.mean_abs_sample);
-    }
+     }
 
     return send_simple_page(req, "Mic Test", detail);
 }
@@ -1376,7 +1391,7 @@ static esp_err_t save_xiaozhi_post_handler(httpd_req_t *req)
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, esp_err_to_name(err));
         return ESP_FAIL;
     }
-    return send_xiaozhi_page(req, "Xiaozhi Saved", "The next AI session will use the saved WebSocket settings.");
+    return send_xiaozhi_page(req, "Xiaozhi Saved", "Saved settings applied. Running AI sessions were reconnected with the new WebSocket address.");
 }
 
 static esp_err_t xiaozhi_start_post_handler(httpd_req_t *req)
@@ -1397,13 +1412,13 @@ static esp_err_t xiaozhi_start_post_handler(httpd_req_t *req)
         }
     }
 
-    esp_err_t err = xiaozhi_client_start_session();
+    esp_err_t err = xiaozhi_client_reconnect_session(true);
     if (err != ESP_OK) {
         char detail[96];
         snprintf(detail, sizeof(detail), "Start failed: %s", esp_err_to_name(err));
         return send_xiaozhi_page(req, "Xiaozhi Start", detail);
     }
-    return send_xiaozhi_page(req, "Xiaozhi Start", "AI session is starting.");
+    return send_xiaozhi_page(req, "Xiaozhi Start", "AI session is starting with the latest saved WebSocket settings.");
 }
 
 static esp_err_t xiaozhi_stop_post_handler(httpd_req_t *req)

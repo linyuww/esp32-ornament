@@ -53,6 +53,7 @@ typedef struct {
 esp_err_t xiaozhi_client_init(void);
 esp_err_t xiaozhi_client_probe(const char *ws_url_override, const char *token_override, xiaozhi_probe_result_t *result);
 esp_err_t xiaozhi_client_start_session(void);
+esp_err_t xiaozhi_client_reconnect_session(bool start_if_idle);
 esp_err_t xiaozhi_client_stop_session(void);
 void xiaozhi_client_status_snapshot(xiaozhi_client_snapshot_t *snapshot);
 const char *xiaozhi_client_state_name(xiaozhi_client_state_t state);

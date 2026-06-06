@@ -15,8 +15,13 @@ typedef struct {
     size_t frames_requested;
     size_t frames_captured;
     size_t nonzero_samples;
+    size_t positive_samples;
+    size_t negative_samples;
+    size_t saturated_samples;
+    size_t zero_crossings;
     int16_t min_sample;
     int16_t max_sample;
+    int32_t mean_sample;
     uint32_t mean_abs_sample;
 } task_audio_mic_probe_result_t;
 

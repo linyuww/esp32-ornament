@@ -35,6 +35,7 @@
 #define XIAOZHI_EVENT_STOP BIT2
 #define XIAOZHI_EVENT_SPEAKING BIT3
 #define XIAOZHI_EVENT_ERROR BIT4
+#define XIAOZHI_EVENT_LISTEN_RESTART BIT5
 #define XIAOZHI_JSON_MAX 640
 #define XIAOZHI_HEADER_MAX 512
 #define XIAOZHI_HTTP_RESPONSE_MAX 4096
@@ -107,6 +108,16 @@ static const char *ota_url(void)
 static bool is_official_backend_url(const char *ws_url)
 {
     return ws_url != NULL && strstr(ws_url, "api.tenclass.net") != NULL;
+}
+
+static bool should_fetch_official_runtime_config(const ornament_settings_t *settings)
+{
+    const char *ws_url = settings_xiaozhi_ws_url_or_default(settings);
+    if (!is_official_backend_url(ws_url)) {
+        return false;
+    }
+
+    return strcmp(ws_url, CONFIG_ORNAMENT_XIAOZHI_WS_URL) == 0;
 }
 
 static void generate_uuid_v4(char *target, size_t target_size)
@@ -476,6 +487,19 @@ static void set_error(const char *message)
     }
 }
 
+static esp_err_t sync_runtime_config_from_settings(const ornament_settings_t *settings)
+{
+    if (s_mutex == NULL || settings == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    reset_runtime_config_locked(settings);
+    xSemaphoreGive(s_mutex);
+    return ESP_OK;
+}
+
 static void copy_settings_to_snapshot(const ornament_settings_t *settings)
 {
     if (s_mutex == NULL || settings == NULL) {
@@ -678,6 +702,7 @@ static void handle_text_message(const char *data, int len)
                 release_tts_output_if_active();
                 set_state(XIAOZHI_CLIENT_STATE_LISTENING);
                 xEventGroupClearBits(s_events, XIAOZHI_EVENT_SPEAKING);
+                xEventGroupSetBits(s_events, XIAOZHI_EVENT_LISTEN_RESTART);
             } else if (strcmp(state->valuestring, "sentence_start") == 0) {
                 if (s_mutex != NULL && xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
                     store_text_field(root, "text", s_snapshot.last_tts, sizeof(s_snapshot.last_tts));
@@ -937,6 +962,7 @@ static esp_err_t run_capture_loop(OpusEncoder *encoder)
     const int frame_samples = (ORNAMENT_AUDIO_SAMPLE_RATE_HZ * CONFIG_ORNAMENT_XIAOZHI_FRAME_MS) / 1000;
     int16_t *pcm = calloc((size_t)frame_samples, sizeof(int16_t));
     unsigned char *opus = malloc(CONFIG_ORNAMENT_XIAOZHI_OPUS_MAX_BYTES);
+    bool paused_for_tts = false;
     if (pcm == NULL || opus == NULL) {
         free(pcm);
         free(opus);
@@ -965,8 +991,19 @@ static esp_err_t run_capture_loop(OpusEncoder *encoder)
            esp_websocket_client_is_connected(s_client)) {
         EventBits_t bits = xEventGroupGetBits(s_events);
         if (bits & XIAOZHI_EVENT_SPEAKING) {
+            paused_for_tts = true;
             vTaskDelay(pdMS_TO_TICKS(CONFIG_ORNAMENT_XIAOZHI_FRAME_MS));
             continue;
+        }
+        if ((bits & XIAOZHI_EVENT_LISTEN_RESTART) != 0 || paused_for_tts) {
+            ESP_LOGI(TAG, "restarting listen window after speaking");
+            err = send_listen_state("start");
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG, "listen restart failed: %s", esp_err_to_name(err));
+                break;
+            }
+            xEventGroupClearBits(s_events, XIAOZHI_EVENT_LISTEN_RESTART);
+            paused_for_tts = false;
         }
 
         err = task_audio_input_read_mono(pcm, (size_t)frame_samples, CONFIG_ORNAMENT_XIAOZHI_FRAME_MS + 100);
@@ -1027,7 +1064,7 @@ static void session_task(void *arg)
         goto done;
     }
 
-    if (is_official_backend_url(settings_xiaozhi_ws_url_or_default(&settings))) {
+    if (should_fetch_official_runtime_config(&settings)) {
         bool activation_pending = false;
         int ota_status = -1;
         err = fetch_runtime_config(&settings, &ota_status, &activation_pending);
@@ -1106,7 +1143,14 @@ static void session_task(void *arg)
     };
 
     set_state(XIAOZHI_CLIENT_STATE_CONNECTING);
-    xEventGroupClearBits(s_events, XIAOZHI_EVENT_CONNECTED | XIAOZHI_EVENT_HELLO | XIAOZHI_EVENT_STOP | XIAOZHI_EVENT_SPEAKING | XIAOZHI_EVENT_ERROR);
+    xEventGroupClearBits(
+        s_events,
+        XIAOZHI_EVENT_CONNECTED |
+            XIAOZHI_EVENT_HELLO |
+            XIAOZHI_EVENT_STOP |
+            XIAOZHI_EVENT_SPEAKING |
+            XIAOZHI_EVENT_ERROR |
+            XIAOZHI_EVENT_LISTEN_RESTART);
     s_client = esp_websocket_client_init(&cfg);
     if (s_client == NULL) {
         set_error("websocket init failed");
@@ -1169,6 +1213,16 @@ done:
 esp_err_t xiaozhi_client_init(void)
 {
     if (s_mutex != NULL) {
+        ornament_settings_t settings;
+        if (settings_load(&settings) == ESP_OK) {
+            if (s_runtime_client_id[0] == '\0' &&
+                load_or_create_client_id(s_runtime_client_id, sizeof(s_runtime_client_id)) == ESP_OK) {
+                strlcpy(s_snapshot.client_id, s_runtime_client_id, sizeof(s_snapshot.client_id));
+            }
+            if (sync_runtime_config_from_settings(&settings) == ESP_OK) {
+                copy_settings_to_snapshot(&settings);
+            }
+        }
         return ESP_OK;
     }
     s_mutex = xSemaphoreCreateMutex();
@@ -1200,9 +1254,9 @@ esp_err_t xiaozhi_client_init(void)
         if (load_or_create_client_id(s_runtime_client_id, sizeof(s_runtime_client_id)) == ESP_OK) {
             strlcpy(s_snapshot.client_id, s_runtime_client_id, sizeof(s_snapshot.client_id));
         }
-        reset_runtime_config_locked(&settings);
+        (void)sync_runtime_config_from_settings(&settings);
         copy_settings_to_snapshot(&settings);
-        if (is_official_backend_url(settings_xiaozhi_ws_url_or_default(&settings))) {
+        if (should_fetch_official_runtime_config(&settings)) {
             int ota_status = -1;
             bool activation_pending = false;
             esp_err_t ota_err = fetch_runtime_config(&settings, &ota_status, &activation_pending);
@@ -1267,7 +1321,7 @@ esp_err_t xiaozhi_client_probe(const char *ws_url_override, const char *token_ov
         }
     }
     if (ws_url_override == NULL && token_override == NULL &&
-        is_official_backend_url(settings_xiaozhi_ws_url_or_default(&settings))) {
+        should_fetch_official_runtime_config(&settings)) {
         int ota_status = -1;
         bool activation_pending = false;
         err = fetch_runtime_config(&settings, &ota_status, &activation_pending);
@@ -1408,6 +1462,54 @@ esp_err_t xiaozhi_client_start_session(void)
     return ESP_OK;
 }
 
+esp_err_t xiaozhi_client_reconnect_session(bool start_if_idle)
+{
+    ESP_RETURN_ON_ERROR(xiaozhi_client_init(), TAG, "init failed");
+    if (s_mutex == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    bool restart_running_session = false;
+    if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    restart_running_session = s_session_task != NULL || s_session_starting || s_client != NULL;
+    xSemaphoreGive(s_mutex);
+
+    if (!restart_running_session) {
+        return start_if_idle ? xiaozhi_client_start_session() : ESP_OK;
+    }
+
+    esp_err_t err = xiaozhi_client_stop_session();
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    for (int attempt = 0; attempt < 40; attempt++) {
+        bool still_running = false;
+        if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+            return ESP_ERR_TIMEOUT;
+        }
+        still_running = s_session_task != NULL || s_session_starting || s_client != NULL;
+        xSemaphoreGive(s_mutex);
+        if (!still_running) {
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    bool still_running = s_session_task != NULL || s_session_starting || s_client != NULL;
+    xSemaphoreGive(s_mutex);
+    if (still_running) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    return xiaozhi_client_start_session();
+}
+
 esp_err_t xiaozhi_client_stop_session(void)
 {
     if (s_events == NULL) {
@@ -1436,6 +1538,12 @@ esp_err_t xiaozhi_client_init(void)
 
 esp_err_t xiaozhi_client_start_session(void)
 {
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
+esp_err_t xiaozhi_client_reconnect_session(bool start_if_idle)
+{
+    (void)start_if_idle;
     return ESP_ERR_NOT_SUPPORTED;
 }
 
