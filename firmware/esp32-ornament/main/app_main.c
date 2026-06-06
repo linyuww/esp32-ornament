@@ -12,6 +12,8 @@
 
 #include "driver/gpio.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
+#include "freertos/idf_additions.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
@@ -91,6 +93,19 @@ static ornament_shared_state_t shared_state;
 static SemaphoreHandle_t voice_control_mutex;
 static voice_control_state_t voice_control;
 static QueueHandle_t voice_command_queue;
+
+static void log_heap_status(const char *stage)
+{
+    ESP_LOGI(
+        TAG,
+        "heap %s: free=%u min=%u largest8=%u internal=%u spiram=%u",
+        stage,
+        (unsigned int)esp_get_free_heap_size(),
+        (unsigned int)esp_get_minimum_free_heap_size(),
+        (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
+        (unsigned int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+        (unsigned int)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+}
 
 static void publish_state(
     const ornament_state_t *state,
@@ -654,6 +669,9 @@ static bool xiaozhi_session_page_active(const xiaozhi_client_snapshot_t *snapsho
     if (snapshot == NULL) {
         return false;
     }
+    if (snapshot->session_requested || snapshot->activation_pending) {
+        return true;
+    }
     switch (snapshot->state) {
     case XIAOZHI_CLIENT_STATE_CONNECTING:
     case XIAOZHI_CLIENT_STATE_LISTENING:
@@ -960,6 +978,23 @@ static void create_app_task(
     ESP_ERROR_CHECK(created == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
 }
 
+static void create_app_task_psram(
+    TaskFunction_t task_fn,
+    const char *name,
+    uint32_t stack_depth,
+    UBaseType_t priority)
+{
+    BaseType_t created = xTaskCreateWithCaps(
+        task_fn,
+        name,
+        stack_depth,
+        NULL,
+        priority,
+        NULL,
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    ESP_ERROR_CHECK(created == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
+}
+
 static void poll_task(void *arg)
 {
     (void)arg;
@@ -1178,19 +1213,23 @@ static void ui_render_task(void *arg)
 void app_main(void)
 {
     ESP_LOGI(TAG, "starting Codex ornament");
+    log_heap_status("boot");
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
+    log_heap_status("after_nvs");
 
     display_init();
     display_render_boot();
+    log_heap_status("after_display");
     esp_err_t audio_err = task_audio_start();
     if (audio_err != ESP_OK) {
         ESP_LOGW(TAG, "task done audio unavailable: %s", esp_err_to_name(audio_err));
     }
+    log_heap_status("after_audio");
 
     if (wifi_connect() != ESP_OK) {
         ESP_LOGW(TAG, "provisioning mode active: SSID=%s URL=http://192.168.4.1", config_portal_ssid());
@@ -1200,6 +1239,7 @@ void app_main(void)
         }
     }
     display_render_status("Wi-Fi connected");
+    log_heap_status("after_wifi");
     voice_control_init();
     voice_command_queue = xQueueCreate(4, sizeof(asrpro_voice_command_t));
     ESP_ERROR_CHECK(voice_command_queue == NULL ? ESP_ERR_NO_MEM : ESP_OK);
@@ -1220,6 +1260,7 @@ void app_main(void)
     system_status_start_time_sync();
     ESP_ERROR_CHECK(weather_client_start());
     ESP_ERROR_CHECK(web_console_start());
+    log_heap_status("after_services");
 
     shared_state_mutex = xSemaphoreCreateMutex();
     ESP_ERROR_CHECK(shared_state_mutex == NULL ? ESP_ERR_NO_MEM : ESP_OK);
@@ -1231,7 +1272,8 @@ void app_main(void)
     create_app_task(voice_command_task, "voice_cmd", 4096, 5);
     create_app_task(page_button_task, "page_button", 3072, 5);
     create_app_task(poll_task, "bridge_poll", 8192, 5);
-    create_app_task(ui_render_task, "ui_render", UI_RENDER_TASK_STACK, 4);
+    create_app_task_psram(ui_render_task, "ui_render", UI_RENDER_TASK_STACK, 4);
+    log_heap_status("after_tasks");
 
     /* Main task must never return in ESP-IDF — returning tears down
      * FreeRTOS resources (mutexes, queues, semaphores) that child tasks

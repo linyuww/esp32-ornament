@@ -1,5 +1,6 @@
 #include "task_audio.h"
 
+#include "driver/gpio.h"
 #include "driver/i2s_std.h"
 #include "esp_check.h"
 #include "esp_log.h"
@@ -58,6 +59,28 @@ static i2s_std_gpio_config_t s_tx_gpio_active_cfg;
 static i2s_std_gpio_config_t s_tx_gpio_idle_cfg;
 static i2s_std_gpio_config_t s_rx_gpio_active_cfg;
 static i2s_std_gpio_config_t s_rx_gpio_idle_cfg;
+
+static void speaker_data_hold_low(void)
+{
+    if (CONFIG_ORNAMENT_AUDIO_PIN_DIN < 0) {
+        return;
+    }
+
+    const gpio_config_t cfg = {
+        .pin_bit_mask = 1ULL << CONFIG_ORNAMENT_AUDIO_PIN_DIN,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    esp_err_t err = gpio_config(&cfg);
+    if (err == ESP_OK) {
+        err = gpio_set_level(CONFIG_ORNAMENT_AUDIO_PIN_DIN, 0);
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "speaker data idle-low failed: %s", esp_err_to_name(err));
+    }
+}
 
 static int16_t apply_volume(int16_t sample)
 {
@@ -144,10 +167,12 @@ static esp_err_t disable_route_locked(audio_route_t route)
         ESP_RETURN_ON_ERROR(i2s_channel_disable(s_tx_chan), TAG, "disable tx route failed");
         ESP_RETURN_ON_ERROR(i2s_channel_reconfig_std_gpio(s_tx_chan, &s_tx_gpio_idle_cfg), TAG, "park tx gpio failed");
         s_output_enabled = false;
+        speaker_data_hold_low();
     } else if (route == AUDIO_ROUTE_RX && s_rx_enabled) {
         ESP_RETURN_ON_ERROR(i2s_channel_disable(s_rx_chan), TAG, "disable rx route failed");
         ESP_RETURN_ON_ERROR(i2s_channel_reconfig_std_gpio(s_rx_chan, &s_rx_gpio_idle_cfg), TAG, "park rx gpio failed");
         s_rx_enabled = false;
+        speaker_data_hold_low();
     }
 
     if (s_active_route == route) {
@@ -166,6 +191,7 @@ static esp_err_t switch_route_locked(audio_route_t target)
         if (s_active_route != AUDIO_ROUTE_TX) {
             ESP_RETURN_ON_ERROR(disable_route_locked(s_active_route), TAG, "drop previous route failed");
             ESP_LOGI(TAG, "switching audio route to TX");
+            ESP_RETURN_ON_ERROR(gpio_reset_pin(CONFIG_ORNAMENT_AUDIO_PIN_DIN), TAG, "release tx data gpio failed");
             ESP_RETURN_ON_ERROR(i2s_channel_reconfig_std_gpio(s_tx_chan, &s_tx_gpio_active_cfg), TAG, "tx gpio switch failed");
             ESP_RETURN_ON_ERROR(i2s_channel_enable(s_tx_chan), TAG, "tx enable failed");
             s_output_enabled = true;
@@ -181,6 +207,7 @@ static esp_err_t switch_route_locked(audio_route_t target)
         if (s_active_route != AUDIO_ROUTE_RX) {
             ESP_RETURN_ON_ERROR(disable_route_locked(s_active_route), TAG, "drop previous route failed");
             ESP_LOGI(TAG, "switching audio route to RX");
+            speaker_data_hold_low();
             ESP_RETURN_ON_ERROR(i2s_channel_reconfig_std_gpio(s_rx_chan, &s_rx_gpio_active_cfg), TAG, "rx gpio switch failed");
             ESP_RETURN_ON_ERROR(i2s_channel_enable(s_rx_chan), TAG, "rx enable failed");
             s_rx_enabled = true;
@@ -322,6 +349,7 @@ static esp_err_t init_i2s(void)
         CONFIG_ORNAMENT_XIAOZHI_MIC_SLOT_RIGHT ? "right" : "left",
         ORNAMENT_AUDIO_SAMPLE_RATE_HZ,
         CONFIG_ORNAMENT_AUDIO_VOLUME_PERCENT);
+    speaker_data_hold_low();
     return ESP_OK;
 }
 

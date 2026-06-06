@@ -25,10 +25,15 @@ typedef struct {
     bool enabled;
     bool configured;
     bool connected;
+    bool official_runtime_config;
+    bool session_requested;
     xiaozhi_client_state_t state;
     int protocol_version;
     bool activation_pending;
     char ws_url[ORNAMENT_XIAOZHI_WS_URL_MAX];
+    char saved_ws_url[ORNAMENT_XIAOZHI_WS_URL_MAX];
+    char runtime_ws_url[ORNAMENT_XIAOZHI_WS_URL_MAX];
+    char active_ws_url[ORNAMENT_XIAOZHI_WS_URL_MAX];
     char client_id[XIAOZHI_CLIENT_ID_MAX];
     char session_id[XIAOZHI_SESSION_ID_MAX];
     char activation_code[XIAOZHI_ACTIVATION_CODE_MAX];

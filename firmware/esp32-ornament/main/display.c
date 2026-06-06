@@ -4,25 +4,408 @@
 
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
+#include "draw/sw/lv_draw_sw.h"
 #include "esp_check.h"
 #include "esp_heap_caps.h"
 #include "esp_lcd_io_spi.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_panel_st7789.h"
 #include "esp_log.h"
+#include "esp_timer.h"
+#include "lvgl.h"
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 static const char *TAG = "display";
 static const int FLUSH_LINES_CANDIDATES[] = {40, 24, 16, 8, 4, 1};
+static const uint64_t LVGL_TICK_PERIOD_US = 1000;
+
+LV_FONT_DECLARE(font_puhui_16_4);
 
 static esp_lcd_panel_handle_t panel_handle;
 static display_core_canvas_t canvas;
 static uint16_t *flush_buffers[2];
 static int flush_lines;
+
+static bool lvgl_initialized;
+static bool lvgl_ready;
+static bool lvgl_xiaozhi_visible;
+static lv_display_t *lvgl_display;
+static lv_obj_t *lvgl_root;
+static lv_obj_t *lvgl_header_label;
+static lv_obj_t *lvgl_state_label;
+static lv_obj_t *lvgl_user_card;
+static lv_obj_t *lvgl_ai_card;
+static lv_obj_t *lvgl_user_label;
+static lv_obj_t *lvgl_ai_label;
+static lv_obj_t *lvgl_footer_label;
+static lv_obj_t *lvgl_spinner;
+static esp_timer_handle_t lvgl_tick_timer;
+
+static const char *const XIAOZHI_TITLE_TEXT = "\xE5\xB0\x8F\xE6\x99\xBA";
+static const char *const XIAOZHI_STATUS_CONNECTING_TEXT = "\xE8\xBF\x9E\xE6\x8E\xA5\xE4\xB8\xAD";
+static const char *const XIAOZHI_STATUS_LISTENING_TEXT = "\xE8\x81\x86\xE5\x90\xAC\xE4\xB8\xAD";
+static const char *const XIAOZHI_STATUS_SPEAKING_TEXT = "\xE5\x9B\x9E\xE7\xAD\x94\xE4\xB8\xAD";
+static const char *const XIAOZHI_STATUS_ERROR_TEXT = "\xE5\xBC\x82\xE5\xB8\xB8";
+static const char *const XIAOZHI_STATUS_CONFIG_MISSING_TEXT = "\xE6\x9C\xAA\xE9\x85\x8D\xE7\xBD\xAE";
+static const char *const XIAOZHI_STATUS_IDLE_TEXT = "\xE5\xBE\x85\xE6\x9C\xBA";
+static const char *const XIAOZHI_STATUS_DISABLED_TEXT = "\xE5\x85\xB3\xE9\x97\xAD";
+static const char *const XIAOZHI_PROMPT_SPEAK_TEXT = "\xE8\xAF\xB7\xE8\xAF\xB4\xE8\xAF\x9D...";
+static const char *const XIAOZHI_WAIT_RESPONSE_TEXT = "\xE7\xAD\x89\xE5\xBE\x85\xE5\x9B\x9E\xE7\xAD\x94...";
+static const char *const XIAOZHI_WAIT_BIND_TEXT = "\xE7\xAD\x89\xE5\xBE\x85\xE7\xBB\x91\xE5\xAE\x9A...";
+static const char *const XIAOZHI_BIND_HINT_TEXT = "\xE8\xAF\xB7\xE7\xBB\x91\xE5\xAE\x9A\xE5\xAE\x98\xE6\x96\xB9\xE5\x90\x8E\xE5\x8F\xB0";
+static const char *const XIAOZHI_WAIT_CODE_TEXT = "\xE7\xAD\x89\xE5\xBE\x85\xE4\xB8\x8B\xE5\x8F\x91";
+static const char *const XIAOZHI_FOOTER_DEFAULT_TEXT = "\xE4\xB8\x8A\xE8\xA1\x8C 0  \xE4\xB8\x8B\xE8\xA1\x8C 0";
+
+static bool flush_buffers_alloc(void);
+
+static void lvgl_tick_cb(void *arg)
+{
+    (void)arg;
+    lv_tick_inc(1);
+}
+
+static void lvgl_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
+{
+    if (panel_handle == NULL || area == NULL || px_map == NULL) {
+        lv_display_flush_ready(disp);
+        return;
+    }
+
+    lv_draw_sw_rgb565_swap(px_map, (uint32_t)lv_area_get_size(area));
+
+    esp_err_t err = esp_lcd_panel_draw_bitmap(
+        panel_handle,
+        area->x1,
+        area->y1,
+        area->x2 + 1,
+        area->y2 + 1,
+        px_map);
+    if (err != ESP_OK) {
+        ESP_LOGE(
+            TAG,
+            "lvgl flush failed x1=%d y1=%d x2=%d y2=%d: %s",
+            (int)area->x1,
+            (int)area->y1,
+            (int)area->x2,
+            (int)area->y2,
+            esp_err_to_name(err));
+    }
+    lv_display_flush_ready(disp);
+}
+
+static void lvgl_style_card(lv_obj_t *obj, lv_color_t bg_color)
+{
+    lv_obj_remove_style_all(obj);
+    lv_obj_set_scrollbar_mode(obj, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_set_style_bg_opa(obj, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(obj, bg_color, 0);
+    lv_obj_set_style_radius(obj, 16, 0);
+    lv_obj_set_style_border_width(obj, 0, 0);
+    lv_obj_set_style_pad_left(obj, 14, 0);
+    lv_obj_set_style_pad_right(obj, 14, 0);
+    lv_obj_set_style_pad_top(obj, 12, 0);
+    lv_obj_set_style_pad_bottom(obj, 12, 0);
+}
+
+static void lvgl_style_label(lv_obj_t *obj, const lv_font_t *font, lv_color_t color, lv_text_align_t align)
+{
+    lv_obj_set_style_text_font(obj, font, 0);
+    lv_obj_set_style_text_color(obj, color, 0);
+    lv_obj_set_style_text_align(obj, align, 0);
+}
+
+static void lvgl_update_now(void)
+{
+    if (!lvgl_ready) {
+        return;
+    }
+    lv_timer_handler();
+}
+
+static void lvgl_set_xiaozhi_visible(bool visible)
+{
+    if (!lvgl_ready || lvgl_root == NULL) {
+        return;
+    }
+
+    if (visible) {
+        lv_obj_remove_flag(lvgl_root, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(lvgl_root, LV_OBJ_FLAG_HIDDEN);
+    }
+    lvgl_xiaozhi_visible = visible;
+}
+
+static const char *xiaozhi_status_cn(xiaozhi_client_state_t state)
+{
+    switch (state) {
+    case XIAOZHI_CLIENT_STATE_CONNECTING:
+        return XIAOZHI_STATUS_CONNECTING_TEXT;
+    case XIAOZHI_CLIENT_STATE_LISTENING:
+        return XIAOZHI_STATUS_LISTENING_TEXT;
+    case XIAOZHI_CLIENT_STATE_SPEAKING:
+        return XIAOZHI_STATUS_SPEAKING_TEXT;
+    case XIAOZHI_CLIENT_STATE_ERROR:
+        return XIAOZHI_STATUS_ERROR_TEXT;
+    case XIAOZHI_CLIENT_STATE_CONFIG_MISSING:
+        return XIAOZHI_STATUS_CONFIG_MISSING_TEXT;
+    case XIAOZHI_CLIENT_STATE_IDLE:
+        return XIAOZHI_STATUS_IDLE_TEXT;
+    case XIAOZHI_CLIENT_STATE_DISABLED:
+    default:
+        return XIAOZHI_STATUS_DISABLED_TEXT;
+    }
+}
+
+static const char *xiaozhi_default_user_text(const xiaozhi_client_snapshot_t *snapshot)
+{
+    if (snapshot != NULL && snapshot->activation_pending) {
+        return XIAOZHI_WAIT_BIND_TEXT;
+    }
+    return XIAOZHI_PROMPT_SPEAK_TEXT;
+}
+
+static const char *xiaozhi_default_ai_text(const xiaozhi_client_snapshot_t *snapshot)
+{
+    if (snapshot != NULL && snapshot->activation_pending) {
+        if (snapshot->activation_code[0] != '\0') {
+            return snapshot->activation_code;
+        }
+        return XIAOZHI_BIND_HINT_TEXT;
+    }
+    return XIAOZHI_WAIT_RESPONSE_TEXT;
+}
+
+static void lvgl_cleanup_failed_init(void)
+{
+    if (lvgl_tick_timer != NULL) {
+        esp_timer_stop(lvgl_tick_timer);
+        esp_timer_delete(lvgl_tick_timer);
+        lvgl_tick_timer = NULL;
+    }
+    if (lvgl_display != NULL) {
+        lv_display_delete(lvgl_display);
+        lvgl_display = NULL;
+    }
+    lvgl_root = NULL;
+    lvgl_header_label = NULL;
+    lvgl_state_label = NULL;
+    lvgl_user_card = NULL;
+    lvgl_ai_card = NULL;
+    lvgl_user_label = NULL;
+    lvgl_ai_label = NULL;
+    lvgl_footer_label = NULL;
+    lvgl_spinner = NULL;
+    lvgl_ready = false;
+    lvgl_xiaozhi_visible = false;
+}
+
+static void lvgl_release_xiaozhi_overlay(void)
+{
+    if (lvgl_display == NULL && lvgl_tick_timer == NULL && !lvgl_ready) {
+        return;
+    }
+
+    lvgl_cleanup_failed_init();
+    ESP_LOGI(TAG, "LVGL overlay released");
+}
+
+static esp_err_t lvgl_xiaozhi_overlay_init(void)
+{
+    if (lvgl_ready) {
+        return ESP_OK;
+    }
+
+    if (!lvgl_initialized) {
+        lv_init();
+        lvgl_initialized = true;
+    }
+
+    const esp_timer_create_args_t tick_args = {
+        .callback = lvgl_tick_cb,
+        .arg = NULL,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "lvgl_tick",
+        .skip_unhandled_events = true,
+    };
+    esp_err_t err = esp_timer_create(&tick_args, &lvgl_tick_timer);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = esp_timer_start_periodic(lvgl_tick_timer, LVGL_TICK_PERIOD_US);
+    if (err != ESP_OK) {
+        lvgl_cleanup_failed_init();
+        return err;
+    }
+
+    lvgl_display = lv_display_create(CONFIG_ORNAMENT_LCD_H_RES, CONFIG_ORNAMENT_LCD_V_RES);
+    if (lvgl_display == NULL) {
+        lvgl_cleanup_failed_init();
+        return ESP_FAIL;
+    }
+    lv_display_set_color_format(lvgl_display, LV_COLOR_FORMAT_RGB565);
+
+    if (!flush_buffers_alloc()) {
+        lvgl_cleanup_failed_init();
+        return ESP_ERR_NO_MEM;
+    }
+    size_t buffer_bytes = (size_t)CONFIG_ORNAMENT_LCD_H_RES * (size_t)flush_lines * sizeof(uint16_t);
+
+    lv_display_set_buffers(
+        lvgl_display,
+        flush_buffers[0],
+        flush_buffers[1],
+        (uint32_t)buffer_bytes,
+        LV_DISPLAY_RENDER_MODE_PARTIAL);
+    lv_display_set_flush_cb(lvgl_display, lvgl_flush_cb);
+    lv_display_set_default(lvgl_display);
+    ESP_LOGI(TAG, "LVGL overlay reusing %d-line DMA flush buffers (%u bytes each)", flush_lines, (unsigned int)buffer_bytes);
+
+    lv_obj_t *screen = lv_screen_active();
+    lv_obj_set_style_bg_color(screen, lv_color_hex(0x05070b), 0);
+    lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
+    lv_obj_set_style_text_font(screen, &font_puhui_16_4, 0);
+    lv_obj_set_style_text_color(screen, lv_color_hex(0xf6f7fb), 0);
+
+    lvgl_root = lv_obj_create(screen);
+    lv_obj_remove_style_all(lvgl_root);
+    lv_obj_set_size(lvgl_root, CONFIG_ORNAMENT_LCD_H_RES, CONFIG_ORNAMENT_LCD_V_RES);
+    lv_obj_set_style_bg_opa(lvgl_root, LV_OPA_TRANSP, 0);
+    lv_obj_set_scrollbar_mode(lvgl_root, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_add_flag(lvgl_root, LV_OBJ_FLAG_HIDDEN);
+
+    lvgl_header_label = lv_label_create(lvgl_root);
+    lvgl_style_label(lvgl_header_label, &font_puhui_16_4, lv_color_hex(0xf7fafc), LV_TEXT_ALIGN_CENTER);
+    lv_label_set_text(lvgl_header_label, XIAOZHI_TITLE_TEXT);
+    lv_obj_set_width(lvgl_header_label, 240);
+    lv_obj_align(lvgl_header_label, LV_ALIGN_TOP_MID, 0, 16);
+
+    lvgl_state_label = lv_label_create(lvgl_root);
+    lvgl_style_label(lvgl_state_label, &font_puhui_16_4, lv_color_hex(0x8f9aa8), LV_TEXT_ALIGN_CENTER);
+    lv_label_set_text_fmt(lvgl_state_label, "%s %s", XIAOZHI_TITLE_TEXT, XIAOZHI_STATUS_IDLE_TEXT);
+    lv_obj_set_width(lvgl_state_label, 220);
+    lv_obj_align(lvgl_state_label, LV_ALIGN_TOP_MID, 0, 42);
+
+    lvgl_spinner = lv_spinner_create(lvgl_root);
+    lv_spinner_set_anim_params(lvgl_spinner, 900, 90);
+    lv_obj_set_size(lvgl_spinner, 20, 20);
+    lv_obj_set_style_arc_width(lvgl_spinner, 3, LV_PART_MAIN);
+    lv_obj_set_style_arc_color(lvgl_spinner, lv_color_hex(0x1d3348), LV_PART_MAIN);
+    lv_obj_set_style_arc_width(lvgl_spinner, 3, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(lvgl_spinner, lv_color_hex(0x4dc7ff), LV_PART_INDICATOR);
+    lv_obj_align(lvgl_spinner, LV_ALIGN_TOP_RIGHT, -18, 16);
+
+    lvgl_user_card = lv_obj_create(lvgl_root);
+    lvgl_style_card(lvgl_user_card, lv_color_hex(0x153248));
+    lv_obj_set_size(lvgl_user_card, 212, 72);
+    lv_obj_align(lvgl_user_card, LV_ALIGN_TOP_MID, 0, 72);
+
+    lvgl_ai_card = lv_obj_create(lvgl_root);
+    lvgl_style_card(lvgl_ai_card, lv_color_hex(0x113a2e));
+    lv_obj_set_size(lvgl_ai_card, 212, 96);
+    lv_obj_align(lvgl_ai_card, LV_ALIGN_TOP_MID, 0, 154);
+
+    lvgl_user_label = lv_label_create(lvgl_user_card);
+    lvgl_style_label(lvgl_user_label, &font_puhui_16_4, lv_color_hex(0xf8fbff), LV_TEXT_ALIGN_LEFT);
+    lv_label_set_long_mode(lvgl_user_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(lvgl_user_label, 184);
+    lv_obj_align(lvgl_user_label, LV_ALIGN_TOP_LEFT, 0, 0);
+    lv_label_set_text(lvgl_user_label, XIAOZHI_PROMPT_SPEAK_TEXT);
+
+    lvgl_ai_label = lv_label_create(lvgl_ai_card);
+    lvgl_style_label(lvgl_ai_label, &font_puhui_16_4, lv_color_hex(0xf8fbff), LV_TEXT_ALIGN_LEFT);
+    lv_label_set_long_mode(lvgl_ai_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(lvgl_ai_label, 184);
+    lv_obj_align(lvgl_ai_label, LV_ALIGN_TOP_LEFT, 0, 0);
+    lv_label_set_text(lvgl_ai_label, XIAOZHI_WAIT_RESPONSE_TEXT);
+
+    lvgl_footer_label = lv_label_create(lvgl_root);
+    lvgl_style_label(lvgl_footer_label, &font_puhui_16_4, lv_color_hex(0x8f9aa8), LV_TEXT_ALIGN_CENTER);
+    lv_label_set_text(lvgl_footer_label, XIAOZHI_FOOTER_DEFAULT_TEXT);
+    lv_obj_set_width(lvgl_footer_label, 220);
+    lv_obj_align(lvgl_footer_label, LV_ALIGN_BOTTOM_MID, 0, -18);
+
+    lvgl_ready = true;
+    lvgl_xiaozhi_visible = false;
+    lvgl_update_now();
+    return ESP_OK;
+}
+
+static void lvgl_render_xiaozhi_overlay(const xiaozhi_client_snapshot_t *snapshot)
+{
+    xiaozhi_client_snapshot_t fallback = {0};
+    if (!lvgl_ready || lvgl_root == NULL) {
+        return;
+    }
+
+    if (snapshot == NULL) {
+        fallback.state = XIAOZHI_CLIENT_STATE_DISABLED;
+        snapshot = &fallback;
+    }
+
+    char state_text[32];
+    char footer_text[96];
+    const char *user_text = snapshot->last_stt[0] != '\0' ? snapshot->last_stt : xiaozhi_default_user_text(snapshot);
+    const char *ai_text = snapshot->last_tts[0] != '\0' ? snapshot->last_tts : xiaozhi_default_ai_text(snapshot);
+
+    snprintf(state_text, sizeof(state_text), "%s %s", XIAOZHI_TITLE_TEXT, xiaozhi_status_cn(snapshot->state));
+    if (snapshot->activation_pending) {
+        snprintf(
+            footer_text,
+            sizeof(footer_text),
+            "\xE9\xAA\x8C\xE8\xAF\x81\xE7\xA0\x81 %s",
+            snapshot->activation_code[0] != '\0' ? snapshot->activation_code : XIAOZHI_WAIT_CODE_TEXT);
+    } else {
+        snprintf(
+            footer_text,
+            sizeof(footer_text),
+            "\xE4\xB8\x8A\xE8\xA1\x8C %lu  \xE4\xB8\x8B\xE8\xA1\x8C %lu",
+            (unsigned long)snapshot->uplink_frames,
+            (unsigned long)snapshot->downlink_frames);
+    }
+
+    lv_label_set_text(lvgl_state_label, state_text);
+    lv_label_set_text(lvgl_user_label, user_text);
+    lv_label_set_text(lvgl_ai_label, ai_text);
+    lv_label_set_text(lvgl_footer_label, footer_text);
+
+    lv_color_t state_color = lv_color_hex(0x8f9aa8);
+    switch (snapshot->state) {
+    case XIAOZHI_CLIENT_STATE_LISTENING:
+        state_color = lv_color_hex(0x24c16a);
+        break;
+    case XIAOZHI_CLIENT_STATE_SPEAKING:
+        state_color = lv_color_hex(0x36c2ff);
+        break;
+    case XIAOZHI_CLIENT_STATE_CONNECTING:
+        state_color = lv_color_hex(0xf4b942);
+        break;
+    case XIAOZHI_CLIENT_STATE_ERROR:
+    case XIAOZHI_CLIENT_STATE_CONFIG_MISSING:
+        state_color = lv_color_hex(0xff6b6b);
+        break;
+    case XIAOZHI_CLIENT_STATE_IDLE:
+    case XIAOZHI_CLIENT_STATE_DISABLED:
+    default:
+        break;
+    }
+    lv_obj_set_style_text_color(lvgl_state_label, state_color, 0);
+
+    if (snapshot->state == XIAOZHI_CLIENT_STATE_CONNECTING || snapshot->state == XIAOZHI_CLIENT_STATE_IDLE) {
+        lv_obj_remove_flag(lvgl_spinner, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(lvgl_spinner, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    lvgl_set_xiaozhi_visible(true);
+    lvgl_update_now();
+}
 
 static esp_err_t display_init_st7789_spi(void)
 {
@@ -163,8 +546,16 @@ static esp_err_t flush_canvas(void)
     return ESP_OK;
 }
 
+static void hide_xiaozhi_overlay_if_needed(void)
+{
+    if (lvgl_display != NULL || lvgl_ready || lvgl_xiaozhi_visible) {
+        lvgl_release_xiaozhi_overlay();
+    }
+}
+
 static void render_hud(const ornament_state_t *state)
 {
+    hide_xiaozhi_overlay_if_needed();
     if (!canvas_alloc()) {
         ESP_LOGE(TAG, "failed to allocate display canvas");
         return;
@@ -175,6 +566,7 @@ static void render_hud(const ornament_state_t *state)
 
 static void render_clock(const ornament_state_t *state)
 {
+    hide_xiaozhi_overlay_if_needed();
     if (!canvas_alloc()) {
         ESP_LOGE(TAG, "failed to allocate display canvas");
         return;
@@ -185,6 +577,7 @@ static void render_clock(const ornament_state_t *state)
 
 static void render_voice_status(const ornament_state_t *state, const char *bridge_status, const char *voice_status)
 {
+    hide_xiaozhi_overlay_if_needed();
     if (!canvas_alloc()) {
         ESP_LOGE(TAG, "failed to allocate display canvas");
         return;
@@ -195,6 +588,12 @@ static void render_voice_status(const ornament_state_t *state, const char *bridg
 
 static void render_xiaozhi(const ornament_state_t *state, const xiaozhi_client_snapshot_t *snapshot)
 {
+    (void)state;
+    if (lvgl_xiaozhi_overlay_init() == ESP_OK) {
+        lvgl_render_xiaozhi_overlay(snapshot);
+        return;
+    }
+
     if (!canvas_alloc()) {
         ESP_LOGE(TAG, "failed to allocate display canvas");
         return;
@@ -205,6 +604,7 @@ static void render_xiaozhi(const ornament_state_t *state, const xiaozhi_client_s
 
 static void render_tasks(const ornament_state_t *state)
 {
+    hide_xiaozhi_overlay_if_needed();
     if (!canvas_alloc()) {
         ESP_LOGE(TAG, "failed to allocate display canvas");
         return;
@@ -215,6 +615,7 @@ static void render_tasks(const ornament_state_t *state)
 
 static void render_boot_message(void)
 {
+    hide_xiaozhi_overlay_if_needed();
     if (!canvas_alloc()) {
         ESP_LOGE(TAG, "failed to allocate display canvas");
         return;
@@ -225,6 +626,7 @@ static void render_boot_message(void)
 
 static void render_status_message(const char *message)
 {
+    hide_xiaozhi_overlay_if_needed();
     if (!canvas_alloc()) {
         ESP_LOGE(TAG, "failed to allocate display canvas");
         return;
@@ -235,6 +637,7 @@ static void render_status_message(const char *message)
 
 static void render_error_message(const char *message)
 {
+    hide_xiaozhi_overlay_if_needed();
     if (!canvas_alloc()) {
         ESP_LOGE(TAG, "failed to allocate display canvas");
         return;

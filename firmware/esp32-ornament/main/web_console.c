@@ -295,6 +295,9 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     char weather_config_label[ORNAMENT_WEATHER_LABEL_MAX * 2];
     char bridge_url[ORNAMENT_BRIDGE_URL_MAX * 2];
     char xiaozhi_ws_url[ORNAMENT_XIAOZHI_WS_URL_MAX * 2];
+    char xiaozhi_saved_ws_url[ORNAMENT_XIAOZHI_WS_URL_MAX * 2];
+    char xiaozhi_runtime_ws_url[ORNAMENT_XIAOZHI_WS_URL_MAX * 2];
+    char xiaozhi_active_ws_url[ORNAMENT_XIAOZHI_WS_URL_MAX * 2];
     char xiaozhi_client_id[XIAOZHI_CLIENT_ID_MAX * 2];
     char xiaozhi_session_id[XIAOZHI_SESSION_ID_MAX * 2];
     char xiaozhi_activation_code[XIAOZHI_ACTIVATION_CODE_MAX * 2];
@@ -324,6 +327,9 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     json_escape(settings_bridge_url_or_default(&console_settings), bridge_url, sizeof(bridge_url));
     xiaozhi_client_status_snapshot(&xiaozhi);
     json_escape(xiaozhi.ws_url, xiaozhi_ws_url, sizeof(xiaozhi_ws_url));
+    json_escape(xiaozhi.saved_ws_url, xiaozhi_saved_ws_url, sizeof(xiaozhi_saved_ws_url));
+    json_escape(xiaozhi.runtime_ws_url, xiaozhi_runtime_ws_url, sizeof(xiaozhi_runtime_ws_url));
+    json_escape(xiaozhi.active_ws_url, xiaozhi_active_ws_url, sizeof(xiaozhi_active_ws_url));
     json_escape(xiaozhi.client_id, xiaozhi_client_id, sizeof(xiaozhi_client_id));
     json_escape(xiaozhi.session_id, xiaozhi_session_id, sizeof(xiaozhi_session_id));
     json_escape(xiaozhi.activation_code, xiaozhi_activation_code, sizeof(xiaozhi_activation_code));
@@ -419,14 +425,19 @@ static esp_err_t status_get_handler(httpd_req_t *req)
         json,
         json_size,
         &used,
-        "\"xiaozhi\":{\"enabled\":%s,\"configured\":%s,\"connected\":%s,\"state\":\"%s\",\"protocol_version\":%d,\"activation_pending\":%s,\"ws_url\":\"%s\",\"client_id\":\"%s\",\"session_id\":\"%s\",\"activation_code\":\"%s\",\"activation_message\":\"%s\",\"last_error\":\"%s\",\"last_stt\":\"%s\",\"last_tts\":\"%s\",\"uplink_frames\":%u,\"downlink_frames\":%u},",
+        "\"xiaozhi\":{\"enabled\":%s,\"configured\":%s,\"connected\":%s,\"session_requested\":%s,\"state\":\"%s\",\"protocol_version\":%d,\"activation_pending\":%s,\"official_runtime_config\":%s,\"ws_url\":\"%s\",\"saved_ws_url\":\"%s\",\"runtime_ws_url\":\"%s\",\"active_ws_url\":\"%s\",\"client_id\":\"%s\",\"session_id\":\"%s\",\"activation_code\":\"%s\",\"activation_message\":\"%s\",\"last_error\":\"%s\",\"last_stt\":\"%s\",\"last_tts\":\"%s\",\"uplink_frames\":%u,\"downlink_frames\":%u},",
         xiaozhi.enabled ? "true" : "false",
         xiaozhi.configured ? "true" : "false",
         xiaozhi.connected ? "true" : "false",
+        xiaozhi.session_requested ? "true" : "false",
         xiaozhi_client_state_name(xiaozhi.state),
         xiaozhi.protocol_version,
         xiaozhi.activation_pending ? "true" : "false",
+        xiaozhi.official_runtime_config ? "true" : "false",
         xiaozhi_ws_url,
+        xiaozhi_saved_ws_url,
+        xiaozhi_runtime_ws_url,
+        xiaozhi_active_ws_url,
         xiaozhi_client_id,
         xiaozhi_session_id,
         xiaozhi_activation_code,
@@ -452,10 +463,11 @@ static esp_err_t status_get_handler(httpd_req_t *req)
         json,
         json_size,
         &used,
-        "\"heap\":{\"free\":%u,\"min_free\":%u,\"largest_free_block\":%u}}",
+        "\"heap\":{\"free\":%u,\"min_free\":%u,\"largest_free_block\":%u,\"largest_internal_block\":%u}}",
         (unsigned int)esp_get_free_heap_size(),
         (unsigned int)esp_get_minimum_free_heap_size(),
-        (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+        (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
+        (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
 
     httpd_resp_set_type(req, "application/json");
     esp_err_t err = httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
@@ -484,6 +496,9 @@ static esp_err_t root_get_handler(httpd_req_t *req)
     char weather_value[96];
     char weather_detail[192];
     char xiaozhi_ws_url[ORNAMENT_XIAOZHI_WS_URL_MAX * 2];
+    char xiaozhi_saved_ws_url[ORNAMENT_XIAOZHI_WS_URL_MAX * 2];
+    char xiaozhi_runtime_ws_url[ORNAMENT_XIAOZHI_WS_URL_MAX * 2];
+    char xiaozhi_active_ws_url[ORNAMENT_XIAOZHI_WS_URL_MAX * 2];
     char xiaozhi_client_id[XIAOZHI_CLIENT_ID_MAX * 2];
     char xiaozhi_activation_code[XIAOZHI_ACTIVATION_CODE_MAX * 2];
     char xiaozhi_activation_message[XIAOZHI_STATUS_TEXT_MAX * 2];
@@ -506,6 +521,9 @@ static esp_err_t root_get_handler(httpd_req_t *req)
     html_escape(settings_bridge_url_or_default(&console_settings), bridge_url, sizeof(bridge_url));
     xiaozhi_client_status_snapshot(&xiaozhi);
     html_escape(settings_xiaozhi_ws_url_or_default(&console_settings), xiaozhi_ws_url, sizeof(xiaozhi_ws_url));
+    html_escape(xiaozhi.saved_ws_url, xiaozhi_saved_ws_url, sizeof(xiaozhi_saved_ws_url));
+    html_escape(xiaozhi.runtime_ws_url, xiaozhi_runtime_ws_url, sizeof(xiaozhi_runtime_ws_url));
+    html_escape(xiaozhi.active_ws_url, xiaozhi_active_ws_url, sizeof(xiaozhi_active_ws_url));
     html_escape(xiaozhi.client_id, xiaozhi_client_id, sizeof(xiaozhi_client_id));
     html_escape(xiaozhi.activation_code, xiaozhi_activation_code, sizeof(xiaozhi_activation_code));
     html_escape(xiaozhi.activation_message, xiaozhi_activation_message, sizeof(xiaozhi_activation_message));
@@ -678,6 +696,26 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "<div class=\"card\"><div class=\"k\">Last TTS</div><div class=\"v\">%s</div><div class=\"k\">%s</div></div>",
         xiaozhi_last_tts[0] != '\0' ? xiaozhi_last_tts : "--",
         xiaozhi_last_error[0] != '\0' ? xiaozhi_last_error : "no error");
+    appendf(
+        html,
+        html_size,
+        &used,
+        "<div class=\"card\"><div class=\"k\">Saved WS</div><div class=\"v\" style=\"font-size:12px;word-break:break-all\">%s</div></div>",
+        xiaozhi_saved_ws_url[0] != '\0' ? xiaozhi_saved_ws_url : "--");
+    appendf(
+        html,
+        html_size,
+        &used,
+        "<div class=\"card\"><div class=\"k\">Runtime WS</div><div class=\"v\" style=\"font-size:12px;word-break:break-all\">%s</div><div class=\"k\">official %s</div></div>",
+        xiaozhi_runtime_ws_url[0] != '\0' ? xiaozhi_runtime_ws_url : "--",
+        xiaozhi.official_runtime_config ? "yes" : "no");
+    appendf(
+        html,
+        html_size,
+        &used,
+        "<div class=\"card\"><div class=\"k\">Active WS</div><div class=\"v\" style=\"font-size:12px;word-break:break-all\">%s</div><div class=\"k\">requested %s</div></div>",
+        xiaozhi_active_ws_url[0] != '\0' ? xiaozhi_active_ws_url : "--",
+        xiaozhi.session_requested ? "yes" : "no");
     append(html, html_size, &used, "</section>");
     append(
         html,
