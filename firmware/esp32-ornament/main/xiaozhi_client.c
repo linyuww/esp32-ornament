@@ -595,7 +595,6 @@ static void set_error_with_http_status(const char *message, int http_status)
     }
     if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         set_state_locked(XIAOZHI_CLIENT_STATE_ERROR);
-        set_session_requested_locked(true);
         if (http_status > 0 && message != NULL && strstr(message, "hello timeout") != NULL) {
             snprintf(s_snapshot.last_error, sizeof(s_snapshot.last_error), "%s (%d)", message, http_status);
         } else if (http_status > 0 && message != NULL && strstr(message, "websocket error") != NULL) {
@@ -735,11 +734,6 @@ static esp_err_t send_hello_on_client(esp_websocket_client_handle_t client)
     return send_text_frame_on_client(client, json);
 }
 
-static esp_err_t send_text_frame(const char *json)
-{
-    return send_text_frame_on_client(s_client, json);
-}
-
 static esp_err_t send_hello(void)
 {
     return send_hello_on_client(s_client);
@@ -765,11 +759,6 @@ static esp_err_t send_listen_state_on_client(esp_websocket_client_handle_t clien
         return ESP_ERR_NO_MEM;
     }
     return send_text_frame_on_client(client, json);
-}
-
-static esp_err_t send_listen_state(const char *state)
-{
-    return send_listen_state_on_client(s_client, state);
 }
 
 static void store_text_field(const cJSON *root, const char *name, char *target, size_t target_size)
@@ -1509,6 +1498,7 @@ cleanup_ctx:
 done:
     log_heap_status("session_done");
     if (s_mutex != NULL && xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        set_session_requested_locked(false);
         if (s_snapshot.state != XIAOZHI_CLIENT_STATE_ERROR &&
             s_snapshot.state != XIAOZHI_CLIENT_STATE_CONFIG_MISSING) {
             set_state_locked(XIAOZHI_CLIENT_STATE_IDLE);

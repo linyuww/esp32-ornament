@@ -425,10 +425,11 @@ static esp_err_t status_get_handler(httpd_req_t *req)
         json,
         json_size,
         &used,
-        "\"xiaozhi\":{\"enabled\":%s,\"configured\":%s,\"connected\":%s,\"session_requested\":%s,\"state\":\"%s\",\"protocol_version\":%d,\"activation_pending\":%s,\"official_runtime_config\":%s,\"ws_url\":\"%s\",\"saved_ws_url\":\"%s\",\"runtime_ws_url\":\"%s\",\"active_ws_url\":\"%s\",\"client_id\":\"%s\",\"session_id\":\"%s\",\"activation_code\":\"%s\",\"activation_message\":\"%s\",\"last_error\":\"%s\",\"last_stt\":\"%s\",\"last_tts\":\"%s\",\"uplink_frames\":%u,\"downlink_frames\":%u},",
+        "\"xiaozhi\":{\"enabled\":%s,\"configured\":%s,\"connected\":%s,\"ai_enabled\":%s,\"session_requested\":%s,\"state\":\"%s\",\"protocol_version\":%d,\"activation_pending\":%s,\"official_runtime_config\":%s,\"ws_url\":\"%s\",\"saved_ws_url\":\"%s\",\"runtime_ws_url\":\"%s\",\"active_ws_url\":\"%s\",\"client_id\":\"%s\",\"session_id\":\"%s\",\"activation_code\":\"%s\",\"activation_message\":\"%s\",\"last_error\":\"%s\",\"last_stt\":\"%s\",\"last_tts\":\"%s\",\"uplink_frames\":%u,\"downlink_frames\":%u},",
         xiaozhi.enabled ? "true" : "false",
         xiaozhi.configured ? "true" : "false",
         xiaozhi.connected ? "true" : "false",
+        xiaozhi.session_requested ? "true" : "false",
         xiaozhi.session_requested ? "true" : "false",
         xiaozhi_client_state_name(xiaozhi.state),
         xiaozhi.protocol_version,
@@ -664,6 +665,12 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         html,
         html_size,
         &used,
+        "<div class=\"card\"><div class=\"k\">AI Enabled</div><div class=\"v\">%s</div><div class=\"k\">stop ai disables wake</div></div>",
+        xiaozhi.session_requested ? "yes" : "no");
+    appendf(
+        html,
+        html_size,
+        &used,
         "<div class=\"card\"><div class=\"k\">Client ID</div><div class=\"v\">%s</div><div class=\"k\">proto v%d</div></div>",
         xiaozhi_client_id[0] != '\0' ? xiaozhi_client_id : "--",
         xiaozhi.protocol_version);
@@ -713,9 +720,9 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         html,
         html_size,
         &used,
-        "<div class=\"card\"><div class=\"k\">Active WS</div><div class=\"v\" style=\"font-size:12px;word-break:break-all\">%s</div><div class=\"k\">requested %s</div></div>",
+        "<div class=\"card\"><div class=\"k\">Active WS</div><div class=\"v\" style=\"font-size:12px;word-break:break-all\">%s</div><div class=\"k\">connected %s</div></div>",
         xiaozhi_active_ws_url[0] != '\0' ? xiaozhi_active_ws_url : "--",
-        xiaozhi.session_requested ? "yes" : "no");
+        xiaozhi.connected ? "yes" : "no");
     append(html, html_size, &used, "</section>");
     append(
         html,
@@ -732,7 +739,9 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "<div class=\"actions\"><button type=\"submit\">Save Xiaozhi</button>"
         "<button type=\"submit\" formaction=\"/test-xiaozhi\">Test AI</button>"
         "<button class=\"warn\" type=\"submit\" formaction=\"/xiaozhi-start\">Start AI</button>"
-        "<button class=\"danger\" type=\"submit\" formaction=\"/xiaozhi-stop\">Stop AI</button></div></form></section>");
+        "<button class=\"danger\" type=\"submit\" formaction=\"/xiaozhi-stop\">Stop AI</button></div>"
+        "<footer>Start AI keeps Xiaozhi listening in the background. When idle, the screen returns to the quota or standby page. When wake-word or dialog activity appears, the screen switches back to Xiaozhi. Stop AI fully disables wake listening.</footer>"
+        "</form></section>");
     appendf(
         html,
         html_size,

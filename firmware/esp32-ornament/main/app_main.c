@@ -51,6 +51,7 @@
 static const char *TAG = "ornament";
 
 #define VOICE_PAGE_HOLD_MS 12000
+#define XIAOZHI_PAGE_FOCUS_MS 12000
 #define VOICE_STATUS_TEXT_MAX 40
 #define ORNAMENT_MIN_VALID_EPOCH 1577836800LL
 #define BRIDGE_SINGLE_RETRY_DELAY_MS 1000
@@ -664,23 +665,76 @@ static bool voice_view_active(voice_view_t view, TickType_t hold_until_tick, Tic
            (hold_until_tick == portMAX_DELAY || (hold_until_tick != 0 && now < hold_until_tick));
 }
 
-static bool xiaozhi_session_page_active(const xiaozhi_client_snapshot_t *snapshot)
+static bool xiaozhi_text_changed(const char *current, const char *previous)
+{
+    const char *current_text = current != NULL ? current : "";
+    const char *previous_text = previous != NULL ? previous : "";
+    return current_text[0] != '\0' && strcmp(current_text, previous_text) != 0;
+}
+
+static bool xiaozhi_should_refresh_page_focus(
+    const xiaozhi_client_snapshot_t *snapshot,
+    const xiaozhi_client_snapshot_t *previous_snapshot,
+    bool have_previous_snapshot)
 {
     if (snapshot == NULL) {
         return false;
     }
-    if (snapshot->session_requested || snapshot->activation_pending) {
+
+    if (!have_previous_snapshot) {
+        return snapshot->session_requested ||
+               snapshot->activation_pending ||
+               snapshot->state == XIAOZHI_CLIENT_STATE_CONNECTING ||
+               snapshot->state == XIAOZHI_CLIENT_STATE_SPEAKING;
+    }
+
+    if ((snapshot->activation_pending && !previous_snapshot->activation_pending) ||
+        (snapshot->session_requested && !previous_snapshot->session_requested)) {
+        return true;
+    }
+
+    if (snapshot->state != previous_snapshot->state) {
+        switch (snapshot->state) {
+        case XIAOZHI_CLIENT_STATE_CONNECTING:
+        case XIAOZHI_CLIENT_STATE_SPEAKING:
+        case XIAOZHI_CLIENT_STATE_ERROR:
+            return true;
+        case XIAOZHI_CLIENT_STATE_LISTENING:
+            return previous_snapshot->state == XIAOZHI_CLIENT_STATE_CONNECTING ||
+                   previous_snapshot->state == XIAOZHI_CLIENT_STATE_SPEAKING;
+        case XIAOZHI_CLIENT_STATE_DISABLED:
+        case XIAOZHI_CLIENT_STATE_IDLE:
+        case XIAOZHI_CLIENT_STATE_CONFIG_MISSING:
+        default:
+            break;
+        }
+    }
+
+    return xiaozhi_text_changed(snapshot->last_stt, previous_snapshot->last_stt) ||
+           xiaozhi_text_changed(snapshot->last_tts, previous_snapshot->last_tts);
+}
+
+static bool xiaozhi_session_page_active(
+    const xiaozhi_client_snapshot_t *snapshot,
+    TickType_t focus_until_tick,
+    TickType_t now)
+{
+    if (snapshot == NULL) {
+        return false;
+    }
+    if (snapshot->activation_pending) {
         return true;
     }
     switch (snapshot->state) {
     case XIAOZHI_CLIENT_STATE_CONNECTING:
-    case XIAOZHI_CLIENT_STATE_LISTENING:
     case XIAOZHI_CLIENT_STATE_SPEAKING:
         return true;
+    case XIAOZHI_CLIENT_STATE_LISTENING:
+    case XIAOZHI_CLIENT_STATE_ERROR:
+        return focus_until_tick != 0 && now < focus_until_tick;
     case XIAOZHI_CLIENT_STATE_DISABLED:
     case XIAOZHI_CLIENT_STATE_IDLE:
     case XIAOZHI_CLIENT_STATE_CONFIG_MISSING:
-    case XIAOZHI_CLIENT_STATE_ERROR:
     default:
         return false;
     }
@@ -1159,10 +1213,13 @@ static void ui_render_task(void *arg)
     (void)arg;
     ornament_state_t state;
     xiaozhi_client_snapshot_t xiaozhi_snapshot;
+    xiaozhi_client_snapshot_t previous_xiaozhi_snapshot = {0};
     voice_control_state_t voice_state;
     TickType_t idle_since_tick = 0;
     TickType_t last_done_tick = 0;
+    TickType_t xiaozhi_page_focus_until_tick = 0;
     bool have_last_done_tick = false;
+    bool have_previous_xiaozhi_snapshot = false;
     bool previous_standby_eligible = false;
     bool previous_xiaozhi_page_active = false;
     esp_err_t fetch_error = ESP_OK;
@@ -1179,7 +1236,23 @@ static void ui_render_task(void *arg)
         web_console_set_last_state(&state, fetch_error);
         xiaozhi_client_status_snapshot(&xiaozhi_snapshot);
         bool have_voice_state = voice_control_snapshot(&voice_state);
-        bool xiaozhi_page_active = xiaozhi_session_page_active(&xiaozhi_snapshot);
+        if (xiaozhi_should_refresh_page_focus(
+                &xiaozhi_snapshot,
+                &previous_xiaozhi_snapshot,
+                have_previous_xiaozhi_snapshot)) {
+            xiaozhi_page_focus_until_tick = now + pdMS_TO_TICKS(XIAOZHI_PAGE_FOCUS_MS);
+        }
+        if (have_previous_xiaozhi_snapshot &&
+            !xiaozhi_snapshot.session_requested &&
+            previous_xiaozhi_snapshot.session_requested &&
+            xiaozhi_snapshot.state == XIAOZHI_CLIENT_STATE_IDLE &&
+            !xiaozhi_snapshot.activation_pending) {
+            xiaozhi_page_focus_until_tick = 0;
+        }
+        bool xiaozhi_page_active = xiaozhi_session_page_active(
+            &xiaozhi_snapshot,
+            xiaozhi_page_focus_until_tick,
+            now);
 
         bool standby_eligible = standby_timer_eligible(&state);
         if (standby_eligible) {
@@ -1205,6 +1278,9 @@ static void ui_render_task(void *arg)
         } else if (!(have_voice_state && render_voice_override(&state, fetch_error, &xiaozhi_snapshot, &voice_state, now))) {
             render_current_state(&state, idle_since_tick, now);
         }
+
+        previous_xiaozhi_snapshot = xiaozhi_snapshot;
+        have_previous_xiaozhi_snapshot = true;
 
         vTaskDelay(pdMS_TO_TICKS(CONFIG_ORNAMENT_UI_FRAME_MS));
     }

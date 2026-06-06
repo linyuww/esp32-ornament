@@ -35,6 +35,9 @@
 - 连续 `CONFIG_ORNAMENT_BRIDGE_OFFLINE_FAILURES` 次拉取失败后才显示 `Bridge offline`，默认 3 次。
 - 空闲 `CONFIG_ORNAMENT_STANDBY_CLOCK_MS` 后进入待机时钟页，默认 60000 ms。
 - GPIO15 页面按键可短按切换 `Auto` / `Quota` / `Tasks` / `Clock` / `Xiaozhi`。
+- 网页 `Start AI` 会启动小智后台监听并立即切到 AI 页面；进入监听待机后，屏幕默认回到额度/待机页。
+- 小智检测到唤醒词或新的对话活动后，屏幕会自动切回小智页面显示 STT/TTS。
+- 网页 `Stop AI` 会彻底关闭小智会话；关闭后仅喊唤醒词不会重新启动 AI。
 - 任务完成后边框闪烁 `CONFIG_ORNAMENT_DONE_FLASH_MS`，默认 5000 ms。
 - 本地 Web 控制台提供状态查看、Bridge URL 测试、重启、清空配置和语音音量设置。
 
@@ -138,7 +141,9 @@ http://<ESP32-IP>/
 
 - 首次配网页可填写 Xiaozhi WebSocket URL 和 token。
 - 联网后 Web 控制台的 `Xiaozhi AI` 区域可保存 URL/token、启动/停止会话、查看 STT/TTS 文本和上下行帧计数。
-- ASRPRO 串口命令可发送 `xiaozhi_start` / `xiaozhi_stop`，别名为 `ai_start` / `ai_stop`。
+- `Start AI` 用于开启后台监听。启动瞬间屏幕会进入小智页；连接成功后如果没有人说话，屏幕会恢复为额度/待机页。
+- 保持 `Start AI` 开启时，官方小智后台的唤醒词 `你好小智` 仍然有效。识别到新的语音对话或 TTS 播放时，屏幕会自动切回小智页。
+- `Stop AI` 会终止当前小智会话并关闭唤醒监听。停止后就算喊 `你好小智`，设备也不会重新进入 AI。
 - 屏幕的小智页面使用 `78/xiaozhi-fonts` 普惠中文字体和 LVGL 字形渲染，STT/TTS 中文文本会直接显示在当前 ST7789 帧缓冲页面中。
 
 音频硬件配置：
