@@ -20,7 +20,9 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "nvs.h"
+#include "music_player.h"
 #include "task_audio.h"
+#include "xiaozhi_mcp.h"
 
 #include <opus.h>
 
@@ -85,6 +87,7 @@ static void format_http_error_detail(
     esp_err_t err,
     int http_status,
     const char *response);
+static esp_err_t send_mcp_response_on_client(esp_websocket_client_handle_t client, const char *response_json);
 
 typedef struct {
     ornament_settings_t settings;
@@ -732,6 +735,20 @@ void xiaozhi_client_status_snapshot(xiaozhi_client_snapshot_t *snapshot)
     }
 }
 
+bool xiaozhi_client_session_requested(void)
+{
+    if (s_mutex == NULL) {
+        return false;
+    }
+
+    bool requested = false;
+    if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        requested = s_snapshot.session_requested;
+        xSemaphoreGive(s_mutex);
+    }
+    return requested;
+}
+
 static void get_device_mac(char *target, size_t target_size)
 {
     uint8_t mac[6] = {0};
@@ -772,6 +789,24 @@ static esp_err_t send_text_frame_on_client(esp_websocket_client_handle_t client,
     return sent == len ? ESP_OK : ESP_FAIL;
 }
 
+static esp_err_t send_mcp_response_on_client(esp_websocket_client_handle_t client, const char *response_json)
+{
+    if (client == NULL || response_json == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    char envelope[XIAOZHI_JSON_MAX * 2];
+    int written = snprintf(
+        envelope,
+        sizeof(envelope),
+        "{\"type\":\"mcp\",\"payload\":%s}",
+        response_json);
+    if (written <= 0 || written >= (int)sizeof(envelope)) {
+        return ESP_ERR_NO_MEM;
+    }
+    return send_text_frame_on_client(client, envelope);
+}
+
 static esp_err_t send_hello_on_client(esp_websocket_client_handle_t client)
 {
     char json[XIAOZHI_JSON_MAX];
@@ -779,10 +814,12 @@ static esp_err_t send_hello_on_client(esp_websocket_client_handle_t client)
         json,
         sizeof(json),
         "{\"type\":\"hello\",\"version\":%d,\"transport\":\"websocket\","
-        "\"audio_params\":{\"format\":\"opus\",\"sample_rate\":%d,\"channels\":1,\"frame_duration\":%d}}",
+        "\"audio_params\":{\"format\":\"opus\",\"sample_rate\":%d,\"channels\":1,\"frame_duration\":%d},"
+        "\"features\":{\"mcp\":%s}}",
         s_runtime_protocol_version,
         XIAOZHI_OPUS_SAMPLE_RATE_HZ,
-        CONFIG_ORNAMENT_XIAOZHI_FRAME_MS);
+        CONFIG_ORNAMENT_XIAOZHI_FRAME_MS,
+        CONFIG_ORNAMENT_XIAOZHI_MCP_ENABLED ? "true" : "false");
     if (written <= 0 || written >= (int)sizeof(json)) {
         return ESP_ERR_NO_MEM;
     }
@@ -848,7 +885,20 @@ static void handle_text_message(const char *data, int len)
         return;
     }
 
-    if (strcmp(type->valuestring, "hello") == 0) {
+    if (strcmp(type->valuestring, "mcp") == 0) {
+        const cJSON *payload = cJSON_GetObjectItem(root, "payload");
+        char *response_json = NULL;
+        esp_err_t err = xiaozhi_mcp_handle_request(payload, &response_json);
+        if (err == ESP_OK && response_json != NULL) {
+            esp_err_t send_err = send_mcp_response_on_client(s_client, response_json);
+            if (send_err != ESP_OK) {
+                ESP_LOGW(TAG, "mcp response send failed: %s", esp_err_to_name(send_err));
+            }
+        } else if (err != ESP_OK) {
+            ESP_LOGW(TAG, "mcp request handling failed: %s", esp_err_to_name(err));
+        }
+        free(response_json);
+    } else if (strcmp(type->valuestring, "hello") == 0) {
         const cJSON *transport = cJSON_GetObjectItem(root, "transport");
         if (cJSON_IsString(transport) && strcmp(transport->valuestring, "websocket") == 0) {
             if (s_mutex != NULL && xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
@@ -869,6 +919,7 @@ static void handle_text_message(const char *data, int len)
         const cJSON *state = cJSON_GetObjectItem(root, "state");
         if (cJSON_IsString(state) && state->valuestring != NULL) {
             if (strcmp(state->valuestring, "start") == 0) {
+                music_player_request_stop();
                 set_state(XIAOZHI_CLIENT_STATE_SPEAKING);
                 xEventGroupSetBits(s_events, XIAOZHI_EVENT_SPEAKING);
             } else if (strcmp(state->valuestring, "stop") == 0) {
@@ -1169,6 +1220,11 @@ static esp_err_t run_capture_loop(OpusEncoder *encoder, esp_websocket_client_han
            client != NULL &&
            esp_websocket_client_is_connected(client)) {
         EventBits_t bits = xEventGroupGetBits(s_events);
+        if (music_player_is_active()) {
+            paused_for_tts = false;
+            vTaskDelay(pdMS_TO_TICKS(CONFIG_ORNAMENT_XIAOZHI_FRAME_MS));
+            continue;
+        }
         if (bits & XIAOZHI_EVENT_SPEAKING) {
             paused_for_tts = true;
             vTaskDelay(pdMS_TO_TICKS(CONFIG_ORNAMENT_XIAOZHI_FRAME_MS));
@@ -1650,6 +1706,7 @@ esp_err_t xiaozhi_client_init(void)
             set_state(XIAOZHI_CLIENT_STATE_IDLE);
         }
     }
+    ESP_RETURN_ON_ERROR(xiaozhi_mcp_init(), TAG, "mcp init failed");
 
     ESP_LOGI(TAG, "Xiaozhi client ready enabled=%d mic_gpio=%d", CONFIG_ORNAMENT_XIAOZHI_ENABLED, CONFIG_ORNAMENT_XIAOZHI_MIC_PIN_DIN);
     return ESP_OK;
@@ -1949,6 +2006,11 @@ esp_err_t xiaozhi_client_reconnect_session(bool start_if_idle)
 esp_err_t xiaozhi_client_stop_session(void)
 {
     return ESP_ERR_NOT_SUPPORTED;
+}
+
+bool xiaozhi_client_session_requested(void)
+{
+    return false;
 }
 
 esp_err_t xiaozhi_client_probe(const char *ws_url_override, const char *token_override, xiaozhi_probe_result_t *result)
