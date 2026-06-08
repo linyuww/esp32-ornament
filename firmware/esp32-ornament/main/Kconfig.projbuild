@@ -402,43 +402,6 @@ config ORNAMENT_XIAOZHI_MIC_SLOT_RIGHT
         Enable when the I2S microphone is wired or strapped to transmit on the
         right channel. Left slot is used by default.
 
-config ORNAMENT_XIAOZHI_MCP_ENABLED
-    bool "Enable Xiaozhi MCP tool handling"
-    depends on ORNAMENT_XIAOZHI_ENABLED
-    default y
-    help
-        Advertise MCP capability in the Xiaozhi hello frame and handle
-        inbound JSON-RPC tool calls for local music playback.
-
-config ORNAMENT_BRIDGE_MUSIC_BASE_URL
-    string "Bridge music base URL"
-    depends on ORNAMENT_XIAOZHI_MCP_ENABLED
-    default ""
-    help
-        Optional base URL for the bridge music endpoints, for example
-        http://192.168.1.100:8787/v1/music. When empty, the firmware derives
-        it from the configured bridge state URL by replacing /state.
-
-config ORNAMENT_BRIDGE_MUSIC_TOKEN
-    string "Bridge music bearer token"
-    depends on ORNAMENT_XIAOZHI_MCP_ENABLED
-    default ""
-    help
-        Optional bearer token sent to bridge music endpoints. Leave empty
-        when the bridge allows LAN access without Authorization.
-
-config ORNAMENT_BRIDGE_MUSIC_STREAM_TIMEOUT_MS
-    int "Bridge music request timeout in milliseconds"
-    depends on ORNAMENT_XIAOZHI_MCP_ENABLED
-    default 2000
-    range 500 60000
-
-config ORNAMENT_BRIDGE_MUSIC_PCM_CHUNK_BYTES
-    int "Bridge music PCM chunk bytes"
-    depends on ORNAMENT_XIAOZHI_MCP_ENABLED
-    default 2048
-    range 512 8192
-
 endmenu
 
 config ORNAMENT_STANDBY_CLOCK_MS

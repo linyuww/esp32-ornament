@@ -5,14 +5,12 @@ use quota_core::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    borrow::Cow,
     collections::{HashMap, HashSet, VecDeque},
     env,
     fs::{self, File},
     io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket},
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
     sync::{
         mpsc::{self, Receiver, SyncSender, TrySendError},
         Arc, Mutex,
@@ -22,7 +20,6 @@ use std::{
 
 const DEFAULT_BIND: &str = "0.0.0.0:8787";
 const MAX_BODY_BYTES: usize = 64 * 1024;
-const DEFAULT_STREAM_COPY_BYTES: usize = 8192;
 const MAX_STATE_TASKS: usize = 8;
 const MAX_TASK_HISTORY: usize = 16;
 const TASK_EVENT_QUEUE_CAPACITY: usize = 64;
@@ -92,7 +89,6 @@ struct CachedActiveRecovery {
 struct BridgeConfig {
     bind: String,
     token: Option<String>,
-    yaohud_key: Option<String>,
     tracked_session_id: Option<String>,
     codex_home: PathBuf,
     weather_latitude: f64,
@@ -116,7 +112,6 @@ enum WeatherProvider {
 struct HttpRequest {
     method: String,
     path: String,
-    raw_path: String,
     headers: HashMap<String, String>,
     body: Vec<u8>,
 }
@@ -314,69 +309,6 @@ enum DoneSource {
     Other,
 }
 
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct MusicResolveResponse {
-    ok: bool,
-    song: String,
-    artist: String,
-    index: u32,
-    source: &'static str,
-    title: String,
-    album: String,
-    picture: String,
-    url: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    lyrics: Option<String>,
-}
-
-#[derive(Clone, Debug)]
-struct MusicRequest {
-    song: String,
-    artist: Option<String>,
-    index: u32,
-}
-
-#[derive(Clone, Debug)]
-struct ResolvedSong {
-    title: String,
-    artist: String,
-    album: String,
-    picture: String,
-    url: String,
-    lyrics: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct YaohudMusicResponse {
-    #[serde(default)]
-    code: Option<i32>,
-    #[serde(default)]
-    msg: Option<String>,
-    #[serde(default)]
-    title: Option<String>,
-    #[serde(default)]
-    song: Option<String>,
-    #[serde(default)]
-    artist: Option<String>,
-    #[serde(default)]
-    singer: Option<String>,
-    #[serde(default)]
-    album: Option<String>,
-    #[serde(default)]
-    picture: Option<String>,
-    #[serde(default)]
-    pic: Option<String>,
-    #[serde(default)]
-    musicurl: Option<String>,
-    #[serde(default)]
-    url: Option<String>,
-    #[serde(default)]
-    lrc: Option<String>,
-    #[serde(default)]
-    lyrics: Option<String>,
-}
-
 fn main() {
     if let Err(error) = run() {
         eprintln!("{error}");
@@ -390,7 +322,6 @@ fn run() -> io::Result<()> {
         token: env::var("CODEX_ORNAMENT_TOKEN")
             .ok()
             .filter(|value| !value.trim().is_empty()),
-        yaohud_key: env_text("CODEX_ORNAMENT_YAOHUD_KEY"),
         tracked_session_id: env_text("CODEX_ORNAMENT_SESSION_ID"),
         codex_home: codex_home(),
         weather_latitude: env_f64("CODEX_ORNAMENT_WEATHER_LAT").unwrap_or(DEFAULT_WEATHER_LATITUDE),
@@ -473,8 +404,6 @@ fn handle_connection(
             };
             write_json(&mut stream, 200, &response)
         }
-        ("GET", "/v1/music/resolve") => handle_music_resolve(&mut stream, peer, &request, &config),
-        ("GET", "/v1/music/stream") => handle_music_stream(&mut stream, peer, &request, &config),
         ("POST", "/hook/codex") | ("POST", "/event") => {
             if !post_allowed(peer, &request, &config) {
                 return write_json(
@@ -1491,7 +1420,7 @@ fn read_request(stream: &mut TcpStream) -> io::Result<HttpRequest> {
     let path = raw_path
         .split_once('?')
         .map(|(path, _)| path.to_string())
-        .unwrap_or_else(|| raw_path.clone());
+        .unwrap_or(raw_path);
 
     let mut headers = HashMap::new();
     loop {
@@ -1519,7 +1448,6 @@ fn read_request(stream: &mut TcpStream) -> io::Result<HttpRequest> {
     Ok(HttpRequest {
         method,
         path,
-        raw_path,
         headers,
         body,
     })
@@ -1618,373 +1546,10 @@ fn post_allowed(peer: Option<SocketAddr>, request: &HttpRequest, config: &Bridge
         .unwrap_or(false)
 }
 
-fn music_get_allowed(peer: Option<SocketAddr>, request: &HttpRequest, config: &BridgeConfig) -> bool {
-    if peer.map(|addr| is_loopback(addr.ip())).unwrap_or(false) {
-        return true;
-    }
-
-    let Some(expected) = config.token.as_deref() else {
-        return true;
-    };
-
-    request
-        .headers
-        .get("authorization")
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .map(|actual| actual.trim() == expected)
-        .unwrap_or(false)
-}
-
 fn is_loopback(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => ip.is_loopback(),
         IpAddr::V6(ip) => ip.is_loopback(),
-    }
-}
-
-fn handle_music_resolve(
-    stream: &mut TcpStream,
-    peer: Option<SocketAddr>,
-    request: &HttpRequest,
-    config: &BridgeConfig,
-) -> io::Result<()> {
-    if !music_get_allowed(peer, request, config) {
-        return write_json(stream, 403, &json!({"ok": false, "error": "forbidden"}));
-    }
-
-    let music_request = match parse_music_request(request) {
-        Ok(request) => request,
-        Err(error) => {
-            return write_json(stream, 400, &json!({"ok": false, "error": error.to_string()}));
-        }
-    };
-
-    match resolve_song(config, &music_request) {
-        Ok(song) => write_json(
-            stream,
-            200,
-            &MusicResolveResponse {
-                ok: true,
-                song: music_request.song,
-                artist: music_request.artist.unwrap_or_else(|| song.artist.clone()),
-                index: music_request.index,
-                source: "yaohud",
-                title: song.title,
-                album: song.album,
-                picture: song.picture,
-                url: song.url,
-                lyrics: song.lyrics,
-            },
-        ),
-        Err(error) => {
-            eprintln!("music resolve failed: {error}");
-            write_json(stream, map_music_status(&error), &json!({"ok": false, "error": error.to_string()}))
-        }
-    }
-}
-
-fn handle_music_stream(
-    stream: &mut TcpStream,
-    peer: Option<SocketAddr>,
-    request: &HttpRequest,
-    config: &BridgeConfig,
-) -> io::Result<()> {
-    if !music_get_allowed(peer, request, config) {
-        return write_json(stream, 403, &json!({"ok": false, "error": "forbidden"}));
-    }
-
-    let music_request = match parse_music_request(request) {
-        Ok(request) => request,
-        Err(error) => {
-            return write_json(stream, 400, &json!({"ok": false, "error": error.to_string()}));
-        }
-    };
-
-    let resolved = match resolve_song(config, &music_request) {
-        Ok(song) => song,
-        Err(error) => {
-            eprintln!("music stream resolve failed: {error}");
-            return write_json(stream, map_music_status(&error), &json!({"ok": false, "error": error.to_string()}));
-        }
-    };
-
-    let mut child = match spawn_ffmpeg_pcm_stream(&resolved.url) {
-        Ok(child) => child,
-        Err(error) => {
-            eprintln!("music ffmpeg spawn failed: {error}");
-            return write_json(stream, 500, &json!({"ok": false, "error": error.to_string()}));
-        }
-    };
-
-    let headers = [
-        ("X-Ornament-Music-Title", sanitize_header_value(&resolved.title)),
-        ("X-Ornament-Music-Artist", sanitize_header_value(&resolved.artist)),
-        ("X-Ornament-Music-Album", sanitize_header_value(&resolved.album)),
-    ];
-    write_streaming_response(stream, 200, "audio/L16; rate=16000; channels=1", &headers)?;
-
-    let copy_result = stream_child_stdout_to_http(stream, &mut child);
-    let _ = child.kill();
-    let _ = child.wait();
-
-    copy_result
-}
-
-fn parse_music_request(request: &HttpRequest) -> io::Result<MusicRequest> {
-    let raw_query = request
-        .raw_path
-        .split_once('?')
-        .map(|(_, query)| query)
-        .unwrap_or("");
-    let query = parse_query_params(raw_query);
-
-    let song = query
-        .get("song")
-        .cloned()
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing song query parameter"))?;
-    let artist = query.get("artist").cloned().filter(|value| !value.is_empty());
-    let index = query
-        .get("index")
-        .and_then(|value| value.parse::<u32>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(1);
-
-    Ok(MusicRequest { song, artist, index })
-}
-
-fn parse_query_params(query: &str) -> HashMap<String, String> {
-    let mut values = HashMap::new();
-    for pair in query.split('&') {
-        if pair.is_empty() {
-            continue;
-        }
-        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
-        values.insert(percent_decode(key), percent_decode(value));
-    }
-    values
-}
-
-fn percent_decode(value: &str) -> String {
-    let bytes = value.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        match bytes[index] {
-            b'+' => {
-                decoded.push(b' ');
-                index += 1;
-            }
-            b'%' if index + 2 < bytes.len() => {
-                if let (Some(high), Some(low)) = (hex_digit_value(bytes[index + 1]), hex_digit_value(bytes[index + 2])) {
-                    decoded.push(((high << 4) | low) as u8);
-                    index += 3;
-                } else {
-                    decoded.push(bytes[index]);
-                    index += 1;
-                }
-            }
-            byte => {
-                decoded.push(byte);
-                index += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&decoded).into_owned()
-}
-
-fn resolve_song(config: &BridgeConfig, request: &MusicRequest) -> io::Result<ResolvedSong> {
-    let key = config.yaohud_key.as_deref().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "CODEX_ORNAMENT_YAOHUD_KEY is required for local music playback",
-        )
-    })?;
-
-    let query = match request.artist.as_deref() {
-        Some(artist) if !artist.is_empty() => format!("{} {}", request.song, artist),
-        _ => request.song.clone(),
-    };
-    let url = format!(
-        "https://api.yaohud.cn/api/music/wy?key={}&msg={}&n={}&g=13",
-        form_urlencode(key),
-        form_urlencode(&query),
-        request.index
-    );
-
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()
-        .map_err(io_other)?;
-    let response = client
-        .get(url)
-        .send()
-        .map_err(io_other)?
-        .error_for_status()
-        .map_err(io_other)?;
-    let body = response.text().map_err(io_other)?;
-    let parsed: YaohudMusicResponse =
-        serde_json::from_str(&body).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-
-    if parsed.code.unwrap_or(200) != 200 {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            parsed.msg.unwrap_or_else(|| "Yaohud resolve failed".to_string()),
-        ));
-    }
-
-    let url = parsed
-        .musicurl
-        .or(parsed.url)
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Yaohud response missing playable url"))?;
-
-    let title = first_nonempty(&[
-        parsed.title.as_deref(),
-        parsed.song.as_deref(),
-        Some(request.song.as_str()),
-    ])
-    .unwrap_or_default()
-    .to_string();
-    let artist = first_nonempty(&[
-        parsed.artist.as_deref(),
-        parsed.singer.as_deref(),
-        request.artist.as_deref(),
-    ])
-    .unwrap_or("")
-    .to_string();
-    let album = parsed.album.unwrap_or_default();
-    let picture = parsed.picture.or(parsed.pic).unwrap_or_default();
-    let lyrics = parsed
-        .lyrics
-        .or(parsed.lrc)
-        .and_then(|value| if value.trim().is_empty() { None } else { Some(value) });
-
-    Ok(ResolvedSong {
-        title,
-        artist,
-        album,
-        picture,
-        url,
-        lyrics,
-    })
-}
-
-fn first_nonempty<'a>(values: &[Option<&'a str>]) -> Option<&'a str> {
-    values.iter().copied().flatten().find(|value| !value.trim().is_empty())
-}
-
-fn form_urlencode(value: &str) -> Cow<'_, str> {
-    let mut encoded = String::with_capacity(value.len());
-    let mut changed = false;
-    for byte in value.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => encoded.push(byte as char),
-            b' ' => {
-                encoded.push('+');
-                changed = true;
-            }
-            _ => {
-                encoded.push('%');
-                encoded.push_str(&format!("{byte:02X}"));
-                changed = true;
-            }
-        }
-    }
-    if changed {
-        Cow::Owned(encoded)
-    } else {
-        Cow::Borrowed(value)
-    }
-}
-
-fn spawn_ffmpeg_pcm_stream(url: &str) -> io::Result<Child> {
-    Command::new("ffmpeg")
-        .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-i", url, "-f", "s16le", "-ac", "1", "-ar", "16000", "pipe:1"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-}
-
-fn stream_child_stdout_to_http(stream: &mut TcpStream, child: &mut Child) -> io::Result<()> {
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| io::Error::other("ffmpeg stdout unavailable"))?;
-    let mut stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| io::Error::other("ffmpeg stderr unavailable"))?;
-    let stderr_thread = std::thread::spawn(move || -> String {
-        let mut stderr_text = String::new();
-        let _ = stderr.read_to_string(&mut stderr_text);
-        stderr_text
-    });
-
-    let mut buffer = vec![0_u8; DEFAULT_STREAM_COPY_BYTES];
-    loop {
-        let read = stdout.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        stream.write_all(&buffer[..read])?;
-    }
-    stream.flush()?;
-
-    let status = child.wait()?;
-    let stderr_text = stderr_thread.join().unwrap_or_default();
-    if status.success() {
-        Ok(())
-    } else {
-        Err(io::Error::other(format!(
-            "ffmpeg exited with status {status}: {}",
-            clip(stderr_text.trim(), 200)
-        )))
-    }
-}
-
-fn sanitize_header_value(value: &str) -> String {
-    value
-        .chars()
-        .map(|ch| if ch == '\r' || ch == '\n' { ' ' } else { ch })
-        .collect::<String>()
-}
-
-fn write_streaming_response(
-    stream: &mut TcpStream,
-    status: u16,
-    content_type: &str,
-    extra_headers: &[(&str, String)],
-) -> io::Result<()> {
-    let reason = match status {
-        200 => "OK",
-        202 => "Accepted",
-        204 => "No Content",
-        400 => "Bad Request",
-        403 => "Forbidden",
-        404 => "Not Found",
-        500 => "Internal Server Error",
-        503 => "Service Unavailable",
-        _ => "OK",
-    };
-    write!(
-        stream,
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: Content-Type, Authorization, X-Codex-Ornament-Token, Access-Control-Request-Private-Network\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Private-Network: true\r\nConnection: close\r\n"
-    )?;
-    for (name, value) in extra_headers {
-        write!(stream, "{name}: {value}\r\n")?;
-    }
-    write!(stream, "\r\n")?;
-    Ok(())
-}
-
-fn map_music_status(error: &io::Error) -> u16 {
-    match error.kind() {
-        io::ErrorKind::InvalidInput => 400,
-        io::ErrorKind::NotFound => 404,
-        io::ErrorKind::PermissionDenied => 403,
-        _ => 500,
     }
 }
 
@@ -3617,7 +3182,6 @@ mod tests {
         BridgeConfig {
             bind: "127.0.0.1:8787".to_string(),
             token: token.map(str::to_string),
-            yaohud_key: None,
             tracked_session_id: None,
             codex_home: PathBuf::from(".codex-test"),
             weather_latitude: DEFAULT_WEATHER_LATITUDE,
@@ -3634,7 +3198,6 @@ mod tests {
         BridgeConfig {
             bind: "127.0.0.1:8787".to_string(),
             token: None,
-            yaohud_key: None,
             tracked_session_id: Some(session_id.to_string()),
             codex_home: codex_home.into(),
             weather_latitude: DEFAULT_WEATHER_LATITUDE,
