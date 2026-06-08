@@ -96,8 +96,8 @@ config ORNAMENT_PAGE_BUTTON_ENABLED
     bool "Enable hardware page cycle button"
     default y
     help
-        Enables a physical button that cycles the display through auto,
-        quota, tasks, clock, and Xiaozhi pages.
+        Enables a physical button that cycles the display through the fixed
+        standby/clock, quota, and Xiaozhi assistant pages.
 
 config ORNAMENT_PAGE_BUTTON_GPIO
     int "Page cycle button GPIO"
@@ -117,6 +117,38 @@ config ORNAMENT_PAGE_BUTTON_ACTIVE_LOW
 config ORNAMENT_PAGE_BUTTON_DEBOUNCE_MS
     int "Page button debounce in milliseconds"
     depends on ORNAMENT_PAGE_BUTTON_ENABLED
+    default 50
+    range 10 500
+
+endmenu
+
+menu "AI button"
+
+config ORNAMENT_AI_BUTTON_ENABLED
+    bool "Enable hardware AI start/stop button"
+    default y
+    help
+        Enables a dedicated button that toggles the Xiaozhi session only while
+        the current manual page is the Xiaozhi assistant page.
+
+config ORNAMENT_AI_BUTTON_GPIO
+    int "AI start/stop button GPIO"
+    depends on ORNAMENT_AI_BUTTON_ENABLED
+    default 16
+    help
+        Connect one side of the button to this GPIO and the other side to
+        GND when active-low mode is enabled.
+
+config ORNAMENT_AI_BUTTON_ACTIVE_LOW
+    bool "AI button is active low"
+    depends on ORNAMENT_AI_BUTTON_ENABLED
+    default y
+    help
+        Enables the GPIO internal pull-up and treats a low level as pressed.
+
+config ORNAMENT_AI_BUTTON_DEBOUNCE_MS
+    int "AI button debounce in milliseconds"
+    depends on ORNAMENT_AI_BUTTON_ENABLED
     default 50
     range 10 500
 
