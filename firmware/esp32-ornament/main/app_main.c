@@ -48,6 +48,24 @@
 #define ORNAMENT_PAGE_BUTTON_ACTIVE_LOW 0
 #endif
 
+#ifndef CONFIG_ORNAMENT_AI_BUTTON_ENABLED
+#define CONFIG_ORNAMENT_AI_BUTTON_ENABLED 0
+#endif
+
+#ifndef CONFIG_ORNAMENT_AI_BUTTON_GPIO
+#define CONFIG_ORNAMENT_AI_BUTTON_GPIO 16
+#endif
+
+#ifndef CONFIG_ORNAMENT_AI_BUTTON_DEBOUNCE_MS
+#define CONFIG_ORNAMENT_AI_BUTTON_DEBOUNCE_MS 50
+#endif
+
+#ifdef CONFIG_ORNAMENT_AI_BUTTON_ACTIVE_LOW
+#define ORNAMENT_AI_BUTTON_ACTIVE_LOW 1
+#else
+#define ORNAMENT_AI_BUTTON_ACTIVE_LOW 0
+#endif
+
 static const char *TAG = "ornament";
 
 #define VOICE_PAGE_HOLD_MS 12000
@@ -90,11 +108,24 @@ typedef struct {
     char last_result[VOICE_STATUS_TEXT_MAX];
 } voice_control_state_t;
 
+typedef enum {
+    XIAOZHI_SESSION_ACTION_NONE = 0,
+    XIAOZHI_SESSION_ACTION_START,
+    XIAOZHI_SESSION_ACTION_STOP,
+    XIAOZHI_SESSION_ACTION_TOGGLE,
+} xiaozhi_session_action_t;
+
+typedef struct {
+    xiaozhi_session_action_t action;
+    const char *reason;
+} xiaozhi_session_request_t;
+
 static SemaphoreHandle_t shared_state_mutex;
 static ornament_shared_state_t shared_state;
 static SemaphoreHandle_t voice_control_mutex;
 static voice_control_state_t voice_control;
 static QueueHandle_t voice_command_queue;
+static QueueHandle_t xiaozhi_session_queue;
 
 static void log_heap_status(const char *stage)
 {
@@ -500,7 +531,7 @@ static const char *voice_view_name(voice_view_t view)
     case VOICE_VIEW_TASKS:
         return "TASKS";
     case VOICE_VIEW_CLOCK:
-        return "CLOCK";
+        return "STANDBY";
     case VOICE_VIEW_XIAOZHI:
         return "XIAOZHI";
     default:
@@ -508,22 +539,28 @@ static const char *voice_view_name(voice_view_t view)
     }
 }
 
+static bool voice_view_in_page_button_cycle(voice_view_t view)
+{
+    return view == VOICE_VIEW_CLOCK ||
+           view == VOICE_VIEW_QUOTA ||
+           view == VOICE_VIEW_XIAOZHI;
+}
+
 static voice_view_t next_button_view(voice_view_t current)
 {
     switch (current) {
     case VOICE_VIEW_AUTO:
-        return VOICE_VIEW_QUOTA;
-    case VOICE_VIEW_QUOTA:
-        return VOICE_VIEW_TASKS;
-    case VOICE_VIEW_TASKS:
         return VOICE_VIEW_CLOCK;
     case VOICE_VIEW_CLOCK:
+        return VOICE_VIEW_QUOTA;
+    case VOICE_VIEW_QUOTA:
         return VOICE_VIEW_XIAOZHI;
     case VOICE_VIEW_XIAOZHI:
-        return VOICE_VIEW_AUTO;
+        return VOICE_VIEW_CLOCK;
     case VOICE_VIEW_STATUS:
+    case VOICE_VIEW_TASKS:
     default:
-        return VOICE_VIEW_AUTO;
+        return VOICE_VIEW_CLOCK;
     }
 }
 
@@ -531,6 +568,64 @@ static bool voice_view_active(voice_view_t view, TickType_t hold_until_tick, Tic
 {
     return view != VOICE_VIEW_AUTO &&
            (hold_until_tick == portMAX_DELAY || (hold_until_tick != 0 && now < hold_until_tick));
+}
+
+static bool voice_control_active_view(TickType_t now, voice_view_t *view, bool *manual_active)
+{
+    if (voice_control_mutex == NULL) {
+        return false;
+    }
+    if (xSemaphoreTake(voice_control_mutex, pdMS_TO_TICKS(20)) != pdTRUE) {
+        return false;
+    }
+
+    bool active = voice_view_active(voice_control.view, voice_control.hold_until_tick, now);
+    if (view != NULL) {
+        *view = active ? voice_control.view : VOICE_VIEW_AUTO;
+    }
+    if (manual_active != NULL) {
+        *manual_active = voice_control.manual_view && active;
+    }
+
+    xSemaphoreGive(voice_control_mutex);
+    return true;
+}
+
+static void queue_xiaozhi_session_action(xiaozhi_session_action_t action, const char *reason)
+{
+    if (action == XIAOZHI_SESSION_ACTION_NONE || xiaozhi_session_queue == NULL) {
+        return;
+    }
+
+    const xiaozhi_session_request_t request = {
+        .action = action,
+        .reason = reason,
+    };
+    if (xQueueSend(xiaozhi_session_queue, &request, 0) == pdTRUE) {
+        ESP_LOGI(
+            TAG,
+            "queued Xiaozhi action=%d reason=%s",
+            action,
+            reason != NULL ? reason : "<none>");
+        return;
+    }
+
+    xiaozhi_session_request_t dropped = {0};
+    if (xQueueReceive(xiaozhi_session_queue, &dropped, 0) == pdTRUE &&
+        xQueueSend(xiaozhi_session_queue, &request, 0) == pdTRUE) {
+        ESP_LOGW(
+            TAG,
+            "Xiaozhi session queue full, dropped oldest action=%d reason=%s",
+            dropped.action,
+            dropped.reason != NULL ? dropped.reason : "<none>");
+        return;
+    }
+
+    ESP_LOGW(
+        TAG,
+        "Xiaozhi session action dropped action=%d reason=%s",
+        action,
+        reason != NULL ? reason : "<none>");
 }
 
 static void voice_control_set_view(voice_view_t view, TickType_t now, const char *command, const char *result)
@@ -554,8 +649,50 @@ static void voice_control_set_view(voice_view_t view, TickType_t now, const char
     xSemaphoreGive(voice_control_mutex);
 }
 
+static esp_err_t xiaozhi_start_session_if_needed(const char *reason)
+{
+    if (xiaozhi_client_session_requested()) {
+        ESP_LOGI(TAG, "Xiaozhi session already active: %s", reason);
+        return ESP_OK;
+    }
+
+    esp_err_t err = xiaozhi_client_start_session();
+    if (err == ESP_ERR_INVALID_STATE) {
+        if (xiaozhi_client_session_requested()) {
+            err = ESP_OK;
+        }
+    }
+
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "Xiaozhi session start requested: %s", reason);
+    } else {
+        ESP_LOGW(TAG, "Xiaozhi session start failed (%s): %s", reason, esp_err_to_name(err));
+    }
+    return err;
+}
+
+static esp_err_t xiaozhi_stop_session_if_needed(const char *reason)
+{
+    esp_err_t err = xiaozhi_client_stop_session();
+    if (err == ESP_ERR_INVALID_STATE) {
+        if (!xiaozhi_client_session_requested()) {
+            err = ESP_OK;
+        }
+    }
+
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "Xiaozhi session stop requested: %s", reason);
+    } else {
+        ESP_LOGW(TAG, "Xiaozhi session stop failed (%s): %s", reason, esp_err_to_name(err));
+    }
+    return err;
+}
+
 static void voice_control_cycle_page(TickType_t now)
 {
+    xiaozhi_session_action_t xiaozhi_action = XIAOZHI_SESSION_ACTION_NONE;
+    voice_view_t next_view = VOICE_VIEW_CLOCK;
+
     if (voice_control_mutex == NULL) {
         return;
     }
@@ -564,20 +701,34 @@ static void voice_control_cycle_page(TickType_t now)
         return;
     }
     voice_view_t current = voice_control.manual_view &&
-                                   voice_view_active(voice_control.view, voice_control.hold_until_tick, now)
+                                   voice_view_active(voice_control.view, voice_control.hold_until_tick, now) &&
+                                   voice_view_in_page_button_cycle(voice_control.view)
                                ? voice_control.view
                                : VOICE_VIEW_AUTO;
-    voice_control.view = next_button_view(current);
-    voice_control.hold_until_tick = voice_control.view == VOICE_VIEW_AUTO ? 0 : portMAX_DELAY;
-    voice_control.manual_view = voice_control.view != VOICE_VIEW_AUTO;
+    next_view = next_button_view(current);
+    if (current != VOICE_VIEW_XIAOZHI && next_view == VOICE_VIEW_XIAOZHI) {
+        xiaozhi_action = XIAOZHI_SESSION_ACTION_START;
+    } else if (current == VOICE_VIEW_XIAOZHI && next_view != VOICE_VIEW_XIAOZHI) {
+        xiaozhi_action = XIAOZHI_SESSION_ACTION_STOP;
+    }
+
+    voice_control.view = next_view;
+    voice_control.hold_until_tick = portMAX_DELAY;
+    voice_control.manual_view = true;
     strlcpy(voice_control.last_command, "PAGE BUTTON", sizeof(voice_control.last_command));
     snprintf(
         voice_control.last_result,
         sizeof(voice_control.last_result),
         "PAGE %s",
-        voice_view_name(voice_control.view));
-    ESP_LOGI(TAG, "page button switched to %s at tick %lu", voice_view_name(voice_control.view), (unsigned long)now);
+        voice_view_name(next_view));
+    ESP_LOGI(TAG, "page button switched to %s at tick %lu", voice_view_name(next_view), (unsigned long)now);
     xSemaphoreGive(voice_control_mutex);
+
+    if (xiaozhi_action == XIAOZHI_SESSION_ACTION_START) {
+        queue_xiaozhi_session_action(XIAOZHI_SESSION_ACTION_START, "page button entered Xiaozhi page");
+    } else if (xiaozhi_action == XIAOZHI_SESSION_ACTION_STOP) {
+        queue_xiaozhi_session_action(XIAOZHI_SESSION_ACTION_STOP, "page button left Xiaozhi page");
+    }
 }
 
 static void voice_control_set_result(const char *result)
@@ -911,33 +1062,62 @@ static void asrpro_voice_command_received(asrpro_voice_command_t command, void *
 static void handle_voice_command(asrpro_voice_command_t command)
 {
     TickType_t now = xTaskGetTickCount();
+    voice_view_t active_view = VOICE_VIEW_AUTO;
+    bool manual_active = false;
+    bool manual_xiaozhi_page = voice_control_active_view(now, &active_view, &manual_active) &&
+                               manual_active &&
+                               active_view == VOICE_VIEW_XIAOZHI;
     ESP_LOGI(TAG, "handling voice command: %s", asrpro_voice_command_name(command));
     switch (command) {
     case ASRPRO_VOICE_COMMAND_STATUS:
+        if (manual_xiaozhi_page) {
+            (void)xiaozhi_stop_session_if_needed("voice status left Xiaozhi page");
+        }
         voice_control_set_view(VOICE_VIEW_STATUS, now, "VOICE STATUS", "STATUS READY");
         break;
     case ASRPRO_VOICE_COMMAND_SHOW_QUOTA:
+        if (manual_xiaozhi_page) {
+            (void)xiaozhi_stop_session_if_needed("voice quota left Xiaozhi page");
+        }
         voice_control_set_view(VOICE_VIEW_QUOTA, now, "SHOW QUOTA", "QUOTA PAGE");
         break;
     case ASRPRO_VOICE_COMMAND_SHOW_TASKS:
+        if (manual_xiaozhi_page) {
+            (void)xiaozhi_stop_session_if_needed("voice tasks left Xiaozhi page");
+        }
         voice_control_set_view(VOICE_VIEW_TASKS, now, "SHOW TASKS", "TASK PAGE");
         break;
     case ASRPRO_VOICE_COMMAND_SHOW_CLOCK:
+        if (manual_xiaozhi_page) {
+            (void)xiaozhi_stop_session_if_needed("voice clock left Xiaozhi page");
+        }
         voice_control_set_view(VOICE_VIEW_CLOCK, now, "SHOW CLOCK", "CLOCK PAGE");
         break;
     case ASRPRO_VOICE_COMMAND_REFRESH_STATE:
+        if (manual_xiaozhi_page) {
+            (void)xiaozhi_stop_session_if_needed("voice refresh left Xiaozhi page");
+        }
         voice_control_request_refresh(now);
         voice_control_set_view(VOICE_VIEW_STATUS, now, "REFRESH STATE", "REFRESHING");
         break;
     case ASRPRO_VOICE_COMMAND_BRIDGE_MATCH:
+        if (manual_xiaozhi_page) {
+            (void)xiaozhi_stop_session_if_needed("voice bridge match left Xiaozhi page");
+        }
         voice_control_request_bridge_match(now);
         voice_control_set_view(VOICE_VIEW_STATUS, now, "BRIDGE MATCH", "MATCHING");
         break;
     case ASRPRO_VOICE_COMMAND_QUIET_ON:
+        if (manual_xiaozhi_page) {
+            (void)xiaozhi_stop_session_if_needed("voice quiet on left Xiaozhi page");
+        }
         voice_control_set_quiet(true);
         voice_control_set_view(VOICE_VIEW_STATUS, now, "QUIET ON", "QUIET ON");
         break;
     case ASRPRO_VOICE_COMMAND_QUIET_OFF:
+        if (manual_xiaozhi_page) {
+            (void)xiaozhi_stop_session_if_needed("voice quiet off left Xiaozhi page");
+        }
         voice_control_set_quiet(false);
         voice_control_set_view(VOICE_VIEW_STATUS, now, "QUIET OFF", "QUIET OFF");
         break;
@@ -961,14 +1141,29 @@ static void handle_voice_command(asrpro_voice_command_t command)
     }
     case ASRPRO_VOICE_COMMAND_UNKNOWN:
     default:
+        if (manual_xiaozhi_page) {
+            (void)xiaozhi_stop_session_if_needed("unknown voice command left Xiaozhi page");
+        }
         voice_control_set_view(VOICE_VIEW_STATUS, now, "UNKNOWN", "UNKNOWN CMD");
         break;
     }
 }
 
-static bool page_button_pressed_level(int level)
+static bool button_pressed_level(int level, bool active_low)
 {
-    return ORNAMENT_PAGE_BUTTON_ACTIVE_LOW ? level == 0 : level != 0;
+    return active_low ? level == 0 : level != 0;
+}
+
+static esp_err_t configure_button_gpio(gpio_num_t gpio, bool active_low)
+{
+    const gpio_config_t config = {
+        .pin_bit_mask = 1ULL << gpio,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = active_low ? GPIO_PULLUP_ENABLE : GPIO_PULLUP_DISABLE,
+        .pull_down_en = active_low ? GPIO_PULLDOWN_DISABLE : GPIO_PULLDOWN_ENABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    return gpio_config(&config);
 }
 
 static void page_button_task(void *arg)
@@ -976,31 +1171,24 @@ static void page_button_task(void *arg)
     (void)arg;
 #if CONFIG_ORNAMENT_PAGE_BUTTON_ENABLED
     const gpio_num_t gpio = (gpio_num_t)CONFIG_ORNAMENT_PAGE_BUTTON_GPIO;
-    const gpio_config_t config = {
-        .pin_bit_mask = 1ULL << gpio,
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = ORNAMENT_PAGE_BUTTON_ACTIVE_LOW ? GPIO_PULLUP_ENABLE : GPIO_PULLUP_DISABLE,
-        .pull_down_en = ORNAMENT_PAGE_BUTTON_ACTIVE_LOW ? GPIO_PULLDOWN_DISABLE : GPIO_PULLDOWN_ENABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    ESP_ERROR_CHECK(gpio_config(&config));
+    ESP_ERROR_CHECK(configure_button_gpio(gpio, ORNAMENT_PAGE_BUTTON_ACTIVE_LOW));
 
     const TickType_t poll_ticks = pdMS_TO_TICKS(20);
     const TickType_t debounce_ticks = pdMS_TO_TICKS(CONFIG_ORNAMENT_PAGE_BUTTON_DEBOUNCE_MS);
-    bool stable_pressed = page_button_pressed_level(gpio_get_level(gpio));
+    bool stable_pressed = button_pressed_level(gpio_get_level(gpio), ORNAMENT_PAGE_BUTTON_ACTIVE_LOW);
     bool last_sample_pressed = stable_pressed;
     TickType_t changed_tick = xTaskGetTickCount();
 
     ESP_LOGI(
         TAG,
-        "page button enabled: gpio=%d active_%s debounce=%dms",
+        "page button enabled: gpio=%d active_%s debounce=%dms cycle=standby->quota->xiaozhi",
         CONFIG_ORNAMENT_PAGE_BUTTON_GPIO,
         ORNAMENT_PAGE_BUTTON_ACTIVE_LOW ? "low" : "high",
         CONFIG_ORNAMENT_PAGE_BUTTON_DEBOUNCE_MS);
 
     while (true) {
         TickType_t now = xTaskGetTickCount();
-        bool sample_pressed = page_button_pressed_level(gpio_get_level(gpio));
+        bool sample_pressed = button_pressed_level(gpio_get_level(gpio), ORNAMENT_PAGE_BUTTON_ACTIVE_LOW);
         if (sample_pressed != last_sample_pressed) {
             last_sample_pressed = sample_pressed;
             changed_tick = now;
@@ -1016,6 +1204,98 @@ static void page_button_task(void *arg)
 #else
     vTaskDelete(NULL);
 #endif
+}
+
+static void ai_button_task(void *arg)
+{
+    (void)arg;
+#if CONFIG_ORNAMENT_AI_BUTTON_ENABLED
+    const gpio_num_t gpio = (gpio_num_t)CONFIG_ORNAMENT_AI_BUTTON_GPIO;
+    ESP_ERROR_CHECK(configure_button_gpio(gpio, ORNAMENT_AI_BUTTON_ACTIVE_LOW));
+
+    const TickType_t poll_ticks = pdMS_TO_TICKS(20);
+    const TickType_t debounce_ticks = pdMS_TO_TICKS(CONFIG_ORNAMENT_AI_BUTTON_DEBOUNCE_MS);
+    bool stable_pressed = button_pressed_level(gpio_get_level(gpio), ORNAMENT_AI_BUTTON_ACTIVE_LOW);
+    bool last_sample_pressed = stable_pressed;
+    TickType_t changed_tick = xTaskGetTickCount();
+
+    ESP_LOGI(
+        TAG,
+        "AI button enabled: gpio=%d active_%s debounce=%dms",
+        CONFIG_ORNAMENT_AI_BUTTON_GPIO,
+        ORNAMENT_AI_BUTTON_ACTIVE_LOW ? "low" : "high",
+        CONFIG_ORNAMENT_AI_BUTTON_DEBOUNCE_MS);
+
+    while (true) {
+        TickType_t now = xTaskGetTickCount();
+        bool sample_pressed = button_pressed_level(gpio_get_level(gpio), ORNAMENT_AI_BUTTON_ACTIVE_LOW);
+        if (sample_pressed != last_sample_pressed) {
+            last_sample_pressed = sample_pressed;
+            changed_tick = now;
+        }
+        if (sample_pressed != stable_pressed && (now - changed_tick) >= debounce_ticks) {
+            stable_pressed = sample_pressed;
+            if (stable_pressed) {
+                voice_view_t active_view = VOICE_VIEW_AUTO;
+                bool manual_active = false;
+                if (!voice_control_active_view(now, &active_view, &manual_active) ||
+                    !manual_active ||
+                    active_view != VOICE_VIEW_XIAOZHI) {
+                    ESP_LOGD(
+                        TAG,
+                        "AI button ignored on page=%s manual=%d",
+                        voice_view_name(active_view),
+                        manual_active);
+                } else {
+                    ESP_LOGI(TAG, "AI button pressed on Xiaozhi page");
+                    queue_xiaozhi_session_action(XIAOZHI_SESSION_ACTION_TOGGLE, "AI button toggle");
+                }
+            }
+        }
+        vTaskDelay(poll_ticks);
+    }
+#else
+    vTaskDelete(NULL);
+#endif
+}
+
+static void xiaozhi_session_task(void *arg)
+{
+    (void)arg;
+    xiaozhi_session_request_t request = {0};
+    while (true) {
+        if (xQueueReceive(xiaozhi_session_queue, &request, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+
+        ESP_LOGI(
+            TAG,
+            "processing Xiaozhi action=%d reason=%s requested=%d",
+            request.action,
+            request.reason != NULL ? request.reason : "<none>",
+            xiaozhi_client_session_requested());
+
+        switch (request.action) {
+        case XIAOZHI_SESSION_ACTION_START:
+            (void)xiaozhi_start_session_if_needed(request.reason != NULL ? request.reason : "queued start");
+            break;
+        case XIAOZHI_SESSION_ACTION_STOP:
+            (void)xiaozhi_stop_session_if_needed(request.reason != NULL ? request.reason : "queued stop");
+            break;
+        case XIAOZHI_SESSION_ACTION_TOGGLE:
+            if (xiaozhi_client_session_requested()) {
+                (void)xiaozhi_stop_session_if_needed(request.reason != NULL ? request.reason : "queued toggle off");
+            } else {
+                (void)xiaozhi_start_session_if_needed(request.reason != NULL ? request.reason : "queued toggle on");
+            }
+            break;
+        case XIAOZHI_SESSION_ACTION_NONE:
+        default:
+            break;
+        }
+
+        ESP_LOGI(TAG, "finished Xiaozhi action=%d requested=%d", request.action, xiaozhi_client_session_requested());
+    }
 }
 
 static void voice_command_task(void *arg)
@@ -1336,6 +1616,8 @@ void app_main(void)
     voice_control_init();
     voice_command_queue = xQueueCreate(4, sizeof(asrpro_voice_command_t));
     ESP_ERROR_CHECK(voice_command_queue == NULL ? ESP_ERR_NO_MEM : ESP_OK);
+    xiaozhi_session_queue = xQueueCreate(4, sizeof(xiaozhi_session_request_t));
+    ESP_ERROR_CHECK(xiaozhi_session_queue == NULL ? ESP_ERR_NO_MEM : ESP_OK);
 
     esp_err_t asrpro_err = asrpro_link_init(asrpro_voice_command_received, NULL);
     if (asrpro_err != ESP_OK) {
@@ -1363,7 +1645,9 @@ void app_main(void)
     shared_state.have_state = true;
 
     create_app_task(voice_command_task, "voice_cmd", 4096, 5);
+    create_app_task(xiaozhi_session_task, "xiaozhi_ctl", 6144, 5);
     create_app_task(page_button_task, "page_button", 3072, 5);
+    create_app_task(ai_button_task, "ai_button", 4096, 5);
     create_app_task(poll_task, "bridge_poll", 8192, 5);
     create_app_task_psram(ui_render_task, "ui_render", UI_RENDER_TASK_STACK, 4);
     log_heap_status("after_tasks");

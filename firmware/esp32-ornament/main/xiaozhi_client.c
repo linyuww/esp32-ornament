@@ -732,6 +732,20 @@ void xiaozhi_client_status_snapshot(xiaozhi_client_snapshot_t *snapshot)
     }
 }
 
+bool xiaozhi_client_session_requested(void)
+{
+    if (s_mutex == NULL) {
+        return false;
+    }
+
+    bool requested = false;
+    if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        requested = s_snapshot.session_requested;
+        xSemaphoreGive(s_mutex);
+    }
+    return requested;
+}
+
 static void get_device_mac(char *target, size_t target_size)
 {
     uint8_t mac[6] = {0};
@@ -779,7 +793,8 @@ static esp_err_t send_hello_on_client(esp_websocket_client_handle_t client)
         json,
         sizeof(json),
         "{\"type\":\"hello\",\"version\":%d,\"transport\":\"websocket\","
-        "\"audio_params\":{\"format\":\"opus\",\"sample_rate\":%d,\"channels\":1,\"frame_duration\":%d}}",
+        "\"audio_params\":{\"format\":\"opus\",\"sample_rate\":%d,\"channels\":1,\"frame_duration\":%d},"
+        "\"features\":{\"mcp\":false}}",
         s_runtime_protocol_version,
         XIAOZHI_OPUS_SAMPLE_RATE_HZ,
         CONFIG_ORNAMENT_XIAOZHI_FRAME_MS);
@@ -1970,6 +1985,11 @@ void xiaozhi_client_status_snapshot(xiaozhi_client_snapshot_t *snapshot)
         memset(snapshot, 0, sizeof(*snapshot));
         snapshot->state = XIAOZHI_CLIENT_STATE_DISABLED;
     }
+}
+
+bool xiaozhi_client_session_requested(void)
+{
+    return false;
 }
 
 #endif
