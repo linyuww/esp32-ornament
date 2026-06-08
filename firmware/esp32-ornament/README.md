@@ -158,11 +158,7 @@ http://<ESP32-IP>/
 
 INMP441 `SCK`/`BCLK` 接 GPIO4，`WS`/`LRCLK` 接 GPIO5，`SD`/`DOUT` 接 GPIO14，`L/R` 接 GND 使用左声道。若 `L/R` 改接 3V3，需要启用 `CONFIG_ORNAMENT_XIAOZHI_MIC_SLOT_RIGHT`。小智会话播放 TTS 时会占用 I2S 输出；此时任务完成提示音会跳过，避免两个音频源同时写同一喇叭。
 
-页面切换按键：按钮一端接 GPIO15，另一端接 GND。默认启用内部上拉，短按循环 `Auto -> Quota -> Tasks -> Clock -> Xiaozhi -> Auto`，手动切到的页面会保持显示到下一次按键。
-
-## 已知问题
-
-- 当前这个版本以 `AI 能正常启动和对话` 为优先，页面/界面切换逻辑仍未完全修好，部分场景下切换行为不符合预期，后续需要继续修复。
+页面切换按键：按钮一端接 GPIO15，另一端接 GND。默认启用内部上拉，短按循环 `Auto -> Quota -> Tasks -> Clock -> Xiaozhi -> Auto`。手动切到的页面会保持显示到下一次按键，并优先于小智会话的自动页面聚焦；切回 `Auto` 后恢复自动显示逻辑。
 
 如果开启 Clash Verge Rev TUN 后 `.local` 访问失败，推荐在 Clash Verge Rev 全局扩展中添加静态 hosts，或在路由器中给 ESP32 绑定 DHCP 静态地址。不要只依赖 `DOMAIN-SUFFIX,local,DIRECT`，因为它不能解决 mDNS 解析被 TUN/DNS 劫持的问题。
 

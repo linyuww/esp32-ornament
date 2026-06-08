@@ -84,6 +84,7 @@ typedef struct {
     TickType_t hold_until_tick;
     TickType_t refresh_requested_tick;
     TickType_t bridge_match_requested_tick;
+    bool manual_view;
     bool quiet_mode;
     char last_command[VOICE_STATUS_TEXT_MAX];
     char last_result[VOICE_STATUS_TEXT_MAX];
@@ -526,6 +527,12 @@ static voice_view_t next_button_view(voice_view_t current)
     }
 }
 
+static bool voice_view_active(voice_view_t view, TickType_t hold_until_tick, TickType_t now)
+{
+    return view != VOICE_VIEW_AUTO &&
+           (hold_until_tick == portMAX_DELAY || (hold_until_tick != 0 && now < hold_until_tick));
+}
+
 static void voice_control_set_view(voice_view_t view, TickType_t now, const char *command, const char *result)
 {
     if (voice_control_mutex == NULL) {
@@ -537,6 +544,7 @@ static void voice_control_set_view(voice_view_t view, TickType_t now, const char
     }
     voice_control.view = view;
     voice_control.hold_until_tick = now + pdMS_TO_TICKS(VOICE_PAGE_HOLD_MS);
+    voice_control.manual_view = false;
     if (command != NULL) {
         strlcpy(voice_control.last_command, command, sizeof(voice_control.last_command));
     }
@@ -555,8 +563,13 @@ static void voice_control_cycle_page(TickType_t now)
         ESP_LOGW(TAG, "page cycle skipped: mutex timeout");
         return;
     }
-    voice_control.view = next_button_view(voice_control.view);
+    voice_view_t current = voice_control.manual_view &&
+                                   voice_view_active(voice_control.view, voice_control.hold_until_tick, now)
+                               ? voice_control.view
+                               : VOICE_VIEW_AUTO;
+    voice_control.view = next_button_view(current);
     voice_control.hold_until_tick = voice_control.view == VOICE_VIEW_AUTO ? 0 : portMAX_DELAY;
+    voice_control.manual_view = voice_control.view != VOICE_VIEW_AUTO;
     strlcpy(voice_control.last_command, "PAGE BUTTON", sizeof(voice_control.last_command));
     snprintf(
         voice_control.last_result,
@@ -657,12 +670,6 @@ static void voice_control_set_quiet(bool enabled)
     voice_control.quiet_mode = enabled;
     strlcpy(voice_control.last_result, enabled ? "QUIET ON" : "QUIET OFF", sizeof(voice_control.last_result));
     xSemaphoreGive(voice_control_mutex);
-}
-
-static bool voice_view_active(voice_view_t view, TickType_t hold_until_tick, TickType_t now)
-{
-    return view != VOICE_VIEW_AUTO &&
-           (hold_until_tick == portMAX_DELAY || (hold_until_tick != 0 && now < hold_until_tick));
 }
 
 static bool xiaozhi_text_changed(const char *current, const char *previous)
@@ -1253,6 +1260,10 @@ static void ui_render_task(void *arg)
             &xiaozhi_snapshot,
             xiaozhi_page_focus_until_tick,
             now);
+        bool manual_page_active = have_voice_state &&
+                                  voice_state.manual_view &&
+                                  voice_view_active(voice_state.view, voice_state.hold_until_tick, now);
+        bool xiaozhi_page_visible = xiaozhi_page_active && !manual_page_active;
 
         bool standby_eligible = standby_timer_eligible(&state);
         if (standby_eligible) {
@@ -1264,19 +1275,25 @@ static void ui_render_task(void *arg)
         }
         previous_standby_eligible = standby_eligible;
 
-        if (xiaozhi_page_active && !previous_xiaozhi_page_active) {
+        if (xiaozhi_page_visible && !previous_xiaozhi_page_active) {
             size_t stack_hwm_bytes = uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t);
             ESP_LOGI(TAG, "ui render entering xiaozhi page: stack_hwm=%u bytes", (unsigned int)stack_hwm_bytes);
             if (stack_hwm_bytes < UI_RENDER_LOW_STACK_WARN_BYTES) {
                 ESP_LOGW(TAG, "ui render stack is low entering xiaozhi page: %u bytes", (unsigned int)stack_hwm_bytes);
             }
         }
-        previous_xiaozhi_page_active = xiaozhi_page_active;
+        previous_xiaozhi_page_active = xiaozhi_page_visible;
 
-        if (xiaozhi_page_active) {
-            display_render_xiaozhi(&state, &xiaozhi_snapshot);
-        } else if (!(have_voice_state && render_voice_override(&state, fetch_error, &xiaozhi_snapshot, &voice_state, now))) {
-            render_current_state(&state, idle_since_tick, now);
+        bool page_rendered = false;
+        if (manual_page_active) {
+            page_rendered = render_voice_override(&state, fetch_error, &xiaozhi_snapshot, &voice_state, now);
+        }
+        if (!page_rendered) {
+            if (xiaozhi_page_visible) {
+                display_render_xiaozhi(&state, &xiaozhi_snapshot);
+            } else if (!(have_voice_state && render_voice_override(&state, fetch_error, &xiaozhi_snapshot, &voice_state, now))) {
+                render_current_state(&state, idle_since_tick, now);
+            }
         }
 
         previous_xiaozhi_snapshot = xiaozhi_snapshot;
