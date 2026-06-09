@@ -1730,22 +1730,11 @@ fn handle_music_resolve(
     };
 
     match resolve_song_cached(state, config, &music_request) {
-        Ok(song) => {
-            eprintln!(
-                "music resolve ok: song={} artist={} index={} source={} title={} url={}",
-                music_request.song,
-                music_request.artist.as_deref().unwrap_or(""),
-                music_request.index,
-                song.source,
-                song.title,
-                song.url
-            );
-            write_json(
-                stream,
-                200,
-                &music_resolve_response(config, &music_request, &song),
-            )
-        }
+        Ok(song) => write_json(
+            stream,
+            200,
+            &music_resolve_response(config, &music_request, &song),
+        ),
         Err(error) => {
             eprintln!("music resolve failed: {error}");
             write_json(
@@ -1780,18 +1769,7 @@ fn handle_music_stream(
     };
 
     let resolved = match resolve_song_cached(state, config, &music_request) {
-        Ok(song) => {
-            eprintln!(
-                "music stream start: song={} artist={} index={} source={} title={} url={}",
-                music_request.song,
-                music_request.artist.as_deref().unwrap_or(""),
-                music_request.index,
-                song.source,
-                song.title,
-                song.url
-            );
-            song
-        }
+        Ok(song) => song,
         Err(error) => {
             eprintln!("music stream resolve failed: {error}");
             return write_json(
@@ -1831,11 +1809,6 @@ fn handle_music_stream(
     write_streaming_response(stream, 200, "audio/L16; rate=16000; channels=1", &headers)?;
 
     let copy_result = stream_child_stdout_to_http(stream, &mut child);
-    if let Err(error) = &copy_result {
-        eprintln!("music stream copy failed: {error}");
-    } else {
-        eprintln!("music stream finished: title={}", resolved.title);
-    }
     let _ = child.kill();
     let _ = child.wait();
 

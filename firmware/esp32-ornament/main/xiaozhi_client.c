@@ -114,7 +114,6 @@ static void format_http_error_detail(
     const char *response);
 static esp_err_t send_mcp_response_on_client(esp_websocket_client_handle_t client, const char *response_json);
 static bool copy_active_settings(ornament_settings_t *settings);
-static bool maybe_handle_local_music_command(const char *text);
 
 typedef struct {
     ornament_settings_t settings;
@@ -1470,110 +1469,6 @@ static void store_text_field(const cJSON *root, const char *name, char *target, 
     }
 }
 
-static const char *skip_music_command_prefix(const char *text)
-{
-    static const char *prefixes[] = {
-        "播放一下",
-        "播放一首",
-        "播放",
-        "放一下",
-        "放一首",
-        "放首",
-        "放",
-        "听一下",
-        "听一首",
-        "听",
-    };
-
-    if (text == NULL) {
-        return NULL;
-    }
-    while (*text == ' ' || *text == '\t') {
-        text++;
-    }
-    for (size_t index = 0; index < sizeof(prefixes) / sizeof(prefixes[0]); index++) {
-        size_t len = strlen(prefixes[index]);
-        if (strncmp(text, prefixes[index], len) == 0) {
-            return text + len;
-        }
-    }
-    return NULL;
-}
-
-static void clean_music_song_name(const char *source, char *target, size_t target_size)
-{
-    if (target == NULL || target_size == 0) {
-        return;
-    }
-    target[0] = '\0';
-    if (source == NULL) {
-        return;
-    }
-
-    while (*source == ' ' || *source == '\t' || *source == ':') {
-        source++;
-    }
-    if ((unsigned char)source[0] == 0xEF && (unsigned char)source[1] == 0xBC && (unsigned char)source[2] == 0x9A) {
-        source += 3;
-    }
-    while (*source == ' ' || *source == '\t') {
-        source++;
-    }
-    strlcpy(target, source, target_size);
-    while (target[0] != '\0') {
-        size_t len = strlen(target);
-        unsigned char last = (unsigned char)target[len - 1];
-        if (last == ' ' || last == '\t' || last == '.' || last == ',' || last == '?' || last == '!') {
-            target[len - 1] = '\0';
-            continue;
-        }
-        if (len >= 3 &&
-            (unsigned char)target[len - 3] == 0xE3 &&
-            (unsigned char)target[len - 2] == 0x80 &&
-            ((unsigned char)target[len - 1] == 0x82 || (unsigned char)target[len - 1] == 0x81)) {
-            target[len - 3] = '\0';
-            continue;
-        }
-        if (len >= 3 &&
-            (unsigned char)target[len - 3] == 0xEF && (unsigned char)target[len - 2] == 0xBC &&
-            ((unsigned char)target[len - 1] == 0x81 || (unsigned char)target[len - 1] == 0x9F ||
-             (unsigned char)target[len - 1] == 0x8C)) {
-            target[len - 3] = '\0';
-            continue;
-        }
-        break;
-    }
-}
-
-static bool maybe_handle_local_music_command(const char *text)
-{
-    char song_name[ORNAMENT_TEXT_MAX] = {0};
-    const char *song = skip_music_command_prefix(text);
-    if (song == NULL) {
-        return false;
-    }
-
-    clean_music_song_name(song, song_name, sizeof(song_name));
-    if (song_name[0] == '\0') {
-        return false;
-    }
-
-    ornament_settings_t settings = {0};
-    const ornament_settings_t *settings_arg = copy_active_settings(&settings) ? &settings : NULL;
-    esp_err_t err = settings_arg != NULL ?
-        music_player_play_song_with_settings(song_name, NULL, 1, settings_arg) :
-        music_player_play_song(song_name, NULL, 1);
-    if (err == ESP_OK) {
-        request_tts_release(true);
-        xEventGroupClearBits(s_events, XIAOZHI_EVENT_SPEAKING);
-        ESP_LOGI(TAG, "local music command started: %s", song_name);
-        return true;
-    }
-
-    ESP_LOGW(TAG, "local music command failed: song=%s err=%s", song_name, esp_err_to_name(err));
-    return false;
-}
-
 static void handle_text_message(const char *data, int len)
 {
     char *json = calloc(1, (size_t)len + 1);
@@ -1623,13 +1518,10 @@ static void handle_text_message(const char *data, int len)
             ESP_LOGI(TAG, "server hello ok");
         }
     } else if (strcmp(type->valuestring, "stt") == 0) {
-        char stt_text[XIAOZHI_STATUS_TEXT_MAX] = {0};
         if (s_mutex != NULL && xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
             store_text_field(root, "text", s_snapshot.last_stt, sizeof(s_snapshot.last_stt));
-            strlcpy(stt_text, s_snapshot.last_stt, sizeof(stt_text));
             xSemaphoreGive(s_mutex);
         }
-        (void)maybe_handle_local_music_command(stt_text);
     } else if (strcmp(type->valuestring, "tts") == 0) {
         const cJSON *state = cJSON_GetObjectItem(root, "state");
         if (cJSON_IsString(state) && state->valuestring != NULL) {
