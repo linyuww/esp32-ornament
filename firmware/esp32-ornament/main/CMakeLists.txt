@@ -9,9 +9,11 @@ idf_component_register(
     "settings.c"
     "system_status.c"
     "task_audio.c"
+    "music_player.c"
     "weather_client.c"
     "web_console.c"
     "xiaozhi_client.c"
+    "xiaozhi_mcp.c"
     "display.c"
     "display_core.c"
     "assets/standby_wallpaper_rgb565.c"
@@ -33,6 +35,7 @@ idf_component_register(
     json
     lwip
     mdns
+    mbedtls
     nvs_flash
     esp-opus
 )

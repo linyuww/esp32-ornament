@@ -17,10 +17,13 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/idf_additions.h"
+#include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "music_player.h"
 #include "nvs.h"
 #include "task_audio.h"
+#include "xiaozhi_mcp.h"
 
 #include <opus.h>
 
@@ -39,6 +42,9 @@
 #define XIAOZHI_EVENT_ERROR BIT4
 #define XIAOZHI_EVENT_LISTEN_RESTART BIT5
 #define XIAOZHI_EVENT_CAPTURE_DONE BIT6
+#define XIAOZHI_EVENT_TTS_RELEASE BIT7
+#define XIAOZHI_EVENT_TTS_SUPPRESSED BIT8
+#define XIAOZHI_EVENT_WS_FINISH BIT9
 #define XIAOZHI_JSON_MAX 640
 #define XIAOZHI_HEADER_MAX 512
 #define XIAOZHI_HTTP_RESPONSE_MAX 4096
@@ -47,12 +53,17 @@
 #define XIAOZHI_TASK_STACK_LARGE 12288
 #define XIAOZHI_TASK_STACK_MEDIUM 10240
 #define XIAOZHI_TASK_STACK_SMALL 8192
-#define XIAOZHI_TASK_STACK_MIN 6144
+#define XIAOZHI_TASK_STACK_MIN 5120
 #define XIAOZHI_CAPTURE_TASK_STACK 16384
 #define XIAOZHI_TASK_PRIO 5
 #define XIAOZHI_RECONNECT_DELAY_MS 2000
+#define XIAOZHI_OFFICIAL_FRAME_MS 60
 #define XIAOZHI_OPUS_DECODE_MAX_FRAMES (ORNAMENT_AUDIO_SAMPLE_RATE_HZ * 60 / 1000)
-#define XIAOZHI_WS_TASK_STACK 8192
+#define XIAOZHI_WS_TASK_STACK 5120
+#define XIAOZHI_TTS_TASK_STACK 8192
+#define XIAOZHI_TTS_QUEUE_LEN 8
+#define XIAOZHI_MCP_TASK_STACK 8192
+#define XIAOZHI_MCP_QUEUE_LEN 3
 #define XIAOZHI_DEFAULT_OTA_URL "https://api.tenclass.net/xiaozhi/ota/"
 
 static const char *TAG = "xiaozhi";
@@ -60,13 +71,21 @@ static const char *XIAOZHI_SETTINGS_NAMESPACE = "xiaozhi";
 static const char *XIAOZHI_UUID_KEY = "client_id";
 
 static SemaphoreHandle_t s_mutex;
+static SemaphoreHandle_t s_client_mutex;
 static EventGroupHandle_t s_events;
 static SemaphoreHandle_t s_codec_mutex;
 static bool s_tts_output_active;
 static TaskHandle_t s_session_task;
 static TaskHandle_t s_capture_task;
+static TaskHandle_t s_tts_task;
+static TaskHandle_t s_mcp_task;
+static QueueHandle_t s_tts_queue;
+static QueueHandle_t s_mcp_queue;
 static esp_websocket_client_handle_t s_client;
+static uint32_t s_client_generation;
 static xiaozhi_client_snapshot_t s_snapshot;
+static ornament_settings_t s_active_settings;
+static bool s_active_settings_valid;
 static bool s_session_starting;
 static volatile esp_err_t s_capture_result;
 static size_t s_session_task_stack_bytes = XIAOZHI_TASK_STACK_LARGE;
@@ -76,6 +95,14 @@ static char s_runtime_token[ORNAMENT_XIAOZHI_TOKEN_MAX];
 static int s_runtime_protocol_version = CONFIG_ORNAMENT_XIAOZHI_PROTOCOL_VERSION;
 
 static void release_tts_output_if_active(void);
+static void request_tts_release(bool suppress);
+static esp_err_t enqueue_tts_packet(const void *data, int len);
+static esp_err_t start_tts_task(void);
+static void increment_downlink_frames(void);
+static OpusEncoder *alloc_opus_encoder(int *opus_err);
+static void free_opus_encoder(OpusEncoder *encoder);
+static OpusDecoder *alloc_opus_decoder(int *opus_err);
+static void free_opus_decoder(OpusDecoder *decoder);
 static void get_device_mac(char *target, size_t target_size);
 static void set_error_with_http_status(const char *message, int http_status);
 static void format_http_error_detail(
@@ -85,6 +112,8 @@ static void format_http_error_detail(
     esp_err_t err,
     int http_status,
     const char *response);
+static esp_err_t send_mcp_response_on_client(esp_websocket_client_handle_t client, const char *response_json);
+static bool copy_active_settings(ornament_settings_t *settings);
 
 typedef struct {
     ornament_settings_t settings;
@@ -95,6 +124,16 @@ typedef struct {
     OpusEncoder *encoder;
     esp_websocket_client_handle_t client;
 } xiaozhi_capture_context_t;
+
+typedef struct {
+    uint8_t *data;
+    int len;
+} xiaozhi_tts_packet_t;
+
+typedef struct {
+    uint32_t client_generation;
+    char *payload_json;
+} xiaozhi_mcp_request_t;
 
 typedef struct {
     char *data;
@@ -164,6 +203,89 @@ static size_t select_session_task_stack_bytes(void)
     return XIAOZHI_TASK_STACK_MIN;
 }
 
+static void *opus_state_alloc(size_t size)
+{
+    void *state = heap_caps_aligned_alloc(8, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (state != NULL) {
+        return state;
+    }
+    ESP_LOGW(
+        TAG,
+        "Opus state PSRAM alloc failed: bytes=%u largest_spiram=%u largest_internal=%u",
+        (unsigned int)size,
+        (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT),
+        (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    return heap_caps_aligned_alloc(8, size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+}
+
+static OpusEncoder *alloc_opus_encoder(int *opus_err)
+{
+    int size = opus_encoder_get_size(XIAOZHI_OPUS_CHANNELS);
+    if (size <= 0) {
+        if (opus_err != NULL) {
+            *opus_err = OPUS_ALLOC_FAIL;
+        }
+        return NULL;
+    }
+
+    OpusEncoder *encoder = opus_state_alloc((size_t)size);
+    if (encoder == NULL) {
+        if (opus_err != NULL) {
+            *opus_err = OPUS_ALLOC_FAIL;
+        }
+        return NULL;
+    }
+
+    int err = opus_encoder_init(encoder, XIAOZHI_OPUS_SAMPLE_RATE_HZ, XIAOZHI_OPUS_CHANNELS, OPUS_APPLICATION_VOIP);
+    if (opus_err != NULL) {
+        *opus_err = err;
+    }
+    if (err != OPUS_OK) {
+        free(encoder);
+        return NULL;
+    }
+    return encoder;
+}
+
+static void free_opus_encoder(OpusEncoder *encoder)
+{
+    heap_caps_free(encoder);
+}
+
+static OpusDecoder *alloc_opus_decoder(int *opus_err)
+{
+    int size = opus_decoder_get_size(XIAOZHI_OPUS_CHANNELS);
+    if (size <= 0) {
+        if (opus_err != NULL) {
+            *opus_err = OPUS_ALLOC_FAIL;
+        }
+        return NULL;
+    }
+
+    OpusDecoder *decoder = opus_state_alloc((size_t)size);
+    if (decoder == NULL) {
+        if (opus_err != NULL) {
+            *opus_err = OPUS_ALLOC_FAIL;
+        }
+        return NULL;
+    }
+
+    int err = opus_decoder_init(decoder, XIAOZHI_OPUS_SAMPLE_RATE_HZ, XIAOZHI_OPUS_CHANNELS);
+    if (opus_err != NULL) {
+        *opus_err = err;
+    }
+    if (err != OPUS_OK) {
+        free(decoder);
+        return NULL;
+    }
+    return decoder;
+}
+
+static void free_opus_decoder(OpusDecoder *decoder)
+{
+    heap_caps_free(decoder);
+}
+
 static void format_http_error_detail(
     char *target,
     size_t target_size,
@@ -216,6 +338,62 @@ static bool should_fetch_official_runtime_config(const ornament_settings_t *sett
     }
 
     return strstr(ws_url, "/xiaozhi/v1/") != NULL;
+}
+
+static int effective_frame_ms_for_ws_url(const char *ws_url)
+{
+    return is_official_backend_url(ws_url) ? XIAOZHI_OFFICIAL_FRAME_MS : CONFIG_ORNAMENT_XIAOZHI_FRAME_MS;
+}
+
+static bool should_advertise_mcp_for_ws_url(const char *ws_url)
+{
+#if CONFIG_ORNAMENT_XIAOZHI_MCP_ENABLED
+    return ws_url != NULL && ws_url[0] != '\0';
+#else
+    (void)ws_url;
+    return false;
+#endif
+}
+
+static void load_effective_transport_config(
+    char *ws_url,
+    size_t ws_url_size,
+    int *frame_ms,
+    bool *advertise_mcp,
+    bool *official_backend)
+{
+    char resolved_ws_url[ORNAMENT_XIAOZHI_WS_URL_MAX] = {0};
+
+    if (s_mutex != NULL && xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        if (s_snapshot.active_ws_url[0] != '\0') {
+            strlcpy(resolved_ws_url, s_snapshot.active_ws_url, sizeof(resolved_ws_url));
+        } else if (s_runtime_ws_url[0] != '\0') {
+            strlcpy(resolved_ws_url, s_runtime_ws_url, sizeof(resolved_ws_url));
+        } else if (s_snapshot.ws_url[0] != '\0') {
+            strlcpy(resolved_ws_url, s_snapshot.ws_url, sizeof(resolved_ws_url));
+        }
+        xSemaphoreGive(s_mutex);
+    } else {
+        if (s_runtime_ws_url[0] != '\0') {
+            strlcpy(resolved_ws_url, s_runtime_ws_url, sizeof(resolved_ws_url));
+        } else if (s_snapshot.ws_url[0] != '\0') {
+            strlcpy(resolved_ws_url, s_snapshot.ws_url, sizeof(resolved_ws_url));
+        }
+    }
+
+    bool official = is_official_backend_url(resolved_ws_url);
+    if (ws_url != NULL && ws_url_size > 0) {
+        strlcpy(ws_url, resolved_ws_url, ws_url_size);
+    }
+    if (frame_ms != NULL) {
+        *frame_ms = effective_frame_ms_for_ws_url(resolved_ws_url);
+    }
+    if (advertise_mcp != NULL) {
+        *advertise_mcp = should_advertise_mcp_for_ws_url(resolved_ws_url);
+    }
+    if (official_backend != NULL) {
+        *official_backend = official;
+    }
 }
 
 static void generate_uuid_v4(char *target, size_t target_size)
@@ -576,9 +754,35 @@ static void set_session_requested_locked(bool requested)
     s_snapshot.session_requested = requested;
 }
 
+static void store_active_settings_locked(const ornament_settings_t *settings)
+{
+    if (settings == NULL) {
+        s_active_settings_valid = false;
+        return;
+    }
+    s_active_settings = *settings;
+    s_active_settings_valid = true;
+}
+
+static bool copy_active_settings(ornament_settings_t *settings)
+{
+    if (settings == NULL || s_mutex == NULL) {
+        return false;
+    }
+    if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
+        return false;
+    }
+    bool valid = s_active_settings_valid;
+    if (valid) {
+        *settings = s_active_settings;
+    }
+    xSemaphoreGive(s_mutex);
+    return valid;
+}
+
 static bool session_runtime_active_locked(void)
 {
-    return s_session_task != NULL || s_session_starting || s_client != NULL || s_capture_task != NULL;
+    return s_session_task != NULL || s_session_starting || s_capture_task != NULL;
 }
 
 static bool session_requested_enabled(void)
@@ -786,28 +990,453 @@ static esp_err_t send_text_frame_on_client(esp_websocket_client_handle_t client,
     return sent == len ? ESP_OK : ESP_FAIL;
 }
 
+static esp_err_t send_mcp_response_on_client(esp_websocket_client_handle_t client, const char *response_json)
+{
+    if (client == NULL || response_json == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    char envelope[XIAOZHI_JSON_MAX * 2];
+    int written = snprintf(
+        envelope,
+        sizeof(envelope),
+        "{\"type\":\"mcp\",\"payload\":%s}",
+        response_json);
+    if (written <= 0 || written >= (int)sizeof(envelope)) {
+        return ESP_ERR_NO_MEM;
+    }
+    return send_text_frame_on_client(client, envelope);
+}
+
+static esp_err_t attach_current_client(esp_websocket_client_handle_t client)
+{
+    if (client == NULL || s_client_mutex == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (xSemaphoreTake(s_client_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    s_client = client;
+    s_client_generation++;
+    xSemaphoreGive(s_client_mutex);
+    return ESP_OK;
+}
+
+static esp_websocket_client_handle_t detach_current_client(void)
+{
+    if (s_client_mutex == NULL) {
+        esp_websocket_client_handle_t client = s_client;
+        s_client = NULL;
+        s_client_generation++;
+        return client;
+    }
+    if (xSemaphoreTake(s_client_mutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
+        ESP_LOGW(TAG, "client detach timed out");
+        return NULL;
+    }
+    esp_websocket_client_handle_t client = s_client;
+    if (client != NULL) {
+        s_client = NULL;
+        s_client_generation++;
+    }
+    xSemaphoreGive(s_client_mutex);
+    return client;
+}
+
+static esp_err_t send_mcp_response_current(uint32_t client_generation, const char *response_json)
+{
+    if (response_json == NULL || s_client_mutex == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (xSemaphoreTake(s_client_mutex, pdMS_TO_TICKS(2500)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    esp_err_t err = ESP_ERR_INVALID_STATE;
+    if (s_client != NULL &&
+        s_client_generation == client_generation &&
+        esp_websocket_client_is_connected(s_client)) {
+        err = send_mcp_response_on_client(s_client, response_json);
+    }
+
+    xSemaphoreGive(s_client_mutex);
+    return err;
+}
+
+static esp_err_t enqueue_mcp_payload(const cJSON *payload)
+{
+    if (s_mcp_queue == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    char *payload_json = NULL;
+    if (payload != NULL) {
+        payload_json = cJSON_PrintUnformatted((cJSON *)payload);
+    } else {
+        payload_json = calloc(1, 5);
+        if (payload_json != NULL) {
+            strlcpy(payload_json, "null", 5);
+        }
+    }
+    if (payload_json == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    xiaozhi_mcp_request_t request = {
+        .payload_json = payload_json,
+    };
+    if (s_client_mutex != NULL && xSemaphoreTake(s_client_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        request.client_generation = s_client_generation;
+        xSemaphoreGive(s_client_mutex);
+    } else {
+        free(payload_json);
+        return ESP_ERR_TIMEOUT;
+    }
+
+    if (xQueueSend(s_mcp_queue, &request, pdMS_TO_TICKS(50)) != pdTRUE) {
+        free(payload_json);
+        return ESP_ERR_TIMEOUT;
+    }
+    return ESP_OK;
+}
+
+static void free_tts_packet(xiaozhi_tts_packet_t *packet)
+{
+    if (packet == NULL) {
+        return;
+    }
+    free(packet->data);
+    packet->data = NULL;
+    packet->len = 0;
+}
+
+static void drain_tts_queue(void)
+{
+    if (s_tts_queue == NULL) {
+        return;
+    }
+    xiaozhi_tts_packet_t packet = {0};
+    while (xQueueReceive(s_tts_queue, &packet, 0) == pdTRUE) {
+        free_tts_packet(&packet);
+    }
+}
+
+static void request_tts_release(bool suppress)
+{
+    if (s_events == NULL) {
+        return;
+    }
+    if (suppress) {
+        xEventGroupSetBits(s_events, XIAOZHI_EVENT_TTS_SUPPRESSED);
+    } else {
+        xEventGroupClearBits(s_events, XIAOZHI_EVENT_TTS_SUPPRESSED);
+    }
+    xEventGroupSetBits(s_events, XIAOZHI_EVENT_TTS_RELEASE);
+}
+
+static esp_err_t enqueue_tts_packet(const void *data, int len)
+{
+    if (s_tts_queue == NULL || data == NULL || len <= 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if ((xEventGroupGetBits(s_events) & XIAOZHI_EVENT_TTS_SUPPRESSED) != 0) {
+        return ESP_OK;
+    }
+
+    uint8_t *copy = heap_caps_malloc((size_t)len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (copy == NULL) {
+        copy = heap_caps_malloc((size_t)len, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+    if (copy == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    memcpy(copy, data, (size_t)len);
+
+    xiaozhi_tts_packet_t packet = {
+        .data = copy,
+        .len = len,
+    };
+    if (xQueueSend(s_tts_queue, &packet, 0) != pdTRUE) {
+        xiaozhi_tts_packet_t dropped = {0};
+        if (xQueueReceive(s_tts_queue, &dropped, 0) == pdTRUE) {
+            free_tts_packet(&dropped);
+        }
+        if (xQueueSend(s_tts_queue, &packet, 0) != pdTRUE) {
+            free(copy);
+            return ESP_ERR_TIMEOUT;
+        }
+        ESP_LOGW(TAG, "tts queue full, dropped oldest packet");
+    }
+    return ESP_OK;
+}
+
+static esp_err_t ensure_tts_output_locked(void)
+{
+    if (s_tts_output_active) {
+        return ESP_OK;
+    }
+
+    ornament_settings_t settings = {0};
+    esp_err_t acquire_err = copy_active_settings(&settings) ?
+        task_audio_output_acquire_with_volume(&settings) :
+        task_audio_output_acquire();
+    if (acquire_err == ESP_OK) {
+        s_tts_output_active = true;
+    }
+    return acquire_err;
+}
+
+static void tts_task(void *arg)
+{
+    (void)arg;
+    int opus_err = OPUS_OK;
+    OpusDecoder *decoder = alloc_opus_decoder(&opus_err);
+    int16_t *pcm = heap_caps_calloc(
+        XIAOZHI_OPUS_DECODE_MAX_FRAMES,
+        sizeof(int16_t),
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (pcm == NULL) {
+        pcm = heap_caps_calloc(
+            XIAOZHI_OPUS_DECODE_MAX_FRAMES,
+            sizeof(int16_t),
+            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+
+    if (decoder == NULL || pcm == NULL) {
+        ESP_LOGW(TAG, "tts task init failed: decoder=%p pcm=%p opus_err=%d", decoder, pcm, opus_err);
+        free_opus_decoder(decoder);
+        free(pcm);
+        s_tts_task = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    ESP_LOGI(TAG, "tts task started: stack_hwm=%lu bytes", (unsigned long)current_stack_high_water_bytes());
+    while (true) {
+        xiaozhi_tts_packet_t packet = {0};
+        if (xQueueReceive(s_tts_queue, &packet, pdMS_TO_TICKS(50)) != pdTRUE) {
+            EventBits_t bits = xEventGroupGetBits(s_events);
+            if ((bits & XIAOZHI_EVENT_TTS_RELEASE) != 0) {
+                drain_tts_queue();
+                release_tts_output_if_active();
+                xEventGroupClearBits(s_events, XIAOZHI_EVENT_TTS_RELEASE);
+            }
+            continue;
+        }
+
+        EventBits_t bits = xEventGroupGetBits(s_events);
+        if ((bits & (XIAOZHI_EVENT_TTS_RELEASE | XIAOZHI_EVENT_TTS_SUPPRESSED)) != 0) {
+            free_tts_packet(&packet);
+            drain_tts_queue();
+            release_tts_output_if_active();
+            xEventGroupClearBits(s_events, XIAOZHI_EVENT_TTS_RELEASE);
+            continue;
+        }
+
+        if (s_codec_mutex == NULL || xSemaphoreTake(s_codec_mutex, pdMS_TO_TICKS(200)) != pdTRUE) {
+            ESP_LOGW(TAG, "opus decode skipped: codec mutex busy");
+            free_tts_packet(&packet);
+            continue;
+        }
+        int decoded = opus_decode(
+            decoder,
+            (const unsigned char *)packet.data,
+            packet.len,
+            pcm,
+            XIAOZHI_OPUS_DECODE_MAX_FRAMES,
+            0);
+        xSemaphoreGive(s_codec_mutex);
+        free_tts_packet(&packet);
+
+        if (decoded <= 0 || (xEventGroupGetBits(s_events) & XIAOZHI_EVENT_SPEAKING) == 0) {
+            continue;
+        }
+
+        esp_err_t acquire_err = ensure_tts_output_locked();
+        if (acquire_err != ESP_OK) {
+            ESP_LOGW(TAG, "tts output acquire failed: %s", esp_err_to_name(acquire_err));
+            continue;
+        }
+
+        esp_err_t err = task_audio_output_write_mono(pcm, (size_t)decoded, 1000);
+        if (err == ESP_OK) {
+            increment_downlink_frames();
+        } else {
+            ESP_LOGW(TAG, "tts write failed: %s", esp_err_to_name(err));
+            release_tts_output_if_active();
+        }
+    }
+}
+
+static esp_err_t start_tts_task(void)
+{
+    if (s_tts_task != NULL) {
+        return ESP_OK;
+    }
+    if (s_tts_queue == NULL) {
+        s_tts_queue = xQueueCreate(XIAOZHI_TTS_QUEUE_LEN, sizeof(xiaozhi_tts_packet_t));
+        if (s_tts_queue == NULL) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
+    BaseType_t created = xTaskCreateWithCaps(
+        tts_task,
+        "xiaozhi_tts",
+        XIAOZHI_TTS_TASK_STACK,
+        NULL,
+        XIAOZHI_TASK_PRIO,
+        &s_tts_task,
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (created != pdPASS) {
+        ESP_LOGW(
+            TAG,
+            "tts task PSRAM stack alloc failed: largest_spiram=%u largest_internal=%u",
+            (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT),
+            (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+        created = xTaskCreateWithCaps(
+            tts_task,
+            "xiaozhi_tts",
+            XIAOZHI_TTS_TASK_STACK,
+            NULL,
+            XIAOZHI_TASK_PRIO,
+            &s_tts_task,
+            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+    if (created != pdPASS) {
+        s_tts_task = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+
+    log_heap_status("after_tts_task");
+    return ESP_OK;
+}
+
+static void mcp_task(void *arg)
+{
+    (void)arg;
+    while (true) {
+        xiaozhi_mcp_request_t request = {0};
+        if (xQueueReceive(s_mcp_queue, &request, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+
+        cJSON *payload = cJSON_Parse(request.payload_json);
+        char *response_json = NULL;
+        ornament_settings_t settings = {0};
+        const ornament_settings_t *settings_arg = copy_active_settings(&settings) ? &settings : NULL;
+        esp_err_t err = xiaozhi_mcp_handle_request(payload, settings_arg, &response_json);
+        if (err == ESP_OK && response_json != NULL) {
+            esp_err_t send_err = send_mcp_response_current(request.client_generation, response_json);
+            if (send_err != ESP_OK) {
+                ESP_LOGW(TAG, "mcp response send failed: %s", esp_err_to_name(send_err));
+            }
+        } else if (err != ESP_OK) {
+            ESP_LOGW(TAG, "mcp request handling failed: %s", esp_err_to_name(err));
+        }
+
+        ESP_LOGI(
+            TAG,
+            "mcp request handled: err=%s stack_hwm=%lu bytes",
+            esp_err_to_name(err),
+            (unsigned long)current_stack_high_water_bytes());
+        free(response_json);
+        cJSON_Delete(payload);
+        free(request.payload_json);
+    }
+}
+
+static esp_err_t start_mcp_task(void)
+{
+    if (s_mcp_task != NULL) {
+        return ESP_OK;
+    }
+    if (s_mcp_queue == NULL) {
+        s_mcp_queue = xQueueCreate(XIAOZHI_MCP_QUEUE_LEN, sizeof(xiaozhi_mcp_request_t));
+        if (s_mcp_queue == NULL) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
+    BaseType_t created = xTaskCreateWithCaps(
+        mcp_task,
+        "xiaozhi_mcp",
+        XIAOZHI_MCP_TASK_STACK,
+        NULL,
+        XIAOZHI_TASK_PRIO,
+        &s_mcp_task,
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (created != pdPASS) {
+        ESP_LOGW(
+            TAG,
+            "mcp task PSRAM stack alloc failed: largest_spiram=%u largest_internal=%u",
+            (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT),
+            (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+        created = xTaskCreateWithCaps(
+            mcp_task,
+            "xiaozhi_mcp",
+            XIAOZHI_MCP_TASK_STACK,
+            NULL,
+            XIAOZHI_TASK_PRIO,
+            &s_mcp_task,
+            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+    if (created != pdPASS) {
+        s_mcp_task = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+
+    log_heap_status("after_mcp_task");
+    return ESP_OK;
+}
+
 static esp_err_t send_hello_on_client(esp_websocket_client_handle_t client)
 {
     char json[XIAOZHI_JSON_MAX];
-    int written = snprintf(
-        json,
-        sizeof(json),
-        "{\"type\":\"hello\",\"version\":%d,\"transport\":\"websocket\","
-        "\"audio_params\":{\"format\":\"opus\",\"sample_rate\":%d,\"channels\":1,\"frame_duration\":%d},"
-        "\"features\":{\"mcp\":false}}",
-        s_runtime_protocol_version,
-        XIAOZHI_OPUS_SAMPLE_RATE_HZ,
-        CONFIG_ORNAMENT_XIAOZHI_FRAME_MS);
+    char active_ws_url[ORNAMENT_XIAOZHI_WS_URL_MAX] = {0};
+    int frame_ms = CONFIG_ORNAMENT_XIAOZHI_FRAME_MS;
+    bool advertise_mcp = false;
+    bool official_backend = false;
+    load_effective_transport_config(
+        active_ws_url,
+        sizeof(active_ws_url),
+        &frame_ms,
+        &advertise_mcp,
+        &official_backend);
+
+    int written = 0;
+    if (advertise_mcp) {
+        written = snprintf(
+            json,
+            sizeof(json),
+            "{\"type\":\"hello\",\"version\":%d,\"transport\":\"websocket\","
+            "\"audio_params\":{\"format\":\"opus\",\"sample_rate\":%d,\"channels\":1,\"frame_duration\":%d},"
+            "\"features\":{\"mcp\":true}}",
+            s_runtime_protocol_version,
+            XIAOZHI_OPUS_SAMPLE_RATE_HZ,
+            frame_ms);
+    } else {
+        written = snprintf(
+            json,
+            sizeof(json),
+            "{\"type\":\"hello\",\"version\":%d,\"transport\":\"websocket\","
+            "\"audio_params\":{\"format\":\"opus\",\"sample_rate\":%d,\"channels\":1,\"frame_duration\":%d}}",
+            s_runtime_protocol_version,
+            XIAOZHI_OPUS_SAMPLE_RATE_HZ,
+            frame_ms);
+    }
     if (written <= 0 || written >= (int)sizeof(json)) {
         return ESP_ERR_NO_MEM;
     }
-    ESP_LOGI(TAG, "sending hello");
+    ESP_LOGI(
+        TAG,
+        "sending hello: protocol=%d frame_ms=%d mcp=%d official=%d ws=%s",
+        s_runtime_protocol_version,
+        frame_ms,
+        advertise_mcp,
+        official_backend,
+        active_ws_url[0] != '\0' ? active_ws_url : "<unknown>");
     return send_text_frame_on_client(client, json);
-}
-
-static esp_err_t send_hello(void)
-{
-    return send_hello_on_client(s_client);
 }
 
 static esp_err_t send_listen_state_on_client(esp_websocket_client_handle_t client, const char *state)
@@ -863,7 +1492,20 @@ static void handle_text_message(const char *data, int len)
         return;
     }
 
-    if (strcmp(type->valuestring, "hello") == 0) {
+    if (strcmp(type->valuestring, "mcp") == 0) {
+        const cJSON *payload = cJSON_GetObjectItem(root, "payload");
+        esp_err_t start_err = start_mcp_task();
+        if (start_err != ESP_OK) {
+            ESP_LOGW(TAG, "mcp task start failed: %s", esp_err_to_name(start_err));
+            cJSON_Delete(root);
+            free(json);
+            return;
+        }
+        esp_err_t err = enqueue_mcp_payload(payload);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "mcp request enqueue failed: %s", esp_err_to_name(err));
+        }
+    } else if (strcmp(type->valuestring, "hello") == 0) {
         const cJSON *transport = cJSON_GetObjectItem(root, "transport");
         if (cJSON_IsString(transport) && strcmp(transport->valuestring, "websocket") == 0) {
             if (s_mutex != NULL && xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
@@ -884,10 +1526,17 @@ static void handle_text_message(const char *data, int len)
         const cJSON *state = cJSON_GetObjectItem(root, "state");
         if (cJSON_IsString(state) && state->valuestring != NULL) {
             if (strcmp(state->valuestring, "start") == 0) {
+                bool suppress_for_music = music_player_is_active();
+                if (suppress_for_music) {
+                    request_tts_release(true);
+                    ESP_LOGI(TAG, "suppressing Xiaozhi TTS while music player is active");
+                } else {
+                    xEventGroupClearBits(s_events, XIAOZHI_EVENT_TTS_SUPPRESSED);
+                }
                 set_state(XIAOZHI_CLIENT_STATE_SPEAKING);
                 xEventGroupSetBits(s_events, XIAOZHI_EVENT_SPEAKING);
             } else if (strcmp(state->valuestring, "stop") == 0) {
-                release_tts_output_if_active();
+                request_tts_release(false);
                 set_state(XIAOZHI_CLIENT_STATE_LISTENING);
                 xEventGroupClearBits(s_events, XIAOZHI_EVENT_SPEAKING);
                 xEventGroupSetBits(s_events, XIAOZHI_EVENT_LISTEN_RESTART);
@@ -979,51 +1628,64 @@ static void release_tts_output_if_active(void)
     }
 }
 
+static void cleanup_websocket_client(
+    esp_websocket_client_handle_t client,
+    bool *events_registered,
+    esp_event_handler_t event_handler,
+    TickType_t close_timeout_ticks)
+{
+    if (client == NULL) {
+        return;
+    }
+
+    bool connected = esp_websocket_client_is_connected(client);
+    if (connected) {
+        (void)esp_websocket_client_close(client, close_timeout_ticks);
+    }
+
+    EventBits_t bits = xEventGroupWaitBits(
+        s_events,
+        XIAOZHI_EVENT_WS_FINISH,
+        pdFALSE,
+        pdFALSE,
+        connected ? pdMS_TO_TICKS(1000) : pdMS_TO_TICKS(100));
+    if ((bits & XIAOZHI_EVENT_WS_FINISH) == 0) {
+        (void)esp_websocket_client_destroy_on_exit(client);
+        return;
+    }
+
+    if (events_registered != NULL && *events_registered) {
+        (void)esp_websocket_unregister_events(client, WEBSOCKET_EVENT_ANY, event_handler);
+        *events_registered = false;
+    }
+    (void)esp_websocket_client_destroy(client);
+}
+
 static void websocket_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
 {
-    (void)handler_args;
     (void)base;
+    esp_websocket_client_handle_t client = (esp_websocket_client_handle_t)handler_args;
     esp_websocket_event_data_t *data = (esp_websocket_event_data_t *)event_data;
     switch (event_id) {
     case WEBSOCKET_EVENT_CONNECTED:
         ESP_LOGI(TAG, "websocket connected");
         set_state(XIAOZHI_CLIENT_STATE_CONNECTING);
         xEventGroupSetBits(s_events, XIAOZHI_EVENT_CONNECTED);
-        if (send_hello() != ESP_OK) {
+        if (send_hello_on_client(client) != ESP_OK) {
             set_error("hello send failed");
             xEventGroupSetBits(s_events, XIAOZHI_EVENT_ERROR);
         }
         break;
     case WEBSOCKET_EVENT_DATA:
         if (data->op_code == 0x2 && data->payload_offset == 0 && data->fin) {
-            int16_t pcm[XIAOZHI_OPUS_DECODE_MAX_FRAMES];
-            if (s_codec_mutex == NULL || xSemaphoreTake(s_codec_mutex, pdMS_TO_TICKS(200)) != pdTRUE) {
-                ESP_LOGW(TAG, "opus decode skipped: codec mutex busy");
+            esp_err_t start_err = start_tts_task();
+            if (start_err != ESP_OK) {
+                ESP_LOGW(TAG, "tts task start failed: %s", esp_err_to_name(start_err));
                 break;
             }
-            int decoded = opus_decode((OpusDecoder *)data->user_context, (const unsigned char *)data->data_ptr, data->data_len, pcm, XIAOZHI_OPUS_DECODE_MAX_FRAMES, 0);
-            xSemaphoreGive(s_codec_mutex);
-            if (decoded > 0 && (xEventGroupGetBits(s_events) & XIAOZHI_EVENT_SPEAKING)) {
-                if (!s_tts_output_active) {
-                    ornament_settings_t settings = {0};
-                    esp_err_t acquire_err = settings_load(&settings) == ESP_OK ?
-                        task_audio_output_acquire_with_volume(&settings) :
-                        task_audio_output_acquire();
-                    if (acquire_err == ESP_OK) {
-                        s_tts_output_active = true;
-                    } else {
-                        ESP_LOGW(TAG, "tts output acquire failed: %s", esp_err_to_name(acquire_err));
-                    }
-                }
-                if (s_tts_output_active) {
-                    esp_err_t err = task_audio_output_write_mono(pcm, (size_t)decoded, 1000);
-                    if (err == ESP_OK) {
-                        increment_downlink_frames();
-                    } else {
-                        ESP_LOGW(TAG, "tts write failed: %s", esp_err_to_name(err));
-                        release_tts_output_if_active();
-                    }
-                }
+            esp_err_t err = enqueue_tts_packet(data->data_ptr, data->data_len);
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG, "tts packet enqueue failed: %s", esp_err_to_name(err));
             }
         } else if (data->op_code == 0x1 || data->op_code == 0x0) {
             if (data->payload_offset == 0 && data->fin) {
@@ -1036,13 +1698,13 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
     case WEBSOCKET_EVENT_DISCONNECTED:
     case WEBSOCKET_EVENT_CLOSED:
         ESP_LOGI(TAG, "websocket disconnected");
-        release_tts_output_if_active();
+        request_tts_release(false);
         xEventGroupSetBits(s_events, XIAOZHI_EVENT_STOP);
         set_state(XIAOZHI_CLIENT_STATE_IDLE);
         break;
     case WEBSOCKET_EVENT_ERROR:
         ESP_LOGW(TAG, "websocket error type=%d status=%d", data->error_handle.error_type, data->error_handle.esp_ws_handshake_status_code);
-        release_tts_output_if_active();
+        request_tts_release(false);
         if (data->error_handle.esp_ws_handshake_status_code > 0) {
             char detail[48];
             snprintf(detail, sizeof(detail), "websocket error (%d)", data->error_handle.esp_ws_handshake_status_code);
@@ -1051,6 +1713,10 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
             set_error_with_http_status("websocket error", -1);
         }
         xEventGroupSetBits(s_events, XIAOZHI_EVENT_ERROR | XIAOZHI_EVENT_STOP);
+        break;
+    case WEBSOCKET_EVENT_FINISH:
+        ESP_LOGI(TAG, "websocket finished");
+        xEventGroupSetBits(s_events, XIAOZHI_EVENT_WS_FINISH);
         break;
     default:
         break;
@@ -1153,9 +1819,29 @@ static esp_err_t build_headers_for_values(
 
 static esp_err_t run_capture_loop(OpusEncoder *encoder, esp_websocket_client_handle_t client)
 {
-    const int frame_samples = (ORNAMENT_AUDIO_SAMPLE_RATE_HZ * CONFIG_ORNAMENT_XIAOZHI_FRAME_MS) / 1000;
-    int16_t *pcm = calloc((size_t)frame_samples, sizeof(int16_t));
-    unsigned char *opus = malloc(CONFIG_ORNAMENT_XIAOZHI_OPUS_MAX_BYTES);
+    char active_ws_url[ORNAMENT_XIAOZHI_WS_URL_MAX] = {0};
+    int frame_ms = CONFIG_ORNAMENT_XIAOZHI_FRAME_MS;
+    bool advertise_mcp = false;
+    bool official_backend = false;
+    load_effective_transport_config(
+        active_ws_url,
+        sizeof(active_ws_url),
+        &frame_ms,
+        &advertise_mcp,
+        &official_backend);
+    if (!is_supported_frame_ms(frame_ms)) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    const int frame_samples = (ORNAMENT_AUDIO_SAMPLE_RATE_HZ * frame_ms) / 1000;
+    int16_t *pcm = heap_caps_calloc((size_t)frame_samples, sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    unsigned char *opus = heap_caps_malloc(CONFIG_ORNAMENT_XIAOZHI_OPUS_MAX_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (pcm == NULL) {
+        pcm = heap_caps_calloc((size_t)frame_samples, sizeof(int16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+    if (opus == NULL) {
+        opus = heap_caps_malloc(CONFIG_ORNAMENT_XIAOZHI_OPUS_MAX_BYTES, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
     bool paused_for_tts = false;
     if (pcm == NULL || opus == NULL) {
         free(pcm);
@@ -1178,15 +1864,27 @@ static esp_err_t run_capture_loop(OpusEncoder *encoder, esp_websocket_client_han
         return err;
     }
 
-    ESP_LOGI(TAG, "capture loop start: stack_hwm=%lu bytes", (unsigned long)current_stack_high_water_bytes());
+    ESP_LOGI(
+        TAG,
+        "capture loop start: frame_ms=%d official=%d mcp=%d ws=%s stack_hwm=%lu bytes",
+        frame_ms,
+        official_backend,
+        advertise_mcp,
+        active_ws_url[0] != '\0' ? active_ws_url : "<unknown>",
+        (unsigned long)current_stack_high_water_bytes());
 
     while ((xEventGroupGetBits(s_events) & XIAOZHI_EVENT_STOP) == 0 &&
            client != NULL &&
            esp_websocket_client_is_connected(client)) {
         EventBits_t bits = xEventGroupGetBits(s_events);
+        if (music_player_is_active()) {
+            paused_for_tts = false;
+            vTaskDelay(pdMS_TO_TICKS(frame_ms));
+            continue;
+        }
         if (bits & XIAOZHI_EVENT_SPEAKING) {
             paused_for_tts = true;
-            vTaskDelay(pdMS_TO_TICKS(CONFIG_ORNAMENT_XIAOZHI_FRAME_MS));
+            vTaskDelay(pdMS_TO_TICKS(frame_ms));
             continue;
         }
         if ((bits & XIAOZHI_EVENT_LISTEN_RESTART) != 0 || paused_for_tts) {
@@ -1200,7 +1898,7 @@ static esp_err_t run_capture_loop(OpusEncoder *encoder, esp_websocket_client_han
             paused_for_tts = false;
         }
 
-        err = task_audio_input_read_mono(pcm, (size_t)frame_samples, CONFIG_ORNAMENT_XIAOZHI_FRAME_MS + 100);
+        err = task_audio_input_read_mono(pcm, (size_t)frame_samples, frame_ms + 100);
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "mic read failed: %s", esp_err_to_name(err));
             break;
@@ -1218,9 +1916,16 @@ static esp_err_t run_capture_loop(OpusEncoder *encoder, esp_websocket_client_han
             err = ESP_FAIL;
             break;
         }
-        int sent = esp_websocket_client_send_bin(client, (const char *)opus, opus_len, pdMS_TO_TICKS(1000));
+        int sent = esp_websocket_client_send_bin(client, (const char *)opus, opus_len, pdMS_TO_TICKS(3000));
         if (sent != opus_len) {
-            ESP_LOGW(TAG, "opus frame send failed: %d/%d", sent, opus_len);
+            ESP_LOGW(
+                TAG,
+                "opus frame send failed: %d/%d frame_ms=%d official=%d mcp=%d",
+                sent,
+                opus_len,
+                frame_ms,
+                official_backend,
+                advertise_mcp);
             err = ESP_FAIL;
             break;
         }
@@ -1258,7 +1963,7 @@ static void capture_task(void *arg)
         esp_err_to_name(err),
         (unsigned long)current_stack_high_water_bytes());
     if (ctx != NULL && ctx->encoder != NULL) {
-        opus_encoder_destroy(ctx->encoder);
+        free_opus_encoder(ctx->encoder);
         ctx->encoder = NULL;
     }
 
@@ -1279,7 +1984,10 @@ static esp_err_t start_capture_task(OpusEncoder *encoder, esp_websocket_client_h
         return ESP_ERR_INVALID_ARG;
     }
 
-    xiaozhi_capture_context_t *ctx = calloc(1, sizeof(*ctx));
+    xiaozhi_capture_context_t *ctx = heap_caps_calloc(1, sizeof(*ctx), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (ctx == NULL) {
+        ctx = heap_caps_calloc(1, sizeof(*ctx), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
     if (ctx == NULL) {
         return ESP_ERR_NO_MEM;
     }
@@ -1361,9 +2069,15 @@ static void session_task(void *arg)
         ESP_LOGI(TAG, "session task start: stack_bytes=%u", (unsigned int)s_session_task_stack_bytes);
         log_heap_status("session_start");
 
-        xiaozhi_session_context_t *ctx = calloc(1, sizeof(*ctx));
+        xiaozhi_session_context_t *ctx = heap_caps_calloc(1, sizeof(*ctx), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (ctx == NULL) {
+            ctx = heap_caps_calloc(1, sizeof(*ctx), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        }
         OpusEncoder *encoder = NULL;
-        OpusDecoder *decoder = NULL;
+        esp_websocket_client_handle_t ws_client = NULL;
+        bool ws_events_registered = false;
+        bool ws_client_attached = false;
+        bool ws_client_started = false;
         bool retry_requested = false;
 
         if (ctx == NULL) {
@@ -1375,6 +2089,10 @@ static void session_task(void *arg)
         if (err != ESP_OK) {
             set_error("settings load failed");
             goto cleanup_ctx;
+        }
+        if (s_mutex != NULL && xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            store_active_settings_locked(&ctx->settings);
+            xSemaphoreGive(s_mutex);
         }
         copy_settings_to_snapshot(&ctx->settings);
         if (settings_xiaozhi_ws_url_or_default(&ctx->settings)[0] == '\0') {
@@ -1435,15 +2153,10 @@ static void session_task(void *arg)
         }
 
         int opus_err = 0;
-        encoder = opus_encoder_create(XIAOZHI_OPUS_SAMPLE_RATE_HZ, XIAOZHI_OPUS_CHANNELS, OPUS_APPLICATION_VOIP, &opus_err);
+        encoder = alloc_opus_encoder(&opus_err);
         if (encoder == NULL || opus_err != OPUS_OK) {
             set_error("opus encoder failed");
             goto attempt_done;
-        }
-        decoder = opus_decoder_create(XIAOZHI_OPUS_SAMPLE_RATE_HZ, XIAOZHI_OPUS_CHANNELS, &opus_err);
-        if (decoder == NULL || opus_err != OPUS_OK) {
-            set_error("opus decoder failed");
-            goto cleanup_opus;
         }
         (void)opus_encoder_ctl(encoder, OPUS_SET_COMPLEXITY(CONFIG_ORNAMENT_XIAOZHI_OPUS_COMPLEXITY));
         (void)opus_encoder_ctl(encoder, OPUS_SET_SIGNAL(OPUS_SIGNAL_VOICE));
@@ -1482,7 +2195,6 @@ static void session_task(void *arg)
             .network_timeout_ms = CONFIG_ORNAMENT_XIAOZHI_CONNECT_TIMEOUT_MS,
             .disable_auto_reconnect = true,
             .crt_bundle_attach = esp_crt_bundle_attach,
-            .user_context = decoder,
         };
 
         set_state(XIAOZHI_CLIENT_STATE_CONNECTING);
@@ -1494,19 +2206,30 @@ static void session_task(void *arg)
                 XIAOZHI_EVENT_SPEAKING |
                 XIAOZHI_EVENT_ERROR |
                 XIAOZHI_EVENT_LISTEN_RESTART |
-                XIAOZHI_EVENT_CAPTURE_DONE);
-        s_client = esp_websocket_client_init(&cfg);
-        if (s_client == NULL) {
+                XIAOZHI_EVENT_CAPTURE_DONE |
+                XIAOZHI_EVENT_TTS_RELEASE |
+                XIAOZHI_EVENT_TTS_SUPPRESSED |
+                XIAOZHI_EVENT_WS_FINISH);
+        ws_client = esp_websocket_client_init(&cfg);
+        if (ws_client == NULL) {
             set_error("websocket init failed");
             goto cleanup_opus;
         }
-        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_websocket_register_events(s_client, WEBSOCKET_EVENT_ANY, websocket_event_handler, NULL));
+        err = attach_current_client(ws_client);
+        if (err != ESP_OK) {
+            set_error("websocket attach failed");
+            goto cleanup_ws;
+        }
+        ws_client_attached = true;
+        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_websocket_register_events(ws_client, WEBSOCKET_EVENT_ANY, websocket_event_handler, ws_client));
+        ws_events_registered = true;
 
-        err = esp_websocket_client_start(s_client);
+        err = esp_websocket_client_start(ws_client);
         if (err != ESP_OK) {
             set_error("websocket start failed");
             goto cleanup_ws;
         }
+        ws_client_started = true;
 
         EventBits_t bits = xEventGroupWaitBits(
             s_events,
@@ -1528,7 +2251,7 @@ static void session_task(void *arg)
             goto cleanup_ws;
         }
 
-        err = start_capture_task(encoder, s_client);
+        err = start_capture_task(encoder, ws_client);
         if (err != ESP_OK) {
             set_error("capture task create failed");
             goto cleanup_ws;
@@ -1542,9 +2265,10 @@ static void session_task(void *arg)
             pdFALSE,
             portMAX_DELAY);
         if ((session_bits & XIAOZHI_EVENT_CAPTURE_DONE) == 0 &&
-            s_client != NULL &&
-            esp_websocket_client_is_connected(s_client)) {
-            (void)esp_websocket_client_close(s_client, pdMS_TO_TICKS(1000));
+            (session_bits & XIAOZHI_EVENT_ERROR) == 0 &&
+            ws_client != NULL &&
+            esp_websocket_client_is_connected(ws_client)) {
+            (void)esp_websocket_client_close(ws_client, pdMS_TO_TICKS(1000));
         }
         err = wait_for_capture_task_done(pdMS_TO_TICKS(3000));
         if (err != ESP_OK) {
@@ -1555,21 +2279,30 @@ static void session_task(void *arg)
         }
 
 cleanup_ws:
-        release_tts_output_if_active();
-        if (s_client != NULL) {
-            if (esp_websocket_client_is_connected(s_client)) {
-                (void)esp_websocket_client_close(s_client, pdMS_TO_TICKS(1000));
+        request_tts_release(false);
+        if (ws_client != NULL) {
+            if (ws_client_attached) {
+                (void)detach_current_client();
+                ws_client_attached = false;
             }
-            (void)esp_websocket_unregister_events(s_client, WEBSOCKET_EVENT_ANY, websocket_event_handler);
-            (void)esp_websocket_client_destroy(s_client);
-            s_client = NULL;
+            if (ws_client_started) {
+                cleanup_websocket_client(
+                    ws_client,
+                    &ws_events_registered,
+                    websocket_event_handler,
+                    pdMS_TO_TICKS(1000));
+            } else {
+                if (ws_events_registered) {
+                    (void)esp_websocket_unregister_events(ws_client, WEBSOCKET_EVENT_ANY, websocket_event_handler);
+                    ws_events_registered = false;
+                }
+                (void)esp_websocket_client_destroy(ws_client);
+            }
+            ws_client = NULL;
         }
 cleanup_opus:
-        if (decoder != NULL) {
-            opus_decoder_destroy(decoder);
-        }
         if (encoder != NULL) {
-            opus_encoder_destroy(encoder);
+            free_opus_encoder(encoder);
         }
 cleanup_ctx:
         free(ctx);
@@ -1584,6 +2317,9 @@ attempt_done:
                 set_state_locked(XIAOZHI_CLIENT_STATE_IDLE);
             }
             s_snapshot.connected = false;
+            if (!retry_requested) {
+                store_active_settings_locked(NULL);
+            }
             xSemaphoreGive(s_mutex);
         }
 
@@ -1628,23 +2364,33 @@ esp_err_t xiaozhi_client_init(void)
                 copy_settings_to_snapshot(&settings);
             }
         }
-        return ESP_OK;
+        return xiaozhi_mcp_init();
     }
     s_mutex = xSemaphoreCreateMutex();
     if (s_mutex == NULL) {
         return ESP_ERR_NO_MEM;
     }
+    s_client_mutex = xSemaphoreCreateMutex();
+    if (s_client_mutex == NULL) {
+        vSemaphoreDelete(s_mutex);
+        s_mutex = NULL;
+        return ESP_ERR_NO_MEM;
+    }
     s_events = xEventGroupCreate();
     if (s_events == NULL) {
+        vSemaphoreDelete(s_client_mutex);
         vSemaphoreDelete(s_mutex);
+        s_client_mutex = NULL;
         s_mutex = NULL;
         return ESP_ERR_NO_MEM;
     }
     s_codec_mutex = xSemaphoreCreateMutex();
     if (s_codec_mutex == NULL) {
         vEventGroupDelete(s_events);
+        vSemaphoreDelete(s_client_mutex);
         vSemaphoreDelete(s_mutex);
         s_events = NULL;
+        s_client_mutex = NULL;
         s_mutex = NULL;
         return ESP_ERR_NO_MEM;
     }
@@ -1665,6 +2411,7 @@ esp_err_t xiaozhi_client_init(void)
             set_state(XIAOZHI_CLIENT_STATE_IDLE);
         }
     }
+    ESP_RETURN_ON_ERROR(xiaozhi_mcp_init(), TAG, "mcp init failed");
 
     ESP_LOGI(TAG, "Xiaozhi client ready enabled=%d mic_gpio=%d", CONFIG_ORNAMENT_XIAOZHI_ENABLED, CONFIG_ORNAMENT_XIAOZHI_MIC_PIN_DIN);
     return ESP_OK;
@@ -1921,15 +2668,22 @@ esp_err_t xiaozhi_client_stop_session(void)
         if (s_snapshot.configured) {
             set_state_locked(XIAOZHI_CLIENT_STATE_IDLE);
         }
+        store_active_settings_locked(NULL);
         xSemaphoreGive(s_mutex);
     }
     if (s_events == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
     xEventGroupSetBits(s_events, XIAOZHI_EVENT_STOP);
-    esp_websocket_client_handle_t client = s_client;
-    if (client != NULL && esp_websocket_client_is_connected(client)) {
-        (void)esp_websocket_client_close(client, pdMS_TO_TICKS(1000));
+    esp_websocket_client_handle_t client = NULL;
+    if (s_client_mutex != NULL && xSemaphoreTake(s_client_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        client = s_client;
+        xSemaphoreGive(s_client_mutex);
+    }
+    if (client != NULL) {
+        if (esp_websocket_client_is_connected(client)) {
+            (void)esp_websocket_client_close(client, pdMS_TO_TICKS(1000));
+        }
     }
     if (!had_runtime) {
         return ESP_OK;

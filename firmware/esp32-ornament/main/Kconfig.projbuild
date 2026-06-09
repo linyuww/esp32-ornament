@@ -402,6 +402,50 @@ config ORNAMENT_XIAOZHI_MIC_SLOT_RIGHT
         Enable when the I2S microphone is wired or strapped to transmit on the
         right channel. Left slot is used by default.
 
+config ORNAMENT_XIAOZHI_MCP_ENABLED
+    bool "Enable Xiaozhi MCP tool handling"
+    depends on ORNAMENT_XIAOZHI_ENABLED
+    default y
+    help
+        Advertise MCP capability in the Xiaozhi hello frame and handle
+        inbound JSON-RPC tool calls for local music playback.
+
+config ORNAMENT_MUSIC_SERVICE_BASE_URL
+    string "Music service base URL"
+    depends on ORNAMENT_XIAOZHI_MCP_ENABLED
+    default "http://110.42.59.54:2233"
+    help
+        Base URL for the device-side music metadata service. The firmware
+        requests /stream_pcm on this service to resolve a song into audio_url
+        and then streams audio directly from the returned URL.
+
+config ORNAMENT_MUSIC_AUTH_SECRET
+    string "Music service auth secret"
+    depends on ORNAMENT_XIAOZHI_MCP_ENABLED
+    default "your-esp32-secret-key-2024"
+    help
+        Shared secret used to build the dynamic authentication headers expected
+        by the reference music service. Leave unchanged only when the service
+        uses the same placeholder secret.
+
+config ORNAMENT_MUSIC_REQUEST_TIMEOUT_MS
+    int "Music HTTP request timeout in milliseconds"
+    depends on ORNAMENT_XIAOZHI_MCP_ENABLED
+    default 10000
+    range 1000 60000
+
+config ORNAMENT_MUSIC_STREAM_CHUNK_BYTES
+    int "Music stream read chunk bytes"
+    depends on ORNAMENT_XIAOZHI_MCP_ENABLED
+    default 2048
+    range 512 8192
+
+config ORNAMENT_MUSIC_MP3_INPUT_BUFFER_BYTES
+    int "Music MP3 decode buffer bytes"
+    depends on ORNAMENT_XIAOZHI_MCP_ENABLED
+    default 16384
+    range 4096 65536
+
 endmenu
 
 config ORNAMENT_STANDBY_CLOCK_MS

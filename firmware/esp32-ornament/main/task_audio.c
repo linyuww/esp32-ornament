@@ -2,6 +2,7 @@
 
 #include "driver/gpio.h"
 #include "driver/i2s_std.h"
+#include "esp_attr.h"
 #include "esp_check.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -55,6 +56,8 @@ static int s_play_volume_percent = CONFIG_ORNAMENT_AUDIO_VOLUME_PERCENT;
 static audio_route_t s_active_route;
 static int32_t s_mic_prev_input;
 static int32_t s_mic_prev_output;
+static DMA_ATTR int16_t s_stereo_buffer[TASK_DONE_AUDIO_CHUNK_FRAMES * 2];
+static DMA_ATTR int32_t s_mono_buffer[TASK_DONE_AUDIO_CHUNK_FRAMES];
 static i2s_std_gpio_config_t s_tx_gpio_active_cfg;
 static i2s_std_gpio_config_t s_tx_gpio_idle_cfg;
 static i2s_std_gpio_config_t s_rx_gpio_active_cfg;
@@ -122,8 +125,6 @@ static int16_t narrow_mic_sample(int32_t raw)
 
 static esp_err_t write_stereo_frames(const int16_t *mono_samples, size_t frame_count, uint32_t timeout_ms)
 {
-    int16_t stereo[TASK_DONE_AUDIO_CHUNK_FRAMES * 2];
-
     while (frame_count > 0) {
         size_t frames = frame_count;
         if (frames > TASK_DONE_AUDIO_CHUNK_FRAMES) {
@@ -132,13 +133,13 @@ static esp_err_t write_stereo_frames(const int16_t *mono_samples, size_t frame_c
 
         for (size_t i = 0; i < frames; i++) {
             int16_t sample = mono_samples == NULL ? 0 : apply_volume(mono_samples[i]);
-            stereo[i * 2] = sample;
-            stereo[i * 2 + 1] = sample;
+            s_stereo_buffer[i * 2] = sample;
+            s_stereo_buffer[i * 2 + 1] = sample;
         }
 
         size_t bytes_to_write = frames * 2 * sizeof(int16_t);
         size_t bytes_written = 0;
-        esp_err_t err = i2s_channel_write(s_tx_chan, stereo, bytes_to_write, &bytes_written, timeout_ms);
+        esp_err_t err = i2s_channel_write(s_tx_chan, s_stereo_buffer, bytes_to_write, &bytes_written, timeout_ms);
         if (err != ESP_OK) {
             return err;
         }
@@ -221,13 +222,6 @@ static esp_err_t switch_route_locked(audio_route_t target)
 
 static void play_task_done_audio(void)
 {
-    ornament_settings_t settings;
-    if (settings_load(&settings) == ESP_OK) {
-        refresh_output_volume_from_settings(&settings);
-    } else {
-        s_play_volume_percent = CONFIG_ORNAMENT_AUDIO_VOLUME_PERCENT;
-    }
-
     if (task_audio_output_acquire() != ESP_OK) {
         ESP_LOGW(TAG, "task done voice skipped: audio output busy");
         return;
@@ -348,7 +342,7 @@ static esp_err_t init_i2s(void)
         CONFIG_ORNAMENT_XIAOZHI_MIC_PIN_DIN,
         CONFIG_ORNAMENT_XIAOZHI_MIC_SLOT_RIGHT ? "right" : "left",
         ORNAMENT_AUDIO_SAMPLE_RATE_HZ,
-        CONFIG_ORNAMENT_AUDIO_VOLUME_PERCENT);
+        s_play_volume_percent);
     speaker_data_hold_low();
     return ESP_OK;
 }
@@ -357,6 +351,11 @@ esp_err_t task_audio_start(void)
 {
     if (s_play_queue != NULL) {
         return ESP_OK;
+    }
+
+    int saved_volume = CONFIG_ORNAMENT_AUDIO_VOLUME_PERCENT;
+    if (settings_load_audio_volume_percent(&saved_volume) == ESP_OK) {
+        s_play_volume_percent = saved_volume;
     }
 
     s_bus_mutex = xSemaphoreCreateMutex();
@@ -395,9 +394,29 @@ void task_audio_play_done(void)
     }
 }
 
+void task_audio_set_volume_percent(int volume_percent)
+{
+    if (volume_percent < 0 || volume_percent > 100) {
+        return;
+    }
+    s_play_volume_percent = volume_percent;
+}
+
 esp_err_t task_audio_output_acquire(void)
 {
-    return task_audio_output_acquire_with_volume(NULL);
+    if (s_bus_mutex == NULL || s_tx_chan == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (xSemaphoreTake(s_bus_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    esp_err_t err = switch_route_locked(AUDIO_ROUTE_TX);
+    if (err != ESP_OK) {
+        xSemaphoreGive(s_bus_mutex);
+        return err;
+    }
+    s_output_locked = true;
+    return ESP_OK;
 }
 
 esp_err_t task_audio_output_acquire_with_volume(const ornament_settings_t *settings)
@@ -485,7 +504,6 @@ esp_err_t task_audio_input_read_mono(int16_t *samples, size_t frame_count, uint3
         return err;
     }
 
-    int32_t mono[TASK_DONE_AUDIO_CHUNK_FRAMES];
     size_t copied = 0;
     while (copied < frame_count) {
         size_t frames = frame_count - copied;
@@ -495,7 +513,7 @@ esp_err_t task_audio_input_read_mono(int16_t *samples, size_t frame_count, uint3
 
         size_t bytes_to_read = frames * sizeof(int32_t);
         size_t bytes_read = 0;
-        err = i2s_channel_read(s_rx_chan, mono, bytes_to_read, &bytes_read, timeout_ms);
+        err = i2s_channel_read(s_rx_chan, s_mono_buffer, bytes_to_read, &bytes_read, timeout_ms);
         if (err != ESP_OK) {
             break;
         }
@@ -505,7 +523,7 @@ esp_err_t task_audio_input_read_mono(int16_t *samples, size_t frame_count, uint3
         }
 
         for (size_t i = 0; i < frames; i++) {
-            samples[copied + i] = narrow_mic_sample(mono[i]);
+            samples[copied + i] = narrow_mic_sample(s_mono_buffer[i]);
         }
         copied += frames;
     }
@@ -624,6 +642,11 @@ esp_err_t task_audio_start(void)
 
 void task_audio_play_done(void)
 {
+}
+
+void task_audio_set_volume_percent(int volume_percent)
+{
+    (void)volume_percent;
 }
 
 esp_err_t task_audio_output_acquire(void)

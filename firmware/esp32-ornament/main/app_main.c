@@ -73,7 +73,7 @@ static const char *TAG = "ornament";
 #define VOICE_STATUS_TEXT_MAX 40
 #define ORNAMENT_MIN_VALID_EPOCH 1577836800LL
 #define BRIDGE_SINGLE_RETRY_DELAY_MS 1000
-#define UI_RENDER_TASK_STACK 16384
+#define UI_RENDER_TASK_STACK 24576
 #define UI_RENDER_LOW_STACK_WARN_BYTES 2048
 
 #ifndef CONFIG_ORNAMENT_EXPIRED_QUOTA_RETRY_MS
@@ -656,7 +656,12 @@ static esp_err_t xiaozhi_start_session_if_needed(const char *reason)
         return ESP_OK;
     }
 
-    esp_err_t err = xiaozhi_client_start_session();
+    /*
+     * The websocket session can still be tearing down after a manual stop,
+     * while session_requested is already false. Reconnect handles both the
+     * clean idle case and the stale-runtime case.
+     */
+    esp_err_t err = xiaozhi_client_reconnect_session(true);
     if (err == ESP_ERR_INVALID_STATE) {
         if (xiaozhi_client_session_requested()) {
             err = ESP_OK;
@@ -888,6 +893,10 @@ static bool xiaozhi_session_page_active(
     case XIAOZHI_CLIENT_STATE_SPEAKING:
         return true;
     case XIAOZHI_CLIENT_STATE_LISTENING:
+        if (snapshot->session_requested || snapshot->connected) {
+            return true;
+        }
+        return focus_until_tick != 0 && now < focus_until_tick;
     case XIAOZHI_CLIENT_STATE_ERROR:
         return focus_until_tick != 0 && now < focus_until_tick;
     case XIAOZHI_CLIENT_STATE_DISABLED:
@@ -1147,6 +1156,14 @@ static void handle_voice_command(asrpro_voice_command_t command)
         voice_control_set_view(VOICE_VIEW_STATUS, now, "UNKNOWN", "UNKNOWN CMD");
         break;
     }
+}
+
+static bool voice_manual_xiaozhi_page_active(const voice_control_state_t *voice_state, TickType_t now)
+{
+    return voice_state != NULL &&
+           voice_state->manual_view &&
+           voice_state->view == VOICE_VIEW_XIAOZHI &&
+           voice_view_active(voice_state->view, voice_state->hold_until_tick, now);
 }
 
 static bool button_pressed_level(int level, bool active_low)
@@ -1543,7 +1560,9 @@ static void ui_render_task(void *arg)
         bool manual_page_active = have_voice_state &&
                                   voice_state.manual_view &&
                                   voice_view_active(voice_state.view, voice_state.hold_until_tick, now);
-        bool xiaozhi_page_visible = xiaozhi_page_active && !manual_page_active;
+        bool manual_xiaozhi_page = have_voice_state &&
+                                   voice_manual_xiaozhi_page_active(&voice_state, now);
+        bool xiaozhi_page_visible = manual_xiaozhi_page || (xiaozhi_page_active && !manual_page_active);
 
         bool standby_eligible = standby_timer_eligible(&state);
         if (standby_eligible) {
@@ -1645,7 +1664,7 @@ void app_main(void)
     shared_state.have_state = true;
 
     create_app_task(voice_command_task, "voice_cmd", 4096, 5);
-    create_app_task(xiaozhi_session_task, "xiaozhi_ctl", 6144, 5);
+    create_app_task(xiaozhi_session_task, "xiaozhi_ctl", 8192, 5);
     create_app_task(page_button_task, "page_button", 3072, 5);
     create_app_task(ai_button_task, "ai_button", 4096, 5);
     create_app_task(poll_task, "bridge_poll", 8192, 5);
