@@ -30,6 +30,10 @@ const TASK_EVENT_ACK_TIMEOUT: Duration = Duration::from_millis(750);
 const QUOTA_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const QUOTA_CACHE_TTL: Duration = QUOTA_REFRESH_INTERVAL;
 const DEFAULT_WEATHER_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
+const MUSIC_RESOLVE_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
+const MUSIC_RESOLVE_CACHE_MAX: usize = 32;
+const YAOHUD_RESOLVE_ATTEMPTS: usize = 3;
+const YAOHUD_RESOLVE_RETRY_DELAY: Duration = Duration::from_millis(300);
 const CAIYUN_DAILY_CALL_BUDGET: u32 = 10_000;
 const CAIYUN_NIGHT_END_HOUR: u32 = 6;
 const CAIYUN_NIGHT_SECONDS: u64 = 6 * 60 * 60;
@@ -74,6 +78,7 @@ struct BridgeState {
     weather_refreshing: bool,
     weather_last_attempt: Option<Instant>,
     active_recovery: Option<CachedActiveRecovery>,
+    music_resolves: HashMap<String, CachedMusicResolve>,
 }
 
 #[derive(Clone, Debug)]
@@ -338,7 +343,7 @@ struct MusicRequest {
     index: u32,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct ResolvedSong {
     source: &'static str,
     title: String,
@@ -347,6 +352,12 @@ struct ResolvedSong {
     picture: String,
     url: String,
     lyrics: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct CachedMusicResolve {
+    song: ResolvedSong,
+    fetched_at: Instant,
 }
 
 #[derive(Debug, Deserialize)]
@@ -529,9 +540,11 @@ fn handle_connection(
             write_json(&mut stream, 200, &response)
         }
         ("GET", "/v1/music/resolve") | ("GET", "/stream_pcm") => {
-            handle_music_resolve(&mut stream, peer, &request, &config)
+            handle_music_resolve(&mut stream, peer, &request, &state, &config)
         }
-        ("GET", "/v1/music/stream") => handle_music_stream(&mut stream, peer, &request, &config),
+        ("GET", "/v1/music/stream") => {
+            handle_music_stream(&mut stream, peer, &request, &state, &config)
+        }
         ("POST", "/hook/codex") | ("POST", "/event") => {
             if !post_allowed(peer, &request, &config) {
                 return write_json(
@@ -1698,6 +1711,7 @@ fn handle_music_resolve(
     stream: &mut TcpStream,
     peer: Option<SocketAddr>,
     request: &HttpRequest,
+    state: &SharedBridgeState,
     config: &BridgeConfig,
 ) -> io::Result<()> {
     if !music_get_allowed(peer) {
@@ -1715,25 +1729,11 @@ fn handle_music_resolve(
         }
     };
 
-    match resolve_song(config, &music_request) {
+    match resolve_song_cached(state, config, &music_request) {
         Ok(song) => write_json(
             stream,
             200,
-            &MusicResolveResponse {
-                ok: true,
-                song: music_request.song.clone(),
-                artist: music_request
-                    .artist
-                    .clone()
-                    .unwrap_or_else(|| song.artist.clone()),
-                index: music_request.index,
-                source: song.source,
-                title: song.title.clone(),
-                album: song.album.clone(),
-                picture: song.picture.clone(),
-                url: music_stream_url(config, &music_request),
-                lyrics: song.lyrics.clone(),
-            },
+            &music_resolve_response(config, &music_request, &song),
         ),
         Err(error) => {
             eprintln!("music resolve failed: {error}");
@@ -1750,6 +1750,7 @@ fn handle_music_stream(
     stream: &mut TcpStream,
     peer: Option<SocketAddr>,
     request: &HttpRequest,
+    state: &SharedBridgeState,
     config: &BridgeConfig,
 ) -> io::Result<()> {
     if !music_get_allowed(peer) {
@@ -1767,7 +1768,7 @@ fn handle_music_stream(
         }
     };
 
-    let resolved = match resolve_song(config, &music_request) {
+    let resolved = match resolve_song_cached(state, config, &music_request) {
         Ok(song) => song,
         Err(error) => {
             eprintln!("music stream resolve failed: {error}");
@@ -1812,6 +1813,96 @@ fn handle_music_stream(
     let _ = child.wait();
 
     copy_result
+}
+
+fn music_resolve_response(
+    config: &BridgeConfig,
+    request: &MusicRequest,
+    song: &ResolvedSong,
+) -> MusicResolveResponse {
+    MusicResolveResponse {
+        ok: true,
+        song: request.song.clone(),
+        artist: request
+            .artist
+            .clone()
+            .unwrap_or_else(|| song.artist.clone()),
+        index: request.index,
+        source: song.source,
+        title: song.title.clone(),
+        album: song.album.clone(),
+        picture: song.picture.clone(),
+        url: music_stream_url(config, request),
+        lyrics: song.lyrics.clone(),
+    }
+}
+
+fn resolve_song_cached(
+    state: &SharedBridgeState,
+    config: &BridgeConfig,
+    request: &MusicRequest,
+) -> io::Result<ResolvedSong> {
+    if let Some(song) = cached_music_resolve(state, request) {
+        return Ok(song);
+    }
+
+    let song = resolve_song(config, request)?;
+    cache_music_resolve(state, request, &song);
+    Ok(song)
+}
+
+fn cached_music_resolve(state: &SharedBridgeState, request: &MusicRequest) -> Option<ResolvedSong> {
+    let cache_key = music_request_cache_key(request);
+    let Ok(mut state) = state.lock() else {
+        return None;
+    };
+
+    prune_music_resolve_cache(&mut state);
+    state
+        .music_resolves
+        .get(&cache_key)
+        .map(|cached| cached.song.clone())
+}
+
+fn cache_music_resolve(state: &SharedBridgeState, request: &MusicRequest, song: &ResolvedSong) {
+    let cache_key = music_request_cache_key(request);
+    let Ok(mut state) = state.lock() else {
+        return;
+    };
+
+    prune_music_resolve_cache(&mut state);
+    if state.music_resolves.len() >= MUSIC_RESOLVE_CACHE_MAX {
+        if let Some(oldest_key) = state
+            .music_resolves
+            .iter()
+            .min_by_key(|(_, cached)| cached.fetched_at)
+            .map(|(key, _)| key.clone())
+        {
+            state.music_resolves.remove(&oldest_key);
+        }
+    }
+    state.music_resolves.insert(
+        cache_key,
+        CachedMusicResolve {
+            song: song.clone(),
+            fetched_at: Instant::now(),
+        },
+    );
+}
+
+fn prune_music_resolve_cache(state: &mut BridgeState) {
+    state
+        .music_resolves
+        .retain(|_, cached| cached.fetched_at.elapsed() <= MUSIC_RESOLVE_CACHE_TTL);
+}
+
+fn music_request_cache_key(request: &MusicRequest) -> String {
+    format!(
+        "{}\n{}\n{}",
+        request.song.trim(),
+        request.artist.as_deref().unwrap_or("").trim(),
+        request.index
+    )
 }
 
 fn parse_music_request(request: &HttpRequest) -> io::Result<MusicRequest> {
@@ -1944,7 +2035,7 @@ fn resolve_song_yaohud(config: &BridgeConfig, request: &MusicRequest) -> io::Res
         _ => request.song.clone(),
     };
     let url = format!(
-        "https://api.yaohud.cn/api/music/wy?key={}&msg={}&n={}&g=13",
+        "https://api.yaohud.cn/api/music/wy?key={}&msg={}&n={}",
         form_urlencode(key),
         form_urlencode(&query),
         request.index
@@ -1954,13 +2045,7 @@ fn resolve_song_yaohud(config: &BridgeConfig, request: &MusicRequest) -> io::Res
         .timeout(Duration::from_secs(15))
         .build()
         .map_err(io_other)?;
-    let response = client
-        .get(url)
-        .send()
-        .map_err(io_other)?
-        .error_for_status()
-        .map_err(io_other)?;
-    let body = response.text().map_err(io_other)?;
+    let body = fetch_yaohud_body(&client, &url)?;
     let parsed: YaohudMusicResponse = serde_json::from_str(&body)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
 
@@ -1976,8 +2061,8 @@ fn resolve_song_yaohud(config: &BridgeConfig, request: &MusicRequest) -> io::Res
     }
 
     let url = data
-        .musicurl
-        .or(data.url)
+        .url
+        .or(data.musicurl)
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| {
             io::Error::new(
@@ -2022,6 +2107,30 @@ fn resolve_song_yaohud(config: &BridgeConfig, request: &MusicRequest) -> io::Res
         url,
         lyrics,
     })
+}
+
+fn fetch_yaohud_body(client: &reqwest::blocking::Client, url: &str) -> io::Result<String> {
+    let mut last_error = None;
+    for attempt in 1..=YAOHUD_RESOLVE_ATTEMPTS {
+        match client
+            .get(url)
+            .send()
+            .and_then(|response| response.error_for_status())
+            .and_then(|response| response.text())
+        {
+            Ok(body) => return Ok(body),
+            Err(error) => {
+                last_error = Some(error);
+                if attempt < YAOHUD_RESOLVE_ATTEMPTS {
+                    std::thread::sleep(YAOHUD_RESOLVE_RETRY_DELAY);
+                }
+            }
+        }
+    }
+
+    Err(last_error
+        .map(io_other)
+        .unwrap_or_else(|| io::Error::other("Yaohud resolve failed")))
 }
 
 fn resolve_song_netease(request: &MusicRequest) -> io::Result<ResolvedSong> {
@@ -4019,6 +4128,37 @@ mod tests {
             music_stream_url(&config, &request),
             "http://192.168.1.102:8787/v1/music/stream?song=%E5%A5%BD%E8%BF%90%E6%9D%A5&artist=%E7%A5%96%E6%B5%B7&index=2"
         );
+    }
+
+    #[test]
+    fn caches_music_resolve_for_matching_request_only() {
+        let state = Arc::new(Mutex::new(BridgeState::default()));
+        let request = MusicRequest {
+            song: "好运来".to_string(),
+            artist: None,
+            index: 1,
+        };
+        let song = ResolvedSong {
+            source: "yaohud",
+            title: "好运来".to_string(),
+            artist: "祖海".to_string(),
+            album: "好运来".to_string(),
+            picture: String::new(),
+            url: "https://music.163.com/song/media/outer/url?id=333750.mp3".to_string(),
+            lyrics: None,
+        };
+
+        cache_music_resolve(&state, &request, &song);
+
+        assert_eq!(cached_music_resolve(&state, &request), Some(song));
+        assert!(cached_music_resolve(
+            &state,
+            &MusicRequest {
+                index: 2,
+                ..request
+            }
+        )
+        .is_none());
     }
 
     #[test]
