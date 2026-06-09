@@ -8,6 +8,7 @@
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
+#include "music_player.h"
 #include "settings.h"
 #include "task_audio.h"
 #include "weather_client.h"
@@ -305,7 +306,13 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     char xiaozhi_last_error[XIAOZHI_STATUS_TEXT_MAX * 2];
     char xiaozhi_last_stt[XIAOZHI_STATUS_TEXT_MAX * 2];
     char xiaozhi_last_tts[XIAOZHI_STATUS_TEXT_MAX * 2];
+    char music_song_name[ORNAMENT_TEXT_MAX * 2];
+    char music_artist_name[ORNAMENT_TEXT_MAX * 2];
+    char music_title[ORNAMENT_TEXT_MAX * 2];
+    char music_album[ORNAMENT_TEXT_MAX * 2];
+    char music_last_error[ORNAMENT_TEXT_MAX * 2];
     xiaozhi_client_snapshot_t xiaozhi = {0};
+    music_player_snapshot_t music = {0};
     web_console_bridge_debug_t bridge_diag = {0};
 
     ornament_state_init(&state);
@@ -337,12 +344,18 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     json_escape(xiaozhi.last_error, xiaozhi_last_error, sizeof(xiaozhi_last_error));
     json_escape(xiaozhi.last_stt, xiaozhi_last_stt, sizeof(xiaozhi_last_stt));
     json_escape(xiaozhi.last_tts, xiaozhi_last_tts, sizeof(xiaozhi_last_tts));
+    music_player_status_snapshot(&music);
+    json_escape(music.song_name, music_song_name, sizeof(music_song_name));
+    json_escape(music.artist_name, music_artist_name, sizeof(music_artist_name));
+    json_escape(music.title, music_title, sizeof(music_title));
+    json_escape(music.album, music_album, sizeof(music_album));
+    json_escape(music.last_error, music_last_error, sizeof(music_last_error));
     if (state_mutex != NULL && xSemaphoreTake(state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         bridge_diag = bridge_debug;
         xSemaphoreGive(state_mutex);
     }
 
-    const size_t json_size = 8192;
+    const size_t json_size = 10240;
     char *json = calloc(1, json_size);
     if (json == NULL) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
@@ -448,6 +461,20 @@ static esp_err_t status_get_handler(httpd_req_t *req)
         xiaozhi_last_tts,
         (unsigned int)xiaozhi.uplink_frames,
         (unsigned int)xiaozhi.downlink_frames);
+    appendf(
+        json,
+        json_size,
+        &used,
+        "\"music\":{\"active\":%s,\"stop_requested\":%s,\"state\":\"%s\",\"song\":\"%s\",\"artist\":\"%s\",\"title\":\"%s\",\"album\":\"%s\",\"index\":%u,\"last_error\":\"%s\"},",
+        music.active ? "true" : "false",
+        music.stop_requested ? "true" : "false",
+        music_player_state_name(music.state),
+        music_song_name,
+        music_artist_name,
+        music_title,
+        music_album,
+        (unsigned int)music.index,
+        music_last_error);
     appendf(
         json,
         json_size,
