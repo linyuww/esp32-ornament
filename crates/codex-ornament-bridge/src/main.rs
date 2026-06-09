@@ -93,6 +93,7 @@ struct BridgeConfig {
     bind: String,
     token: Option<String>,
     yaohud_key: Option<String>,
+    music_public_base_url: Option<String>,
     tracked_session_id: Option<String>,
     codex_home: PathBuf,
     weather_latitude: f64,
@@ -339,6 +340,7 @@ struct MusicRequest {
 
 #[derive(Clone, Debug)]
 struct ResolvedSong {
+    source: &'static str,
     title: String,
     artist: String,
     album: String,
@@ -377,6 +379,36 @@ struct YaohudMusicResponse {
     lyrics: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct NeteaseSearchResponse {
+    result: Option<NeteaseSearchResult>,
+    code: i32,
+}
+
+#[derive(Debug, Deserialize)]
+struct NeteaseSearchResult {
+    songs: Option<Vec<NeteaseSong>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NeteaseSong {
+    id: u64,
+    name: String,
+    #[serde(default)]
+    artists: Vec<NeteaseArtist>,
+    album: Option<NeteaseAlbum>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NeteaseArtist {
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct NeteaseAlbum {
+    name: String,
+}
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("{error}");
@@ -391,6 +423,7 @@ fn run() -> io::Result<()> {
             .ok()
             .filter(|value| !value.trim().is_empty()),
         yaohud_key: env_text("CODEX_ORNAMENT_YAOHUD_KEY"),
+        music_public_base_url: env_text("CODEX_ORNAMENT_MUSIC_PUBLIC_BASE_URL"),
         tracked_session_id: env_text("CODEX_ORNAMENT_SESSION_ID"),
         codex_home: codex_home(),
         weather_latitude: env_f64("CODEX_ORNAMENT_WEATHER_LAT").unwrap_or(DEFAULT_WEATHER_LATITUDE),
@@ -473,7 +506,9 @@ fn handle_connection(
             };
             write_json(&mut stream, 200, &response)
         }
-        ("GET", "/v1/music/resolve") => handle_music_resolve(&mut stream, peer, &request, &config),
+        ("GET", "/v1/music/resolve") | ("GET", "/stream_pcm") => {
+            handle_music_resolve(&mut stream, peer, &request, &config)
+        }
         ("GET", "/v1/music/stream") => handle_music_stream(&mut stream, peer, &request, &config),
         ("POST", "/hook/codex") | ("POST", "/event") => {
             if !post_allowed(peer, &request, &config) {
@@ -1618,21 +1653,16 @@ fn post_allowed(peer: Option<SocketAddr>, request: &HttpRequest, config: &Bridge
         .unwrap_or(false)
 }
 
-fn music_get_allowed(peer: Option<SocketAddr>, request: &HttpRequest, config: &BridgeConfig) -> bool {
-    if peer.map(|addr| is_loopback(addr.ip())).unwrap_or(false) {
-        return true;
-    }
-
-    let Some(expected) = config.token.as_deref() else {
-        return true;
-    };
-
-    request
-        .headers
-        .get("authorization")
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .map(|actual| actual.trim() == expected)
+fn music_get_allowed(peer: Option<SocketAddr>) -> bool {
+    peer.map(|addr| private_get_allowed(addr.ip()))
         .unwrap_or(false)
+}
+
+fn private_get_allowed(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => ip.is_loopback() || ip.is_private(),
+        IpAddr::V6(ip) => ip.is_loopback() || ip.is_unique_local(),
+    }
 }
 
 fn is_loopback(ip: IpAddr) -> bool {
@@ -1648,14 +1678,18 @@ fn handle_music_resolve(
     request: &HttpRequest,
     config: &BridgeConfig,
 ) -> io::Result<()> {
-    if !music_get_allowed(peer, request, config) {
+    if !music_get_allowed(peer) {
         return write_json(stream, 403, &json!({"ok": false, "error": "forbidden"}));
     }
 
     let music_request = match parse_music_request(request) {
         Ok(request) => request,
         Err(error) => {
-            return write_json(stream, 400, &json!({"ok": false, "error": error.to_string()}));
+            return write_json(
+                stream,
+                400,
+                &json!({"ok": false, "error": error.to_string()}),
+            );
         }
     };
 
@@ -1665,20 +1699,27 @@ fn handle_music_resolve(
             200,
             &MusicResolveResponse {
                 ok: true,
-                song: music_request.song,
-                artist: music_request.artist.unwrap_or_else(|| song.artist.clone()),
+                song: music_request.song.clone(),
+                artist: music_request
+                    .artist
+                    .clone()
+                    .unwrap_or_else(|| song.artist.clone()),
                 index: music_request.index,
-                source: "yaohud",
-                title: song.title,
-                album: song.album,
-                picture: song.picture,
-                url: song.url,
-                lyrics: song.lyrics,
+                source: song.source,
+                title: song.title.clone(),
+                album: song.album.clone(),
+                picture: song.picture.clone(),
+                url: music_stream_url(config, &music_request),
+                lyrics: song.lyrics.clone(),
             },
         ),
         Err(error) => {
             eprintln!("music resolve failed: {error}");
-            write_json(stream, map_music_status(&error), &json!({"ok": false, "error": error.to_string()}))
+            write_json(
+                stream,
+                map_music_status(&error),
+                &json!({"ok": false, "error": error.to_string()}),
+            )
         }
     }
 }
@@ -1689,14 +1730,18 @@ fn handle_music_stream(
     request: &HttpRequest,
     config: &BridgeConfig,
 ) -> io::Result<()> {
-    if !music_get_allowed(peer, request, config) {
+    if !music_get_allowed(peer) {
         return write_json(stream, 403, &json!({"ok": false, "error": "forbidden"}));
     }
 
     let music_request = match parse_music_request(request) {
         Ok(request) => request,
         Err(error) => {
-            return write_json(stream, 400, &json!({"ok": false, "error": error.to_string()}));
+            return write_json(
+                stream,
+                400,
+                &json!({"ok": false, "error": error.to_string()}),
+            );
         }
     };
 
@@ -1704,7 +1749,11 @@ fn handle_music_stream(
         Ok(song) => song,
         Err(error) => {
             eprintln!("music stream resolve failed: {error}");
-            return write_json(stream, map_music_status(&error), &json!({"ok": false, "error": error.to_string()}));
+            return write_json(
+                stream,
+                map_music_status(&error),
+                &json!({"ok": false, "error": error.to_string()}),
+            );
         }
     };
 
@@ -1712,14 +1761,27 @@ fn handle_music_stream(
         Ok(child) => child,
         Err(error) => {
             eprintln!("music ffmpeg spawn failed: {error}");
-            return write_json(stream, 500, &json!({"ok": false, "error": error.to_string()}));
+            return write_json(
+                stream,
+                500,
+                &json!({"ok": false, "error": error.to_string()}),
+            );
         }
     };
 
     let headers = [
-        ("X-Ornament-Music-Title", sanitize_header_value(&resolved.title)),
-        ("X-Ornament-Music-Artist", sanitize_header_value(&resolved.artist)),
-        ("X-Ornament-Music-Album", sanitize_header_value(&resolved.album)),
+        (
+            "X-Ornament-Music-Title",
+            sanitize_header_value(&resolved.title),
+        ),
+        (
+            "X-Ornament-Music-Artist",
+            sanitize_header_value(&resolved.artist),
+        ),
+        (
+            "X-Ornament-Music-Album",
+            sanitize_header_value(&resolved.album),
+        ),
     ];
     write_streaming_response(stream, 200, "audio/L16; rate=16000; channels=1", &headers)?;
 
@@ -1742,15 +1804,60 @@ fn parse_music_request(request: &HttpRequest) -> io::Result<MusicRequest> {
         .get("song")
         .cloned()
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing song query parameter"))?;
-    let artist = query.get("artist").cloned().filter(|value| !value.is_empty());
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "missing song query parameter")
+        })?;
+    let artist = query
+        .get("artist")
+        .cloned()
+        .filter(|value| !value.is_empty());
     let index = query
         .get("index")
         .and_then(|value| value.parse::<u32>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(1);
 
-    Ok(MusicRequest { song, artist, index })
+    Ok(MusicRequest {
+        song,
+        artist,
+        index,
+    })
+}
+
+fn music_stream_url(config: &BridgeConfig, request: &MusicRequest) -> String {
+    let base = config
+        .music_public_base_url
+        .clone()
+        .unwrap_or_else(|| discover_music_public_base_url(config));
+    let mut url = format!("{}/v1/music/stream?song=", base.trim_end_matches('/'));
+    url.push_str(&form_urlencode(&request.song));
+    if let Some(artist) = request.artist.as_deref().filter(|value| !value.is_empty()) {
+        url.push_str("&artist=");
+        url.push_str(&form_urlencode(artist));
+    }
+    url.push_str("&index=");
+    url.push_str(&request.index.to_string());
+    url
+}
+
+fn discover_music_public_base_url(config: &BridgeConfig) -> String {
+    let port = bind_port(&config.bind).unwrap_or(8787);
+    let host = configured_lan_ip()
+        .or_else(local_lan_ip)
+        .unwrap_or_else(|| {
+            bind_host_for_url(&config.bind).unwrap_or_else(|| "127.0.0.1".to_string())
+        });
+    format!("http://{host}:{port}")
+}
+
+fn bind_host_for_url(bind: &str) -> Option<String> {
+    let host = bind.rsplit_once(':').map(|(host, _)| host).unwrap_or(bind);
+    let host = host.trim_matches(['[', ']']);
+    if host.is_empty() || host == "0.0.0.0" || host == "::" {
+        None
+    } else {
+        Some(host.to_string())
+    }
 }
 
 fn parse_query_params(query: &str) -> HashMap<String, String> {
@@ -1776,7 +1883,10 @@ fn percent_decode(value: &str) -> String {
                 index += 1;
             }
             b'%' if index + 2 < bytes.len() => {
-                if let (Some(high), Some(low)) = (hex_digit_value(bytes[index + 1]), hex_digit_value(bytes[index + 2])) {
+                if let (Some(high), Some(low)) = (
+                    hex_digit_value(bytes[index + 1]),
+                    hex_digit_value(bytes[index + 2]),
+                ) {
                     decoded.push(((high << 4) | low) as u8);
                     index += 3;
                 } else {
@@ -1794,12 +1904,23 @@ fn percent_decode(value: &str) -> String {
 }
 
 fn resolve_song(config: &BridgeConfig, request: &MusicRequest) -> io::Result<ResolvedSong> {
-    let key = config.yaohud_key.as_deref().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "CODEX_ORNAMENT_YAOHUD_KEY is required for local music playback",
-        )
-    })?;
+    if config.yaohud_key.is_some() {
+        match resolve_song_yaohud(config, request) {
+            Ok(song) => return Ok(song),
+            Err(error) => {
+                eprintln!("Yaohud music resolve failed, trying NetEase fallback: {error}")
+            }
+        }
+    }
+
+    resolve_song_netease(request)
+}
+
+fn resolve_song_yaohud(config: &BridgeConfig, request: &MusicRequest) -> io::Result<ResolvedSong> {
+    let key = config
+        .yaohud_key
+        .as_deref()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing Yaohud key"))?;
 
     let query = match request.artist.as_deref() {
         Some(artist) if !artist.is_empty() => format!("{} {}", request.song, artist),
@@ -1823,13 +1944,15 @@ fn resolve_song(config: &BridgeConfig, request: &MusicRequest) -> io::Result<Res
         .error_for_status()
         .map_err(io_other)?;
     let body = response.text().map_err(io_other)?;
-    let parsed: YaohudMusicResponse =
-        serde_json::from_str(&body).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let parsed: YaohudMusicResponse = serde_json::from_str(&body)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
 
     if parsed.code.unwrap_or(200) != 200 {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            parsed.msg.unwrap_or_else(|| "Yaohud resolve failed".to_string()),
+            parsed
+                .msg
+                .unwrap_or_else(|| "Yaohud resolve failed".to_string()),
         ));
     }
 
@@ -1837,7 +1960,12 @@ fn resolve_song(config: &BridgeConfig, request: &MusicRequest) -> io::Result<Res
         .musicurl
         .or(parsed.url)
         .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Yaohud response missing playable url"))?;
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Yaohud response missing playable url",
+            )
+        })?;
 
     let title = first_nonempty(&[
         parsed.title.as_deref(),
@@ -1855,12 +1983,16 @@ fn resolve_song(config: &BridgeConfig, request: &MusicRequest) -> io::Result<Res
     .to_string();
     let album = parsed.album.unwrap_or_default();
     let picture = parsed.picture.or(parsed.pic).unwrap_or_default();
-    let lyrics = parsed
-        .lyrics
-        .or(parsed.lrc)
-        .and_then(|value| if value.trim().is_empty() { None } else { Some(value) });
+    let lyrics = parsed.lyrics.or(parsed.lrc).and_then(|value| {
+        if value.trim().is_empty() {
+            None
+        } else {
+            Some(value)
+        }
+    });
 
     Ok(ResolvedSong {
+        source: "yaohud",
         title,
         artist,
         album,
@@ -1870,8 +2002,83 @@ fn resolve_song(config: &BridgeConfig, request: &MusicRequest) -> io::Result<Res
     })
 }
 
+fn resolve_song_netease(request: &MusicRequest) -> io::Result<ResolvedSong> {
+    let query = match request.artist.as_deref() {
+        Some(artist) if !artist.is_empty() => format!("{} {}", request.song, artist),
+        _ => request.song.clone(),
+    };
+    let limit = request.index.max(1).min(10);
+    let url = format!(
+        "https://music.163.com/api/search/get/web?csrf_token=&type=1&s={}&limit={limit}&offset=0",
+        form_urlencode(&query)
+    );
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(io_other)?;
+    let response = client
+        .get(url)
+        .header("User-Agent", "Mozilla/5.0")
+        .header("Referer", "https://music.163.com/")
+        .send()
+        .map_err(io_other)?
+        .error_for_status()
+        .map_err(io_other)?;
+    let body = response.text().map_err(io_other)?;
+    let parsed: NeteaseSearchResponse = serde_json::from_str(&body)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+
+    if parsed.code != 200 {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("NetEase search failed with code {}", parsed.code),
+        ));
+    }
+
+    let songs = parsed
+        .result
+        .and_then(|result| result.songs)
+        .filter(|songs| !songs.is_empty())
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "NetEase search returned no songs")
+        })?;
+    let index = (request.index.saturating_sub(1) as usize).min(songs.len() - 1);
+    let song = &songs[index];
+    let artist = song
+        .artists
+        .iter()
+        .map(|artist| artist.name.as_str())
+        .filter(|name| !name.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("/");
+    let album = song
+        .album
+        .as_ref()
+        .map(|album| album.name.clone())
+        .unwrap_or_default();
+    let url = format!(
+        "https://music.163.com/song/media/outer/url?id={}.mp3",
+        song.id
+    );
+
+    Ok(ResolvedSong {
+        source: "netease",
+        title: song.name.clone(),
+        artist,
+        album,
+        picture: String::new(),
+        url,
+        lyrics: None,
+    })
+}
+
 fn first_nonempty<'a>(values: &[Option<&'a str>]) -> Option<&'a str> {
-    values.iter().copied().flatten().find(|value| !value.trim().is_empty())
+    values
+        .iter()
+        .copied()
+        .flatten()
+        .find(|value| !value.trim().is_empty())
 }
 
 fn form_urlencode(value: &str) -> Cow<'_, str> {
@@ -1879,7 +2086,9 @@ fn form_urlencode(value: &str) -> Cow<'_, str> {
     let mut changed = false;
     for byte in value.bytes() {
         match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => encoded.push(byte as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char)
+            }
             b' ' => {
                 encoded.push('+');
                 changed = true;
@@ -1900,7 +2109,25 @@ fn form_urlencode(value: &str) -> Cow<'_, str> {
 
 fn spawn_ffmpeg_pcm_stream(url: &str) -> io::Result<Child> {
     Command::new("ffmpeg")
-        .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-i", url, "-f", "s16le", "-ac", "1", "-ar", "16000", "pipe:1"])
+        .args([
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-user_agent",
+            "Mozilla/5.0",
+            "-headers",
+            "Referer: https://music.163.com/\r\n",
+            "-i",
+            url,
+            "-f",
+            "s16le",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "pipe:1",
+        ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -3617,6 +3844,8 @@ mod tests {
         BridgeConfig {
             bind: "127.0.0.1:8787".to_string(),
             token: token.map(str::to_string),
+            yaohud_key: None,
+            music_public_base_url: None,
             tracked_session_id: None,
             codex_home: PathBuf::from(".codex-test"),
             weather_latitude: DEFAULT_WEATHER_LATITUDE,
@@ -3633,6 +3862,8 @@ mod tests {
         BridgeConfig {
             bind: "127.0.0.1:8787".to_string(),
             token: None,
+            yaohud_key: None,
+            music_public_base_url: None,
             tracked_session_id: Some(session_id.to_string()),
             codex_home: codex_home.into(),
             weather_latitude: DEFAULT_WEATHER_LATITUDE,
@@ -3750,6 +3981,39 @@ mod tests {
             Some(WeatherProvider::OpenMeteo)
         );
         assert_eq!(parse_weather_provider("bad-provider"), None);
+    }
+
+    #[test]
+    fn builds_music_stream_url_from_public_base() {
+        let mut config = test_config(None);
+        config.music_public_base_url = Some("http://192.168.1.102:8787/".to_string());
+        let request = MusicRequest {
+            song: "好运来".to_string(),
+            artist: Some("祖海".to_string()),
+            index: 2,
+        };
+
+        assert_eq!(
+            music_stream_url(&config, &request),
+            "http://192.168.1.102:8787/v1/music/stream?song=%E5%A5%BD%E8%BF%90%E6%9D%A5&artist=%E7%A5%96%E6%B5%B7&index=2"
+        );
+    }
+
+    #[test]
+    fn netease_outer_url_points_to_mp3_proxy() {
+        let request = MusicRequest {
+            song: "好运来".to_string(),
+            artist: None,
+            index: 1,
+        };
+        let song = resolve_song_netease(&request).unwrap();
+
+        assert_eq!(song.source, "netease");
+        assert!(!song.title.is_empty());
+        assert!(song
+            .url
+            .starts_with("https://music.163.com/song/media/outer/url?id="));
+        assert!(song.url.ends_with(".mp3"));
     }
 
     #[test]

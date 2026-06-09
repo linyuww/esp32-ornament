@@ -12,20 +12,12 @@
 #define CONFIG_ORNAMENT_XIAOZHI_TOKEN ""
 #endif
 
-#ifndef CONFIG_ORNAMENT_MUSIC_SERVICE_BASE_URL
-#define CONFIG_ORNAMENT_MUSIC_SERVICE_BASE_URL ""
-#endif
-
-#ifndef CONFIG_ORNAMENT_MUSIC_AUTH_SECRET
-#define CONFIG_ORNAMENT_MUSIC_AUTH_SECRET ""
-#endif
-
 static const char *NVS_NAMESPACE = "ornament";
 static const char *KEY_SSID = "ssid";
 static const char *KEY_PASSWORD = "password";
 static const char *KEY_BRIDGE_URL = "bridge_url";
-static const char *KEY_MUSIC_SERVICE_BASE_URL = "music_base";
-static const char *KEY_MUSIC_AUTH_SECRET = "music_secret";
+static const char *KEY_LEGACY_MUSIC_SERVICE_BASE_URL = "music_base";
+static const char *KEY_LEGACY_MUSIC_AUTH_SECRET = "music_secret";
 static const char *KEY_AUDIO_VOLUME = "audio_volume";
 static const char *KEY_XIAOZHI_WS_URL = "xz_ws_url";
 static const char *KEY_XIAOZHI_TOKEN = "xz_token";
@@ -42,8 +34,6 @@ static void load_default_settings(ornament_settings_t *settings)
     strlcpy(settings->ssid, CONFIG_ORNAMENT_WIFI_SSID, sizeof(settings->ssid));
     strlcpy(settings->password, CONFIG_ORNAMENT_WIFI_PASSWORD, sizeof(settings->password));
     strlcpy(settings->bridge_url, CONFIG_ORNAMENT_BRIDGE_URL, sizeof(settings->bridge_url));
-    strlcpy(settings->music_service_base_url, CONFIG_ORNAMENT_MUSIC_SERVICE_BASE_URL, sizeof(settings->music_service_base_url));
-    strlcpy(settings->music_auth_secret, CONFIG_ORNAMENT_MUSIC_AUTH_SECRET, sizeof(settings->music_auth_secret));
     strlcpy(settings->xiaozhi_ws_url, CONFIG_ORNAMENT_XIAOZHI_WS_URL, sizeof(settings->xiaozhi_ws_url));
     strlcpy(settings->xiaozhi_token, CONFIG_ORNAMENT_XIAOZHI_TOKEN, sizeof(settings->xiaozhi_token));
     strlcpy(settings->weather_label, CONFIG_ORNAMENT_WEATHER_LABEL, sizeof(settings->weather_label));
@@ -53,8 +43,6 @@ static void load_default_settings(ornament_settings_t *settings)
     settings->audio_volume_percent = CONFIG_ORNAMENT_AUDIO_VOLUME_PERCENT;
     settings->has_wifi = settings->ssid[0] != '\0';
     settings->has_bridge_url = settings->bridge_url[0] != '\0';
-    settings->has_music_service_base_url = settings->music_service_base_url[0] != '\0';
-    settings->has_music_auth_secret = settings->music_auth_secret[0] != '\0';
     settings->has_xiaozhi_ws_url = settings->xiaozhi_ws_url[0] != '\0';
     settings->has_xiaozhi_token = settings->xiaozhi_token[0] != '\0';
     settings->has_caiyun_token = false;
@@ -93,8 +81,6 @@ esp_err_t settings_load(ornament_settings_t *settings)
     char ssid[sizeof(settings->ssid)] = {0};
     char password[sizeof(settings->password)] = {0};
     char bridge_url[sizeof(settings->bridge_url)] = {0};
-    char music_service_base_url[sizeof(settings->music_service_base_url)] = {0};
-    char music_auth_secret[sizeof(settings->music_auth_secret)] = {0};
     char xiaozhi_ws_url[sizeof(settings->xiaozhi_ws_url)] = {0};
     char xiaozhi_token[sizeof(settings->xiaozhi_token)] = {0};
     char weather_label[sizeof(settings->weather_label)] = {0};
@@ -106,8 +92,6 @@ esp_err_t settings_load(ornament_settings_t *settings)
     read_nvs_string(handle, KEY_SSID, ssid, sizeof(ssid));
     read_nvs_string(handle, KEY_PASSWORD, password, sizeof(password));
     read_nvs_string(handle, KEY_BRIDGE_URL, bridge_url, sizeof(bridge_url));
-    read_nvs_string(handle, KEY_MUSIC_SERVICE_BASE_URL, music_service_base_url, sizeof(music_service_base_url));
-    read_nvs_string(handle, KEY_MUSIC_AUTH_SECRET, music_auth_secret, sizeof(music_auth_secret));
     read_nvs_string(handle, KEY_XIAOZHI_WS_URL, xiaozhi_ws_url, sizeof(xiaozhi_ws_url));
     read_nvs_string(handle, KEY_XIAOZHI_TOKEN, xiaozhi_token, sizeof(xiaozhi_token));
     read_nvs_string(handle, KEY_WEATHER_LABEL, weather_label, sizeof(weather_label));
@@ -126,14 +110,6 @@ esp_err_t settings_load(ornament_settings_t *settings)
     if (bridge_url[0] != '\0') {
         strlcpy(settings->bridge_url, bridge_url, sizeof(settings->bridge_url));
         settings->has_bridge_url = true;
-    }
-    if (music_service_base_url[0] != '\0') {
-        strlcpy(settings->music_service_base_url, music_service_base_url, sizeof(settings->music_service_base_url));
-        settings->has_music_service_base_url = true;
-    }
-    if (music_auth_secret[0] != '\0') {
-        strlcpy(settings->music_auth_secret, music_auth_secret, sizeof(settings->music_auth_secret));
-        settings->has_music_auth_secret = true;
     }
     if (xiaozhi_ws_url[0] != '\0') {
         if (xiaozhi_ws_url_needs_migration(xiaozhi_ws_url)) {
@@ -186,18 +162,16 @@ esp_err_t settings_save(const ornament_settings_t *settings)
         err = nvs_set_str(handle, KEY_BRIDGE_URL, settings_bridge_url_or_default(settings));
     }
     if (err == ESP_OK) {
-        const char *music_service_base_url =
-            (settings != NULL && settings->has_music_service_base_url && settings->music_service_base_url[0] != '\0') ?
-                settings->music_service_base_url :
-                "";
-        err = nvs_set_str(handle, KEY_MUSIC_SERVICE_BASE_URL, music_service_base_url);
+        esp_err_t erase_err = nvs_erase_key(handle, KEY_LEGACY_MUSIC_SERVICE_BASE_URL);
+        if (erase_err != ESP_OK && erase_err != ESP_ERR_NVS_NOT_FOUND) {
+            err = erase_err;
+        }
     }
     if (err == ESP_OK) {
-        const char *music_auth_secret =
-            (settings != NULL && settings->has_music_auth_secret && settings->music_auth_secret[0] != '\0') ?
-                settings->music_auth_secret :
-                "";
-        err = nvs_set_str(handle, KEY_MUSIC_AUTH_SECRET, music_auth_secret);
+        esp_err_t erase_err = nvs_erase_key(handle, KEY_LEGACY_MUSIC_AUTH_SECRET);
+        if (erase_err != ESP_OK && erase_err != ESP_ERR_NVS_NOT_FOUND) {
+            err = erase_err;
+        }
     }
     if (err == ESP_OK) {
         err = nvs_set_str(handle, KEY_XIAOZHI_WS_URL, settings_xiaozhi_ws_url_or_default(settings));
@@ -309,20 +283,69 @@ const char *settings_bridge_url_or_default(const ornament_settings_t *settings)
     return CONFIG_ORNAMENT_BRIDGE_URL;
 }
 
-const char *settings_music_service_base_url_or_default(const ornament_settings_t *settings)
+static bool string_ends_with_len(const char *value, size_t value_len, const char *suffix)
 {
-    if (settings != NULL && settings->music_service_base_url[0] != '\0') {
-        return settings->music_service_base_url;
-    }
-    return CONFIG_ORNAMENT_MUSIC_SERVICE_BASE_URL;
+    size_t suffix_len = strlen(suffix);
+    return value != NULL && value_len >= suffix_len &&
+           strncmp(value + value_len - suffix_len, suffix, suffix_len) == 0;
 }
 
-const char *settings_music_auth_secret_or_default(const ornament_settings_t *settings)
+static esp_err_t normalize_bridge_music_base_url(const char *url, char *target, size_t target_size)
 {
-    if (settings != NULL && settings->music_auth_secret[0] != '\0') {
-        return settings->music_auth_secret;
+    if (url == NULL || url[0] == '\0' || target == NULL || target_size == 0) {
+        return ESP_ERR_INVALID_ARG;
     }
-    return CONFIG_ORNAMENT_MUSIC_AUTH_SECRET;
+
+    size_t base_len = strcspn(url, "?");
+    while (base_len > 0 && url[base_len - 1] == '/') {
+        base_len--;
+    }
+
+    bool append_music_path = true;
+    if (string_ends_with_len(url, base_len, "/v1/music/resolve")) {
+        base_len -= strlen("/resolve");
+        append_music_path = false;
+    } else if (string_ends_with_len(url, base_len, "/v1/music/stream")) {
+        base_len -= strlen("/stream");
+        append_music_path = false;
+    } else if (string_ends_with_len(url, base_len, "/v1/music")) {
+        append_music_path = false;
+    } else if (string_ends_with_len(url, base_len, "/stream_pcm")) {
+        base_len -= strlen("/stream_pcm");
+    } else if (string_ends_with_len(url, base_len, "/state")) {
+        base_len -= strlen("/state");
+    }
+
+    while (base_len > 0 && url[base_len - 1] == '/') {
+        base_len--;
+    }
+    if (base_len == 0) {
+        target[0] = '\0';
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    int written = snprintf(
+        target,
+        target_size,
+        "%.*s%s",
+        (int)base_len,
+        url,
+        append_music_path ? "/v1/music" : "");
+    if (written <= 0 || written >= (int)target_size) {
+        target[0] = '\0';
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
+
+esp_err_t settings_resolve_bridge_music_base_url(const ornament_settings_t *settings, char *target, size_t target_size)
+{
+    if (target == NULL || target_size == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    target[0] = '\0';
+
+    return normalize_bridge_music_base_url(settings_bridge_url_or_default(settings), target, target_size);
 }
 
 const char *settings_xiaozhi_ws_url_or_default(const ornament_settings_t *settings)

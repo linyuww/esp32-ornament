@@ -1,7 +1,6 @@
 #include "web_console.h"
 
 #include "bridge_client.h"
-#include "cJSON.h"
 #include "device_identity.h"
 #include "esp_heap_caps.h"
 #include "esp_http_server.h"
@@ -14,7 +13,6 @@
 #include "weather_client.h"
 #include "wifi.h"
 #include "xiaozhi_client.h"
-#include "xiaozhi_mcp.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -34,8 +32,6 @@ static ornament_state_t last_state;
 static esp_err_t last_fetch_error = ESP_ERR_INVALID_STATE;
 static int64_t last_state_us;
 static ornament_settings_t console_settings;
-static ornament_settings_t debug_music_settings;
-static bool debug_music_settings_ready;
 static web_console_bridge_debug_t bridge_debug;
 
 static void refresh_console_settings(void)
@@ -43,10 +39,6 @@ static void refresh_console_settings(void)
     if (settings_load(&console_settings) != ESP_OK) {
         memset(&console_settings, 0, sizeof(console_settings));
         console_settings.audio_volume_percent = CONFIG_ORNAMENT_AUDIO_VOLUME_PERCENT;
-    }
-    if (!debug_music_settings_ready) {
-        debug_music_settings = console_settings;
-        debug_music_settings_ready = true;
     }
 }
 
@@ -910,37 +902,6 @@ static esp_err_t save_bridge_url(const char *url)
     return err;
 }
 
-static esp_err_t save_music_debug_config(const char *base_url, const char *auth_secret)
-{
-    if (base_url == NULL || base_url[0] == '\0') {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    ornament_settings_t settings;
-    esp_err_t err = settings_load(&settings);
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    strlcpy(settings.music_service_base_url, base_url, sizeof(settings.music_service_base_url));
-    settings.has_music_service_base_url = true;
-    if (auth_secret != NULL && auth_secret[0] != '\0') {
-        strlcpy(settings.music_auth_secret, auth_secret, sizeof(settings.music_auth_secret));
-        settings.has_music_auth_secret = true;
-    }
-
-    err = settings_save(&settings);
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    console_settings = settings;
-    debug_music_settings = settings;
-    debug_music_settings_ready = true;
-    ESP_LOGI(TAG, "music service saved: %s", base_url);
-    return ESP_OK;
-}
-
 static esp_err_t send_bridge_saved_page(httpd_req_t *req, const char *url, const char *detail)
 {
     char escaped_url[ORNAMENT_BRIDGE_URL_MAX * 2];
@@ -1541,115 +1502,6 @@ static esp_err_t xiaozhi_test_post_handler(httpd_req_t *req)
     return send_xiaozhi_test_page(req, &result);
 }
 
-static esp_err_t debug_music_play_post_handler(httpd_req_t *req)
-{
-    char body[512] = {0};
-    char song_name[ORNAMENT_TEXT_MAX] = "music";
-    char artist_name[ORNAMENT_TEXT_MAX] = {0};
-    if (req->content_len > 0) {
-        if (read_form_body(req, body, sizeof(body)) != ESP_OK) {
-            return ESP_FAIL;
-        }
-        form_value(body, "song_name", song_name, sizeof(song_name));
-        form_value(body, "artist_name", artist_name, sizeof(artist_name));
-        if (song_name[0] == '\0') {
-            strlcpy(song_name, "music", sizeof(song_name));
-        }
-    }
-
-    if (!debug_music_settings_ready) {
-        refresh_console_settings();
-    }
-
-    cJSON *payload = cJSON_CreateObject();
-    cJSON *params = payload != NULL ? cJSON_AddObjectToObject(payload, "params") : NULL;
-    cJSON *arguments = params != NULL ? cJSON_AddObjectToObject(params, "arguments") : NULL;
-    char *response_json = NULL;
-    esp_err_t err = ESP_ERR_NO_MEM;
-    if (payload != NULL && params != NULL && arguments != NULL) {
-        cJSON_AddNumberToObject(payload, "id", 1);
-        cJSON_AddStringToObject(payload, "method", "tools/call");
-        cJSON_AddStringToObject(params, "name", "self.music.play_song");
-        cJSON_AddStringToObject(arguments, "song_name", song_name);
-        if (artist_name[0] != '\0') {
-            cJSON_AddStringToObject(arguments, "artist_name", artist_name);
-        }
-        err = xiaozhi_mcp_handle_request(payload, &debug_music_settings, &response_json);
-    }
-
-    char response_preview[512] = {0};
-    if (response_json != NULL) {
-        strlcpy(response_preview, response_json, sizeof(response_preview));
-    } else {
-        strlcpy(response_preview, esp_err_to_name(err), sizeof(response_preview));
-    }
-    free(response_json);
-    cJSON_Delete(payload);
-
-    if (err != ESP_OK) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, response_preview);
-        return ESP_FAIL;
-    }
-    return send_simple_page(req, "Debug Music Play", response_preview);
-}
-
-static esp_err_t debug_music_stop_post_handler(httpd_req_t *req)
-{
-    if (req->content_len > 0) {
-        char body[128] = {0};
-        (void)read_form_body(req, body, sizeof(body));
-    }
-
-    cJSON *payload = cJSON_CreateObject();
-    cJSON *params = payload != NULL ? cJSON_AddObjectToObject(payload, "params") : NULL;
-    char *response_json = NULL;
-    esp_err_t err = ESP_ERR_NO_MEM;
-    if (payload != NULL && params != NULL) {
-        cJSON_AddNumberToObject(payload, "id", 2);
-        cJSON_AddStringToObject(payload, "method", "tools/call");
-        cJSON_AddStringToObject(params, "name", "self.music.stop");
-        cJSON_AddObjectToObject(params, "arguments");
-        err = xiaozhi_mcp_handle_request(payload, NULL, &response_json);
-    }
-
-    char response_preview[512] = {0};
-    if (response_json != NULL) {
-        strlcpy(response_preview, response_json, sizeof(response_preview));
-    } else {
-        strlcpy(response_preview, esp_err_to_name(err), sizeof(response_preview));
-    }
-    free(response_json);
-    cJSON_Delete(payload);
-
-    if (err != ESP_OK) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, response_preview);
-        return ESP_FAIL;
-    }
-    return send_simple_page(req, "Debug Music Stop", response_preview);
-}
-
-static esp_err_t debug_music_config_post_handler(httpd_req_t *req)
-{
-    char body[512] = {0};
-    char base_url[ORNAMENT_MUSIC_SERVICE_BASE_URL_MAX] = {0};
-    char auth_secret[ORNAMENT_MUSIC_AUTH_SECRET_MAX] = {0};
-    if (read_form_body(req, body, sizeof(body)) != ESP_OK) {
-        return ESP_FAIL;
-    }
-    form_value(body, "base_url", base_url, sizeof(base_url));
-    form_value(body, "auth_secret", auth_secret, sizeof(auth_secret));
-
-    esp_err_t err = save_music_debug_config(base_url, auth_secret);
-    if (err != ESP_OK) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, esp_err_to_name(err));
-        return ESP_FAIL;
-    }
-
-    char detail[256];
-    snprintf(detail, sizeof(detail), "Music service base URL saved: %s", base_url);
-    return send_simple_page(req, "Debug Music Config", detail);
-}
-
 static esp_err_t auto_bridge_post_handler(httpd_req_t *req)
 {
     if (req->content_len > 0) {
@@ -1805,21 +1657,6 @@ esp_err_t web_console_start(void)
         .method = HTTP_POST,
         .handler = xiaozhi_test_post_handler,
     };
-    const httpd_uri_t debug_music_play = {
-        .uri = "/debug-music-play",
-        .method = HTTP_POST,
-        .handler = debug_music_play_post_handler,
-    };
-    const httpd_uri_t debug_music_stop = {
-        .uri = "/debug-music-stop",
-        .method = HTTP_POST,
-        .handler = debug_music_stop_post_handler,
-    };
-    const httpd_uri_t debug_music_config = {
-        .uri = "/debug-music-config",
-        .method = HTTP_POST,
-        .handler = debug_music_config_post_handler,
-    };
     const httpd_uri_t reboot = {
         .uri = "/reboot",
         .method = HTTP_POST,
@@ -1845,9 +1682,6 @@ esp_err_t web_console_start(void)
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &xiaozhi_start));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &xiaozhi_stop));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &xiaozhi_test));
-    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &debug_music_play));
-    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &debug_music_stop));
-    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &debug_music_config));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &reboot));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &clear_config));
     ESP_LOGI(TAG, "web console started on http://<device-ip>/");

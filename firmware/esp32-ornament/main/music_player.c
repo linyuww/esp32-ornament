@@ -1,18 +1,14 @@
 #include "music_player.h"
 
 #include "cJSON.h"
-#include "device_identity.h"
 #include "esp_check.h"
 #include "esp_heap_caps.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
-#include "esp_mac.h"
-#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
-#include "mbedtls/sha256.h"
 #include "settings.h"
 #include "task_audio.h"
 #include "xiaozhi_client.h"
@@ -33,10 +29,6 @@
 
 #ifndef CONFIG_ORNAMENT_MUSIC_STREAM_CHUNK_BYTES
 #define CONFIG_ORNAMENT_MUSIC_STREAM_CHUNK_BYTES 2048
-#endif
-
-#ifndef CONFIG_ORNAMENT_MUSIC_MP3_INPUT_BUFFER_BYTES
-#define CONFIG_ORNAMENT_MUSIC_MP3_INPUT_BUFFER_BYTES 16384
 #endif
 
 #if CONFIG_ORNAMENT_XIAOZHI_ENABLED && CONFIG_ORNAMENT_XIAOZHI_MCP_ENABLED
@@ -69,7 +61,6 @@ typedef struct {
     char artist[ORNAMENT_TEXT_MAX];
     char album[ORNAMENT_TEXT_MAX];
     char picture[ORNAMENT_BRIDGE_URL_MAX];
-    char audio_url[MUSIC_PLAYER_URL_MAX];
 } resolved_song_t;
 
 static const char *TAG = "music_player";
@@ -81,50 +72,6 @@ static music_player_snapshot_t s_snapshot;
 static bool s_stop_requested;
 static size_t s_task_stack_bytes;
 static bool s_task_stack_in_spiram;
-
-static size_t current_stack_high_water_bytes(void)
-{
-    return uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t);
-}
-
-static void log_music_heap_status(const char *stage)
-{
-    ESP_LOGI(
-        TAG,
-        "heap %s: free=%u largest8=%u largest_internal=%u internal=%u spiram=%u",
-        stage,
-        (unsigned int)esp_get_free_heap_size(),
-        (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
-        (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
-        (unsigned int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
-        (unsigned int)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-}
-
-static void format_hex_preview(const uint8_t *data, size_t size, char *target, size_t target_size)
-{
-    if (target == NULL || target_size == 0) {
-        return;
-    }
-    target[0] = '\0';
-    if (data == NULL || size == 0) {
-        return;
-    }
-
-    size_t used = 0;
-    size_t limit = size < 16 ? size : 16;
-    for (size_t i = 0; i < limit && used < target_size; i++) {
-        int written = snprintf(
-            target + used,
-            target_size - used,
-            "%s%02X",
-            i == 0 ? "" : " ",
-            data[i]);
-        if (written <= 0 || written >= (int)(target_size - used)) {
-            break;
-        }
-        used += (size_t)written;
-    }
-}
 
 static void *music_calloc(size_t count, size_t size)
 {
@@ -182,8 +129,6 @@ static void release_xiaozhi_session_for_music(void)
     esp_err_t stop_err = xiaozhi_client_stop_session();
     if (stop_err != ESP_OK) {
         ESP_LOGW(TAG, "stop Xiaozhi before music failed: %s", esp_err_to_name(stop_err));
-    } else {
-        log_music_heap_status("after_xiaozhi_stop");
     }
 #endif
 }
@@ -261,30 +206,6 @@ static char hex_digit(unsigned value)
     return (char)(value < 10 ? ('0' + value) : ('A' + (value - 10)));
 }
 
-static bool is_debug_test_audio_url(const char *audio_url)
-{
-    if (audio_url == NULL) {
-        return false;
-    }
-    const char *test_path = strstr(audio_url, "/test.mp3");
-    if (test_path == NULL) {
-        return false;
-    }
-    return strstr(audio_url, ":2233/test.mp3") != NULL ||
-           strcmp(test_path, "/test.mp3") == 0;
-}
-
-static bool is_mp3_audio_url(const char *audio_url)
-{
-    if (audio_url == NULL) {
-        return false;
-    }
-
-    const char *query = strchr(audio_url, '?');
-    const char *mp3 = strstr(audio_url, ".mp3");
-    return mp3 != NULL && (query == NULL || mp3 < query);
-}
-
 static void append_urlencoded(char *target, size_t target_size, size_t *used, const char *value)
 {
     if (target == NULL || target_size == 0 || used == NULL || value == NULL) {
@@ -320,12 +241,15 @@ static void append_urlencoded(char *target, size_t target_size, size_t *used, co
 
 static esp_err_t build_music_request_url(
     const char *base_url,
+    const char *endpoint,
     const char *song_name,
     const char *artist_name,
+    uint32_t index,
     char *target,
     size_t target_size)
 {
-    if (base_url == NULL || song_name == NULL || song_name[0] == '\0' || target == NULL || target_size == 0) {
+    if (base_url == NULL || endpoint == NULL || song_name == NULL || song_name[0] == '\0' ||
+        target == NULL || target_size == 0) {
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -334,21 +258,14 @@ static esp_err_t build_music_request_url(
         base_len--;
     }
 
-    bool has_query = memchr(base_url, '?', base_len) != NULL;
-    bool endpoint_url =
-        has_query ||
-        strstr(base_url, "/stream_pcm") != NULL ||
-        strstr(base_url, "/v1/music/resolve") != NULL;
-    int written = endpoint_url ?
-        snprintf(target, target_size, "%.*s%csong=", (int)base_len, base_url, has_query ? '&' : '?') :
-        snprintf(target, target_size, "%.*s/stream_pcm?song=", (int)base_len, base_url);
+    int written = snprintf(target, target_size, "%.*s/%s?song=", (int)base_len, base_url, endpoint);
     if (written <= 0 || written >= (int)target_size) {
         return ESP_ERR_NO_MEM;
     }
     size_t used = (size_t)written;
     append_urlencoded(target, target_size, &used, song_name);
 
-    if (artist_name != NULL) {
+    if (artist_name != NULL && artist_name[0] != '\0') {
         const char *suffix = "&artist=";
         if (used + strlen(suffix) >= target_size) {
             return ESP_ERR_NO_MEM;
@@ -359,95 +276,10 @@ static esp_err_t build_music_request_url(
         append_urlencoded(target, target_size, &used, artist_name);
     }
 
-    return ESP_OK;
-}
-
-static void get_device_mac_string(char *target, size_t target_size)
-{
-    uint8_t mac[6] = {0};
-    if (target == NULL || target_size == 0) {
-        return;
-    }
-    if (esp_read_mac(mac, ESP_MAC_WIFI_STA) == ESP_OK) {
-        snprintf(
-            target,
-            target_size,
-            "%02x:%02x:%02x:%02x:%02x:%02x",
-            mac[0],
-            mac[1],
-            mac[2],
-            mac[3],
-            mac[4],
-            mac[5]);
-    } else {
-        strlcpy(target, device_identity_hostname(), target_size);
-    }
-}
-
-static void get_device_chip_id_string(char *target, size_t target_size)
-{
-    uint8_t mac[6] = {0};
-    if (target == NULL || target_size == 0) {
-        return;
-    }
-    if (esp_read_mac(mac, ESP_MAC_WIFI_STA) == ESP_OK) {
-        snprintf(
-            target,
-            target_size,
-            "%02X%02X%02X%02X%02X%02X",
-            mac[0],
-            mac[1],
-            mac[2],
-            mac[3],
-            mac[4],
-            mac[5]);
-    } else {
-        strlcpy(target, device_identity_hostname(), target_size);
-    }
-}
-
-static esp_err_t apply_music_auth_headers(esp_http_client_handle_t client, const ornament_settings_t *settings)
-{
-    if (client == NULL) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    char mac[32] = {0};
-    char chip_id[32] = {0};
-    char timestamp[24] = {0};
-    char dynamic_key[65] = {0};
-    unsigned char hash[32] = {0};
-    char data[256] = {0};
-
-    get_device_mac_string(mac, sizeof(mac));
-    get_device_chip_id_string(chip_id, sizeof(chip_id));
-    int64_t timestamp_sec = esp_timer_get_time() / 1000000;
-    snprintf(timestamp, sizeof(timestamp), "%lld", (long long)timestamp_sec);
-
-    const char *secret = settings_music_auth_secret_or_default(settings);
-    int written = snprintf(data, sizeof(data), "%s:%s:%s:%s", mac, chip_id, timestamp, secret != NULL ? secret : "");
-    if (written <= 0 || written >= (int)sizeof(data)) {
+    written = snprintf(target + used, target_size - used, "&index=%lu", (unsigned long)(index == 0 ? 1UL : index));
+    if (written <= 0 || written >= (int)(target_size - used)) {
         return ESP_ERR_NO_MEM;
     }
-
-#if MBEDTLS_VERSION_MAJOR >= 3
-    int sha_err = mbedtls_sha256((const unsigned char *)data, strlen(data), hash, 0);
-    if (sha_err != 0) {
-        return ESP_FAIL;
-    }
-#else
-    mbedtls_sha256((const unsigned char *)data, strlen(data), hash, 0);
-#endif
-
-    for (size_t i = 0; i < 16; i++) {
-        snprintf(dynamic_key + i * 2, sizeof(dynamic_key) - i * 2, "%02X", hash[i]);
-    }
-
-    ESP_RETURN_ON_ERROR(esp_http_client_set_header(client, "User-Agent", MUSIC_PLAYER_USER_AGENT), TAG, "set user-agent failed");
-    ESP_RETURN_ON_ERROR(esp_http_client_set_header(client, "X-MAC-Address", mac), TAG, "set mac header failed");
-    ESP_RETURN_ON_ERROR(esp_http_client_set_header(client, "X-Chip-ID", chip_id), TAG, "set chip header failed");
-    ESP_RETURN_ON_ERROR(esp_http_client_set_header(client, "X-Timestamp", timestamp), TAG, "set timestamp header failed");
-    ESP_RETURN_ON_ERROR(esp_http_client_set_header(client, "X-Dynamic-Key", dynamic_key), TAG, "set dynamic key header failed");
     return ESP_OK;
 }
 
@@ -460,11 +292,11 @@ static esp_err_t resolve_song(
         return ESP_ERR_INVALID_ARG;
     }
 
-    const char *base_url = settings_music_service_base_url_or_default(settings);
-    if (base_url == NULL || base_url[0] == '\0') {
-        return ESP_ERR_INVALID_STATE;
-    }
-
+    char base_url[ORNAMENT_MUSIC_BASE_URL_MAX] = {0};
+    ESP_RETURN_ON_ERROR(
+        settings_resolve_bridge_music_base_url(settings, base_url, sizeof(base_url)),
+        TAG,
+        "music base url resolve failed");
     char *url = heap_caps_calloc(MUSIC_PLAYER_URL_MAX, 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (url == NULL) {
         return ESP_ERR_NO_MEM;
@@ -472,8 +304,10 @@ static esp_err_t resolve_song(
 
     esp_err_t err = build_music_request_url(
         base_url,
+        "resolve",
         request->song_name,
-        request->artist_name,
+        request->artist_name[0] != '\0' ? request->artist_name : NULL,
+        request->index,
         url,
         MUSIC_PLAYER_URL_MAX);
     if (err != ESP_OK) {
@@ -485,7 +319,6 @@ static esp_err_t resolve_song(
     char *response = heap_caps_calloc(MUSIC_PLAYER_RESPONSE_MAX, 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (response == NULL) {
         ESP_LOGW(TAG, "resolve response alloc failed");
-        log_music_heap_status("resolve_alloc_fail");
         free(url);
         return ESP_ERR_NO_MEM;
     }
@@ -509,17 +342,10 @@ static esp_err_t resolve_song(
     }
 
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_http_client_set_header(client, "Accept", "application/json"));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(apply_music_auth_headers(client, settings));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_http_client_set_header(client, "User-Agent", MUSIC_PLAYER_USER_AGENT));
 
-    ESP_LOGI(TAG, "resolve request: %s", url);
     err = esp_http_client_perform(client);
     int status_code = esp_http_client_get_status_code(client);
-    ESP_LOGI(
-        TAG,
-        "resolve response: err=%s status=%d bytes=%d",
-        esp_err_to_name(err),
-        status_code,
-        buffer.length);
     esp_http_client_cleanup(client);
     free(url);
     if (err != ESP_OK) {
@@ -545,31 +371,16 @@ static esp_err_t resolve_song(
     copy_json_string(root, "artist", parsed.artist, sizeof(parsed.artist));
     copy_json_string(root, "album", parsed.album, sizeof(parsed.album));
     copy_json_string(root, "picture", parsed.picture, sizeof(parsed.picture));
-    copy_json_string(root, "audio_url", parsed.audio_url, sizeof(parsed.audio_url));
-    if (parsed.audio_url[0] == '\0') {
-        copy_json_string(root, "url", parsed.audio_url, sizeof(parsed.audio_url));
-    }
+    cJSON *ok = cJSON_GetObjectItemCaseSensitive(root, "ok");
     cJSON *error = cJSON_GetObjectItemCaseSensitive(root, "error");
     if (cJSON_IsString(error) && error->valuestring != NULL) {
         strlcpy(error_text, error->valuestring, sizeof(error_text));
     }
     cJSON_Delete(root);
 
-    if (parsed.audio_url[0] == '\0') {
-        if (error_text[0] != '\0') {
-            ESP_LOGW(TAG, "music resolve rejected: %s", error_text);
-        } else {
-            ESP_LOGW(TAG, "music resolve missing audio_url");
-        }
+    if (ok != NULL && cJSON_IsBool(ok) && !cJSON_IsTrue(ok)) {
+        ESP_LOGW(TAG, "music resolve rejected: %s", error_text[0] != '\0' ? error_text : "ok=false");
         return ESP_FAIL;
-    }
-    if (is_debug_test_audio_url(parsed.audio_url)) {
-        ESP_LOGW(TAG, "music resolve returned debug MP3 test audio, refusing playback: %s", parsed.audio_url);
-        return ESP_ERR_NOT_SUPPORTED;
-    }
-    if (is_mp3_audio_url(parsed.audio_url)) {
-        ESP_LOGW(TAG, "music resolve returned MP3 URL, refusing unsafe ESP32-side decode: %s", parsed.audio_url);
-        return ESP_ERR_NOT_SUPPORTED;
     }
     if (parsed.title[0] == '\0') {
         strlcpy(parsed.title, request->song_name, sizeof(parsed.title));
@@ -577,7 +388,7 @@ static esp_err_t resolve_song(
     if (parsed.artist[0] == '\0') {
         strlcpy(parsed.artist, request->artist_name, sizeof(parsed.artist));
     }
-    ESP_LOGI(TAG, "resolved song: title=%s artist=%s audio_url=%s", parsed.title, parsed.artist, parsed.audio_url);
+    ESP_LOGI(TAG, "resolved song: title=%s artist=%s", parsed.title, parsed.artist);
     *resolved = parsed;
     return ESP_OK;
 }
@@ -612,26 +423,51 @@ static bool buffer_looks_like_non_pcm(const uint8_t *data, size_t size)
 
 static esp_err_t stream_song(
     const ornament_settings_t *settings,
-    const char *audio_url)
+    const music_player_request_t *request)
 {
-    if (settings == NULL || audio_url == NULL || audio_url[0] == '\0') {
+    if (settings == NULL || request == NULL || request->song_name[0] == '\0') {
         return ESP_ERR_INVALID_ARG;
     }
 
+    char base_url[ORNAMENT_MUSIC_BASE_URL_MAX] = {0};
+    ESP_RETURN_ON_ERROR(
+        settings_resolve_bridge_music_base_url(settings, base_url, sizeof(base_url)),
+        TAG,
+        "music base url resolve failed");
+
+    char *url = heap_caps_calloc(MUSIC_PLAYER_URL_MAX, 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (url == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    esp_err_t err = build_music_request_url(
+        base_url,
+        "stream",
+        request->song_name,
+        request->artist_name[0] != '\0' ? request->artist_name : NULL,
+        request->index,
+        url,
+        MUSIC_PLAYER_URL_MAX);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "stream url build failed: %s", esp_err_to_name(err));
+        free(url);
+        return err;
+    }
+
     esp_http_client_config_t config = {
-        .url = audio_url,
+        .url = url,
         .timeout_ms = CONFIG_ORNAMENT_MUSIC_REQUEST_TIMEOUT_MS,
     };
     esp_http_client_handle_t client = esp_http_client_init(&config);
     if (client == NULL) {
+        free(url);
         return ESP_FAIL;
     }
 
-    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_http_client_set_header(client, "Accept", "*/*"));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(apply_music_auth_headers(client, settings));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_http_client_set_header(client, "Accept", "audio/L16"));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_http_client_set_header(client, "User-Agent", MUSIC_PLAYER_USER_AGENT));
 
-    ESP_LOGI(TAG, "stream request: %s", audio_url);
-    esp_err_t err = esp_http_client_open(client, 0);
+    err = esp_http_client_open(client, 0);
+    free(url);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "stream open failed: %s", esp_err_to_name(err));
         esp_http_client_cleanup(client);
@@ -643,12 +479,6 @@ static esp_err_t stream_song(
     int64_t content_length = esp_http_client_get_content_length(client);
     char *content_type = NULL;
     (void)esp_http_client_get_header(client, "Content-Type", &content_type);
-    ESP_LOGI(
-        TAG,
-        "stream headers: status=%d content_length=%lld content_type=%s",
-        status_code,
-        (long long)content_length,
-        content_type != NULL ? content_type : "<none>");
     if (status_code < 200 || status_code >= 300) {
         esp_http_client_close(client);
         esp_http_client_cleanup(client);
@@ -661,13 +491,12 @@ static esp_err_t stream_song(
         return ESP_ERR_NOT_SUPPORTED;
     }
 
-    uint8_t *read_buffer = heap_caps_calloc(CONFIG_ORNAMENT_MUSIC_STREAM_CHUNK_BYTES, 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    uint8_t *read_buffer = heap_caps_calloc(CONFIG_ORNAMENT_MUSIC_STREAM_CHUNK_BYTES + 1, 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (read_buffer == NULL) {
         ESP_LOGW(
             TAG,
             "stream buffer alloc failed read=%p",
             (void *)read_buffer);
-        log_music_heap_status("stream_alloc_fail");
         free(read_buffer);
         esp_http_client_close(client);
         esp_http_client_cleanup(client);
@@ -677,6 +506,7 @@ static esp_err_t stream_song(
     size_t total_read = 0;
     size_t total_frames = 0;
     size_t empty_reads = 0;
+    size_t carry = 0;
     bool first_chunk_logged = false;
     bool output_acquired = false;
     err = ESP_OK;
@@ -684,8 +514,8 @@ static esp_err_t stream_song(
     while (!stop_requested()) {
         int read = esp_http_client_read(
             client,
-            (char *)read_buffer,
-            CONFIG_ORNAMENT_MUSIC_STREAM_CHUNK_BYTES);
+            (char *)read_buffer + carry,
+            CONFIG_ORNAMENT_MUSIC_STREAM_CHUNK_BYTES - (int)carry);
         if (read == -ESP_ERR_HTTP_EAGAIN) {
             continue;
         }
@@ -694,7 +524,8 @@ static esp_err_t stream_song(
             break;
         }
         if (read == 0) {
-            if (esp_http_client_is_complete_data_received(client)) {
+            if (esp_http_client_is_complete_data_received(client) ||
+                (content_length < 0 && total_read > 0)) {
                 err = ESP_OK;
                 break;
             }
@@ -717,10 +548,8 @@ static esp_err_t stream_song(
 
         empty_reads = 0;
         if (!first_chunk_logged) {
-            char hex[64];
-            format_hex_preview(read_buffer, (size_t)read, hex, sizeof(hex));
-            ESP_LOGI(TAG, "stream first chunk: bytes=%d head=%s", read, hex);
-            if (buffer_looks_like_non_pcm(read_buffer, (size_t)read)) {
+            size_t preview_bytes = carry + (size_t)read;
+            if (buffer_looks_like_non_pcm(read_buffer, preview_bytes)) {
                 ESP_LOGW(TAG, "stream body is not raw PCM, refusing playback");
                 err = ESP_ERR_NOT_SUPPORTED;
                 break;
@@ -734,16 +563,24 @@ static esp_err_t stream_song(
             output_acquired = true;
         }
 
+        size_t total = carry + (size_t)read;
+        size_t bytes_to_write = total & ~(size_t)(MUSIC_PLAYER_PCM_SAMPLE_BYTES - 1);
+        size_t next_carry = total - bytes_to_write;
         total_read += (size_t)read;
-        size_t frames = (size_t)read / MUSIC_PLAYER_PCM_SAMPLE_BYTES;
-        if (frames == 0) {
+        if (bytes_to_write == 0) {
+            carry = next_carry;
             continue;
         }
+        size_t frames = bytes_to_write / MUSIC_PLAYER_PCM_SAMPLE_BYTES;
         err = task_audio_output_write_mono((const int16_t *)read_buffer, frames, 1000);
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "audio write failed: %s", esp_err_to_name(err));
             break;
         }
+        if (next_carry > 0) {
+            read_buffer[0] = read_buffer[bytes_to_write];
+        }
+        carry = next_carry;
         total_frames += frames;
     }
 
@@ -776,10 +613,8 @@ static void music_player_task(void *arg)
     esp_err_t err = ESP_ERR_INVALID_ARG;
     bool requested_stop = false;
 
-    ESP_LOGI(TAG, "music task entry: stack_hwm=%u bytes", (unsigned int)current_stack_high_water_bytes());
     if (resolved == NULL) {
         ESP_LOGW(TAG, "resolved song alloc failed: bytes=%u", (unsigned int)sizeof(*resolved));
-        log_music_heap_status("resolved_alloc_fail");
         err = ESP_ERR_NO_MEM;
         goto cleanup;
     }
@@ -789,11 +624,6 @@ static void music_player_task(void *arg)
     }
 
     err = resolve_song(&request->settings, request, resolved);
-    ESP_LOGI(
-        TAG,
-        "music task after resolve: err=%s stack_hwm=%u bytes",
-        esp_err_to_name(err),
-        (unsigned int)current_stack_high_water_bytes());
     if (err != ESP_OK || stop_requested()) {
         requested_stop = stop_requested();
         goto cleanup;
@@ -812,28 +642,14 @@ static void music_player_task(void *arg)
         xSemaphoreGive(s_mutex);
     }
 
-    char *audio_url = music_calloc(MUSIC_PLAYER_URL_MAX, 1);
-    if (audio_url == NULL) {
-        ESP_LOGW(TAG, "stream url copy alloc failed: bytes=%u", (unsigned int)MUSIC_PLAYER_URL_MAX);
-        log_music_heap_status("stream_url_alloc_fail");
-        err = ESP_ERR_NO_MEM;
-        goto cleanup;
-    }
-    strlcpy(audio_url, resolved->audio_url, MUSIC_PLAYER_URL_MAX);
     free(resolved);
     resolved = NULL;
 
-    err = stream_song(&request->settings, audio_url);
-    free(audio_url);
+    err = stream_song(&request->settings, request);
     requested_stop = stop_requested();
 
 cleanup:
-    ESP_LOGI(
-        TAG,
-        "music task cleanup: err=%s stop=%d stack_hwm=%u bytes",
-        esp_err_to_name(err),
-        requested_stop,
-        (unsigned int)current_stack_high_water_bytes());
+    ESP_LOGI(TAG, "music task finished: err=%s stop=%d", esp_err_to_name(err), requested_stop);
     if (s_mutex != NULL && xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         if (err == ESP_OK) {
             mark_idle_locked();
@@ -912,7 +728,6 @@ static esp_err_t start_music_request(
 
     music_player_request_t *request = music_calloc(1, sizeof(*request));
     if (request == NULL) {
-        log_music_heap_status("request_alloc_fail");
         return ESP_ERR_NO_MEM;
     }
     strlcpy(request->song_name, song_name, sizeof(request->song_name));
@@ -936,15 +751,8 @@ static esp_err_t start_music_request(
     set_state_locked(MUSIC_PLAYER_STATE_RESOLVING);
     xEventGroupClearBits(s_events, MUSIC_PLAYER_TASK_DONE);
 
-    log_music_heap_status("before_music_task");
     s_task_stack_in_spiram = true;
     s_task_stack_bytes = select_music_task_stack_bytes(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    ESP_LOGI(
-        TAG,
-        "music task stack select: largest_spiram=%u largest_internal=%u selected_spiram=%u",
-        (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT),
-        (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
-        (unsigned int)s_task_stack_bytes);
     BaseType_t created = xTaskCreateWithCaps(
         music_player_task,
         "music_player",
@@ -982,17 +790,11 @@ static esp_err_t start_music_request(
             "music task create failed stack=%u caps=%s",
             (unsigned int)s_task_stack_bytes,
             s_task_stack_in_spiram ? "spiram" : "internal");
-        log_music_heap_status("music_task_create_fail");
         return ESP_ERR_NO_MEM;
     }
 
     xSemaphoreGive(s_mutex);
-    ESP_LOGI(
-        TAG,
-        "music task started stack=%u caps=%s",
-        (unsigned int)s_task_stack_bytes,
-        s_task_stack_in_spiram ? "spiram" : "internal");
-    log_music_heap_status("after_music_task");
+    ESP_LOGI(TAG, "music task started");
     return ESP_OK;
 }
 

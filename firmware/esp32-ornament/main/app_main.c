@@ -2,6 +2,7 @@
 #include "bridge_client.h"
 #include "config_portal.h"
 #include "display.h"
+#include "music_player.h"
 #include "ornament_state.h"
 #include "system_status.h"
 #include "task_audio.h"
@@ -651,6 +652,10 @@ static void voice_control_set_view(voice_view_t view, TickType_t now, const char
 
 static esp_err_t xiaozhi_start_session_if_needed(const char *reason)
 {
+    if (music_player_is_active()) {
+        ESP_LOGI(TAG, "Xiaozhi session start ignored while music is playing: %s", reason);
+        return ESP_ERR_INVALID_STATE;
+    }
     if (xiaozhi_client_session_requested()) {
         ESP_LOGI(TAG, "Xiaozhi session already active: %s", reason);
         return ESP_OK;
@@ -1131,12 +1136,13 @@ static void handle_voice_command(asrpro_voice_command_t command)
         voice_control_set_view(VOICE_VIEW_STATUS, now, "QUIET OFF", "QUIET OFF");
         break;
     case ASRPRO_VOICE_COMMAND_XIAOZHI_START: {
-        esp_err_t err = xiaozhi_client_start_session();
+        bool music_active = music_player_is_active();
+        esp_err_t err = music_active ? ESP_ERR_INVALID_STATE : xiaozhi_start_session_if_needed("voice Xiaozhi start");
         voice_control_set_view(
             VOICE_VIEW_STATUS,
             now,
             "XIAOZHI START",
-            err == ESP_OK ? "AI LISTEN" : esp_err_to_name(err));
+            err == ESP_OK ? "AI LISTEN" : (music_active ? "MUSIC PLAYING" : esp_err_to_name(err)));
         break;
     }
     case ASRPRO_VOICE_COMMAND_XIAOZHI_STOP: {
@@ -1264,6 +1270,10 @@ static void ai_button_task(void *arg)
                         voice_view_name(active_view),
                         manual_active);
                 } else {
+                    if (music_player_is_active()) {
+                        ESP_LOGI(TAG, "AI button ignored while music is playing");
+                        continue;
+                    }
                     ESP_LOGI(TAG, "AI button pressed on Xiaozhi page");
                     queue_xiaozhi_session_action(XIAOZHI_SESSION_ACTION_TOGGLE, "AI button toggle");
                 }
@@ -1294,6 +1304,10 @@ static void xiaozhi_session_task(void *arg)
 
         switch (request.action) {
         case XIAOZHI_SESSION_ACTION_START:
+            if (music_player_is_active()) {
+                ESP_LOGI(TAG, "queued Xiaozhi start ignored while music is playing");
+                break;
+            }
             (void)xiaozhi_start_session_if_needed(request.reason != NULL ? request.reason : "queued start");
             break;
         case XIAOZHI_SESSION_ACTION_STOP:
@@ -1302,6 +1316,8 @@ static void xiaozhi_session_task(void *arg)
         case XIAOZHI_SESSION_ACTION_TOGGLE:
             if (xiaozhi_client_session_requested()) {
                 (void)xiaozhi_stop_session_if_needed(request.reason != NULL ? request.reason : "queued toggle off");
+            } else if (music_player_is_active()) {
+                ESP_LOGI(TAG, "queued Xiaozhi toggle-on ignored while music is playing");
             } else {
                 (void)xiaozhi_start_session_if_needed(request.reason != NULL ? request.reason : "queued toggle on");
             }
