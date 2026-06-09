@@ -356,6 +356,20 @@ struct YaohudMusicResponse {
     #[serde(default)]
     msg: Option<String>,
     #[serde(default)]
+    data: Option<YaohudMusicData>,
+    #[serde(flatten)]
+    top_level: YaohudMusicData,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct YaohudMusicData {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    songname: Option<String>,
+    #[serde(default)]
+    songtitle: Option<String>,
+    #[serde(default)]
     title: Option<String>,
     #[serde(default)]
     song: Option<String>,
@@ -377,6 +391,14 @@ struct YaohudMusicResponse {
     lrc: Option<String>,
     #[serde(default)]
     lyrics: Option<String>,
+    #[serde(default)]
+    lrctxt: Option<String>,
+}
+
+impl YaohudMusicData {
+    fn from_response(response: YaohudMusicResponse) -> Self {
+        response.data.unwrap_or(response.top_level)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1905,12 +1927,7 @@ fn percent_decode(value: &str) -> String {
 
 fn resolve_song(config: &BridgeConfig, request: &MusicRequest) -> io::Result<ResolvedSong> {
     if config.yaohud_key.is_some() {
-        match resolve_song_yaohud(config, request) {
-            Ok(song) => return Ok(song),
-            Err(error) => {
-                eprintln!("Yaohud music resolve failed, trying NetEase fallback: {error}")
-            }
-        }
+        return resolve_song_yaohud(config, request);
     }
 
     resolve_song_netease(request)
@@ -1947,18 +1964,20 @@ fn resolve_song_yaohud(config: &BridgeConfig, request: &MusicRequest) -> io::Res
     let parsed: YaohudMusicResponse = serde_json::from_str(&body)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
 
-    if parsed.code.unwrap_or(200) != 200 {
+    let code = parsed.code.unwrap_or(200);
+    let message = parsed.msg.clone();
+    let data = YaohudMusicData::from_response(parsed);
+
+    if code != 200 {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            parsed
-                .msg
-                .unwrap_or_else(|| "Yaohud resolve failed".to_string()),
+            message.unwrap_or_else(|| "Yaohud resolve failed".to_string()),
         ));
     }
 
-    let url = parsed
+    let url = data
         .musicurl
-        .or(parsed.url)
+        .or(data.url)
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| {
             io::Error::new(
@@ -1968,22 +1987,25 @@ fn resolve_song_yaohud(config: &BridgeConfig, request: &MusicRequest) -> io::Res
         })?;
 
     let title = first_nonempty(&[
-        parsed.title.as_deref(),
-        parsed.song.as_deref(),
+        data.name.as_deref(),
+        data.title.as_deref(),
+        data.song.as_deref(),
+        data.songtitle.as_deref(),
         Some(request.song.as_str()),
     ])
     .unwrap_or_default()
     .to_string();
     let artist = first_nonempty(&[
-        parsed.artist.as_deref(),
-        parsed.singer.as_deref(),
+        data.artist.as_deref(),
+        data.singer.as_deref(),
+        data.songname.as_deref(),
         request.artist.as_deref(),
     ])
     .unwrap_or("")
     .to_string();
-    let album = parsed.album.unwrap_or_default();
-    let picture = parsed.picture.or(parsed.pic).unwrap_or_default();
-    let lyrics = parsed.lyrics.or(parsed.lrc).and_then(|value| {
+    let album = data.album.unwrap_or_default();
+    let picture = data.picture.or(data.pic).unwrap_or_default();
+    let lyrics = data.lrctxt.or(data.lyrics).or(data.lrc).and_then(|value| {
         if value.trim().is_empty() {
             None
         } else {
