@@ -63,6 +63,7 @@ config ORNAMENT_PROV_SCAN_MAX
 
 config ORNAMENT_CONFIG_PORTAL_ENABLED
     bool "Enable Wi-Fi provisioning portal"
+    depends on ESP_WIFI_SOFTAP_SUPPORT && LWIP_DHCPS
     default n
     help
         Builds the ESP32 SoftAP web portal for first-time Wi-Fi/bridge setup.

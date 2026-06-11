@@ -374,7 +374,9 @@ static esp_err_t connect_sta_for_probe(const char *ssid, const char *password, i
     strlcpy((char *)wifi_config.sta.ssid, ssid, sizeof(wifi_config.sta.ssid));
     strlcpy((char *)wifi_config.sta.password, password != NULL ? password : "", sizeof(wifi_config.sta.password));
     wifi_config.sta.threshold.authmode = WIFI_AUTH_OPEN;
+#if CONFIG_ESP_WIFI_ENABLE_WPA3_SAE
     wifi_config.sta.sae_pwe_h2e = WPA3_SAE_PWE_BOTH;
+#endif
 
     ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_STA, &wifi_config), TAG, "set STA config failed");
     ESP_RETURN_ON_ERROR(esp_wifi_connect(), TAG, "STA connect failed");
