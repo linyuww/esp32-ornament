@@ -5,7 +5,16 @@
 #include "settings.h"
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
+
+#define MUSIC_PLAYER_COVER_SIZE 96
+#define MUSIC_PLAYER_COVER_PIXELS (MUSIC_PLAYER_COVER_SIZE * MUSIC_PLAYER_COVER_SIZE)
+#define MUSIC_PLAYER_LYRICS_MAX 1024
+
+#ifndef CONFIG_ORNAMENT_MUSIC_COVER_ENABLED
+#define CONFIG_ORNAMENT_MUSIC_COVER_ENABLED 0
+#endif
 
 typedef enum {
     MUSIC_PLAYER_STATE_IDLE = 0,
@@ -20,12 +29,19 @@ typedef struct {
     bool stop_requested;
     music_player_state_t state;
     uint32_t index;
+    uint32_t playback_ms;
     char song_name[ORNAMENT_TEXT_MAX];
     char artist_name[ORNAMENT_TEXT_MAX];
     char title[ORNAMENT_TEXT_MAX];
     char album[ORNAMENT_TEXT_MAX];
     char picture[ORNAMENT_BRIDGE_URL_MAX];
+    char cover_url[ORNAMENT_BRIDGE_URL_MAX];
+    char lyrics[MUSIC_PLAYER_LYRICS_MAX];
     char last_error[ORNAMENT_TEXT_MAX];
+    bool has_cover;
+#if CONFIG_ORNAMENT_MUSIC_COVER_ENABLED
+    const uint16_t *cover_pixels;
+#endif
 } music_player_snapshot_t;
 
 esp_err_t music_player_init(void);

@@ -1,5 +1,11 @@
 #include "config_portal.h"
 
+#ifndef CONFIG_ORNAMENT_CONFIG_PORTAL_ENABLED
+#define CONFIG_ORNAMENT_CONFIG_PORTAL_ENABLED 0
+#endif
+
+#if CONFIG_ORNAMENT_CONFIG_PORTAL_ENABLED
+
 #include "bridge_client.h"
 #include "esp_check.h"
 #include "esp_http_server.h"
@@ -512,3 +518,17 @@ esp_err_t config_portal_start(void)
     ESP_LOGW(TAG, "provisioning portal started. SSID=%s URL=http://192.168.4.1", ap_ssid);
     return start_http_server();
 }
+
+#else
+
+const char *config_portal_ssid(void)
+{
+    return CONFIG_ORNAMENT_PROV_AP_PREFIX;
+}
+
+esp_err_t config_portal_start(void)
+{
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
+#endif

@@ -1,5 +1,7 @@
 #include "display_core.h"
+#include "music_player.h"
 #include "ornament_state.h"
+#include "xiaozhi_client.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -29,6 +31,44 @@ static uint8_t expand_5_to_8(uint16_t value)
 static uint8_t expand_6_to_8(uint16_t value)
 {
     return (uint8_t)((value << 2) | (value >> 4));
+}
+
+const char *music_player_state_name(music_player_state_t state)
+{
+    switch (state) {
+    case MUSIC_PLAYER_STATE_RESOLVING:
+        return "resolving";
+    case MUSIC_PLAYER_STATE_PLAYING:
+        return "playing";
+    case MUSIC_PLAYER_STATE_STOPPING:
+        return "stopping";
+    case MUSIC_PLAYER_STATE_ERROR:
+        return "error";
+    case MUSIC_PLAYER_STATE_IDLE:
+    default:
+        return "idle";
+    }
+}
+
+const char *xiaozhi_client_state_name(xiaozhi_client_state_t state)
+{
+    switch (state) {
+    case XIAOZHI_CLIENT_STATE_CONNECTING:
+        return "connecting";
+    case XIAOZHI_CLIENT_STATE_LISTENING:
+        return "listening";
+    case XIAOZHI_CLIENT_STATE_SPEAKING:
+        return "speaking";
+    case XIAOZHI_CLIENT_STATE_ERROR:
+        return "error";
+    case XIAOZHI_CLIENT_STATE_CONFIG_MISSING:
+        return "config";
+    case XIAOZHI_CLIENT_STATE_IDLE:
+        return "idle";
+    case XIAOZHI_CLIENT_STATE_DISABLED:
+    default:
+        return "disabled";
+    }
 }
 
 static int write_ppm(const char *path, const uint16_t *pixels)
@@ -110,6 +150,88 @@ static int render_one(const char *output_dir, const char *name, const ornament_s
     } else {
         display_core_render_hud(&canvas, state);
     }
+
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/ui-preview-%s.ppm", output_dir, name);
+    int rc = write_ppm(path, pixels);
+    free(pixels);
+    return rc;
+}
+
+static int render_music(const char *output_dir, const ornament_state_t *state)
+{
+    uint16_t *pixels = calloc(PREVIEW_WIDTH * PREVIEW_HEIGHT, sizeof(uint16_t));
+    uint16_t *cover = calloc(MUSIC_PLAYER_COVER_PIXELS, sizeof(uint16_t));
+    if (pixels == NULL || cover == NULL) {
+        free(pixels);
+        free(cover);
+        fprintf(stderr, "music preview allocation failed\n");
+        return 1;
+    }
+
+    for (int y = 0; y < MUSIC_PLAYER_COVER_SIZE; y++) {
+        for (int x = 0; x < MUSIC_PLAYER_COVER_SIZE; x++) {
+            uint8_t r = (uint8_t)(32 + x * 2);
+            uint8_t g = (uint8_t)(28 + y * 2);
+            uint8_t b = (uint8_t)(180 - (x + y) / 2);
+            cover[y * MUSIC_PLAYER_COVER_SIZE + x] = display_core_rgb565(r, g, b);
+        }
+    }
+
+    music_player_snapshot_t music = {0};
+    music.active = true;
+    music.state = MUSIC_PLAYER_STATE_PLAYING;
+    music.playback_ms = 54000;
+    music.has_cover = true;
+    music.cover_pixels = cover;
+    set_text(music.title, sizeof(music.title), "Bad Guy");
+    set_text(music.artist_name, sizeof(music.artist_name), "Billie Eilish");
+    set_text(
+        music.lyrics,
+        sizeof(music.lyrics),
+        "[00:44.00]White shirt now red\n[00:54.00]Sleeping you're on your tippy toes\n[01:04.00]Creeping around like no one knows\n[01:14.00]Think you're so criminal");
+
+    display_core_canvas_t canvas;
+    display_core_canvas_init(&canvas, PREVIEW_WIDTH, PREVIEW_HEIGHT, pixels);
+    display_core_render_music(&canvas, state, &music);
+
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/ui-preview-music.ppm", output_dir);
+    int rc = write_ppm(path, pixels);
+    free(cover);
+    free(pixels);
+    return rc;
+}
+
+static int render_xiaozhi(
+    const char *output_dir,
+    const ornament_state_t *state,
+    const char *name,
+    xiaozhi_client_state_t xiaozhi_state,
+    bool connected,
+    bool configured,
+    const char *last_stt,
+    const char *last_tts,
+    const char *last_error)
+{
+    uint16_t *pixels = calloc(PREVIEW_WIDTH * PREVIEW_HEIGHT, sizeof(uint16_t));
+    if (pixels == NULL) {
+        fprintf(stderr, "xiaozhi preview allocation failed\n");
+        return 1;
+    }
+
+    xiaozhi_client_snapshot_t xiaozhi = {0};
+    xiaozhi.enabled = true;
+    xiaozhi.configured = configured;
+    xiaozhi.connected = connected;
+    xiaozhi.state = xiaozhi_state;
+    set_text(xiaozhi.last_stt, sizeof(xiaozhi.last_stt), last_stt);
+    set_text(xiaozhi.last_tts, sizeof(xiaozhi.last_tts), last_tts);
+    set_text(xiaozhi.last_error, sizeof(xiaozhi.last_error), last_error);
+
+    display_core_canvas_t canvas;
+    display_core_canvas_init(&canvas, PREVIEW_WIDTH, PREVIEW_HEIGHT, pixels);
+    display_core_render_xiaozhi(&canvas, state, &xiaozhi);
 
     char path[1024];
     snprintf(path, sizeof(path), "%s/ui-preview-%s.ppm", output_dir, name);
@@ -241,6 +363,81 @@ int main(int argc, char **argv)
         return 1;
     }
     if (render_one(output_dir, "clock", &clock, true) != 0) {
+        return 1;
+    }
+    if (render_music(output_dir, &normal) != 0) {
+        return 1;
+    }
+    if (render_xiaozhi(
+            output_dir,
+            &normal,
+            "xiaozhi-idle",
+            XIAOZHI_CLIENT_STATE_IDLE,
+            false,
+            true,
+            "",
+            "",
+            "") != 0) {
+        return 1;
+    }
+    if (render_xiaozhi(
+            output_dir,
+            &normal,
+            "xiaozhi-listening",
+            XIAOZHI_CLIENT_STATE_LISTENING,
+            true,
+            true,
+            "Tomorrow weather?",
+            "",
+            "") != 0) {
+        return 1;
+    }
+    if (render_xiaozhi(
+            output_dir,
+            &normal,
+            "xiaozhi-speaking",
+            XIAOZHI_CLIENT_STATE_SPEAKING,
+            true,
+            true,
+            "Tomorrow weather?",
+            "Cloudy with light rain.",
+            "") != 0) {
+        return 1;
+    }
+    if (render_xiaozhi(
+            output_dir,
+            &normal,
+            "xiaozhi-connecting",
+            XIAOZHI_CLIENT_STATE_CONNECTING,
+            false,
+            true,
+            "",
+            "",
+            "") != 0) {
+        return 1;
+    }
+    if (render_xiaozhi(
+            output_dir,
+            &normal,
+            "xiaozhi-error",
+            XIAOZHI_CLIENT_STATE_ERROR,
+            false,
+            false,
+            "",
+            "",
+            "Check config") != 0) {
+        return 1;
+    }
+    if (render_xiaozhi(
+            output_dir,
+            &normal,
+            "xiaozhi-done",
+            XIAOZHI_CLIENT_STATE_IDLE,
+            true,
+            true,
+            "Tomorrow weather?",
+            "Dialog finished",
+            "") != 0) {
         return 1;
     }
     return 0;

@@ -30,10 +30,19 @@ firmware/**/docs/*.ppm
 
 # Logs and local archives
 *.log
+*.log.err
 *.tgz
 *.tar
 *.tar.gz
 *.zip
+
+# Local firmware/music probes
+tmp_*.raw
+target-music-bridge*/
+firmware/**/tmp_*/
+firmware/**/tmp_*.py
+firmware/**/tmp_*.err
+firmware/**/repro-*.err
 
 # Local secrets / credentials
 .env

@@ -2,7 +2,14 @@
 
 #include "esp_log.h"
 #include "esp_mac.h"
+
+#ifndef CONFIG_ORNAMENT_MDNS_ENABLED
+#define CONFIG_ORNAMENT_MDNS_ENABLED 0
+#endif
+
+#if CONFIG_ORNAMENT_MDNS_ENABLED
 #include "mdns.h"
+#endif
 
 #include <stdbool.h>
 #include <stdio.h>
@@ -66,10 +73,11 @@ esp_err_t device_identity_start_mdns(void)
 {
     ESP_ERROR_CHECK_WITHOUT_ABORT(device_identity_init());
 
-    if (!CONFIG_ORNAMENT_MDNS_ENABLED || mdns_started) {
+    if (mdns_started) {
         return ESP_OK;
     }
 
+#if CONFIG_ORNAMENT_MDNS_ENABLED
     esp_err_t err = mdns_init();
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "mDNS init failed: %s", esp_err_to_name(err));
@@ -82,5 +90,6 @@ esp_err_t device_identity_start_mdns(void)
 
     mdns_started = true;
     ESP_LOGI(TAG, "mDNS started: %s", mdns_url);
+#endif
     return ESP_OK;
 }

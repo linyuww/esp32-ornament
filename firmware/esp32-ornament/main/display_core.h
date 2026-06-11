@@ -1,5 +1,6 @@
 #pragma once
 
+#include "music_player.h"
 #include "ornament_state.h"
 #include "xiaozhi_client.h"
 
@@ -28,6 +29,10 @@ void display_core_render_xiaozhi(
     const ornament_state_t *state,
     const xiaozhi_client_snapshot_t *snapshot);
 void display_core_render_tasks(display_core_canvas_t *canvas, const ornament_state_t *state);
+void display_core_render_music(
+    display_core_canvas_t *canvas,
+    const ornament_state_t *state,
+    const music_player_snapshot_t *snapshot);
 void display_core_render_boot(display_core_canvas_t *canvas);
 void display_core_render_status_message(display_core_canvas_t *canvas, const char *message);
 void display_core_render_error_message(display_core_canvas_t *canvas, const char *message);

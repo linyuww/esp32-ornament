@@ -207,5 +207,6 @@ Invoke-WebRequest http://codex-ornament-4ad4.local/ -UseBasicParsing -TimeoutSec
 - ESP 硬件屏幕保持合并任务视图，不区分 Codex/Claude。
 - 网桥自动匹配优先返回真实 LAN IP。
 - 任务状态由 hook 事件和 session 日志恢复共同维护。
+- Claude transcript hook 会先补齐 source 与稳定 turn 身份，再按 Codex 相同的 source/turn/session 规则闭合任务，避免 stop 后继续导致任务数累加。
 - malformed hook 不改变面板状态。
 - ESP offline 是防抖后的连续失败状态，不代表 PC 网桥一定退出。
