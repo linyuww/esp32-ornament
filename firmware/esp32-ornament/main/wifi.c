@@ -236,7 +236,9 @@ esp_err_t wifi_connect(void)
     strlcpy((char *)wifi_config.sta.ssid, settings.ssid, sizeof(wifi_config.sta.ssid));
     strlcpy((char *)wifi_config.sta.password, settings.password, sizeof(wifi_config.sta.password));
     wifi_config.sta.threshold.authmode = WIFI_AUTH_OPEN;
+#if CONFIG_ESP_WIFI_ENABLE_WPA3_SAE
     wifi_config.sta.sae_pwe_h2e = WPA3_SAE_PWE_BOTH;
+#endif
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));

@@ -25,6 +25,10 @@
 #define CONFIG_ORNAMENT_XIAOZHI_MIC_SLOT_RIGHT 0
 #endif
 
+#ifndef CONFIG_ORNAMENT_TASK_DONE_AUDIO_CLIP_ENABLED
+#define CONFIG_ORNAMENT_TASK_DONE_AUDIO_CLIP_ENABLED 0
+#endif
+
 #if CONFIG_ORNAMENT_AUDIO_ENABLED
 
 #define TASK_DONE_AUDIO_CHUNK_FRAMES 256
@@ -32,8 +36,10 @@
 #define TASK_AUDIO_OUTPUT_PORT I2S_NUM_0
 #define TASK_AUDIO_INPUT_PORT I2S_NUM_1
 
+#if CONFIG_ORNAMENT_TASK_DONE_AUDIO_CLIP_ENABLED
 extern const uint8_t task_done_pcm_start[] asm("_binary_task_done_pcm_start");
 extern const uint8_t task_done_pcm_end[] asm("_binary_task_done_pcm_end");
+#endif
 
 static const char *TAG = "task_audio";
 
@@ -45,7 +51,9 @@ typedef enum {
 
 static i2s_chan_handle_t s_tx_chan;
 static i2s_chan_handle_t s_rx_chan;
+#if CONFIG_ORNAMENT_TASK_DONE_AUDIO_CLIP_ENABLED
 static QueueHandle_t s_play_queue;
+#endif
 static SemaphoreHandle_t s_bus_mutex;
 static SemaphoreHandle_t s_input_session_mutex;
 static bool s_output_enabled;
@@ -220,6 +228,7 @@ static esp_err_t switch_route_locked(audio_route_t target)
     return ESP_ERR_INVALID_ARG;
 }
 
+#if CONFIG_ORNAMENT_TASK_DONE_AUDIO_CLIP_ENABLED
 static void play_task_done_audio(void)
 {
     if (task_audio_output_acquire() != ESP_OK) {
@@ -260,6 +269,7 @@ static void audio_task(void *arg)
         }
     }
 }
+#endif
 
 static esp_err_t init_i2s(void)
 {
@@ -349,7 +359,7 @@ static esp_err_t init_i2s(void)
 
 esp_err_t task_audio_start(void)
 {
-    if (s_play_queue != NULL) {
+    if (s_bus_mutex != NULL) {
         return ESP_OK;
     }
 
@@ -369,6 +379,7 @@ esp_err_t task_audio_start(void)
 
     ESP_RETURN_ON_ERROR(init_i2s(), TAG, "audio init failed");
 
+#if CONFIG_ORNAMENT_TASK_DONE_AUDIO_CLIP_ENABLED
     s_play_queue = xQueueCreate(1, sizeof(uint8_t));
     if (s_play_queue == NULL) {
         return ESP_ERR_NO_MEM;
@@ -378,12 +389,14 @@ esp_err_t task_audio_start(void)
     if (created != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
+#endif
 
     return ESP_OK;
 }
 
 void task_audio_play_done(void)
 {
+#if CONFIG_ORNAMENT_TASK_DONE_AUDIO_CLIP_ENABLED
     if (s_play_queue == NULL) {
         return;
     }
@@ -392,6 +405,9 @@ void task_audio_play_done(void)
     if (xQueueSend(s_play_queue, &request, 0) != pdTRUE) {
         (void)xQueueOverwrite(s_play_queue, &request);
     }
+#else
+    ESP_LOGD(TAG, "local task done PCM clip disabled");
+#endif
 }
 
 void task_audio_set_volume_percent(int volume_percent)

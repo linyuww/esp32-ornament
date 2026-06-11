@@ -63,6 +63,7 @@ config ORNAMENT_PROV_SCAN_MAX
 
 config ORNAMENT_CONFIG_PORTAL_ENABLED
     bool "Enable Wi-Fi provisioning portal"
+    depends on ESP_WIFI_SOFTAP_SUPPORT && LWIP_DHCPS
     default n
     help
         Builds the ESP32 SoftAP web portal for first-time Wi-Fi/bridge setup.
@@ -317,10 +318,21 @@ config ORNAMENT_ASRPRO_TX_WAIT_MS
 endmenu
 
 config ORNAMENT_AUDIO_ENABLED
-    bool "Enable task done voice reminder"
+    bool "Enable I2S audio hardware"
     default y
     help
-        Play the embedded task_done.pcm clip once when a new bridge done event is observed.
+        Initializes the shared I2S speaker/microphone path used by music
+        playback and Xiaozhi voice. This does not embed a task-done clip by
+        itself.
+
+config ORNAMENT_TASK_DONE_AUDIO_CLIP_ENABLED
+    bool "Embed and play local task done PCM clip"
+    depends on ORNAMENT_AUDIO_ENABLED
+    default n
+    help
+        Embeds assets/task_done.pcm and plays it once when a new bridge done
+        event is observed. Keep this disabled in the bridge-first firmware to
+        save flash; use ASRPRO done notification and the display flash instead.
 
 config ORNAMENT_AUDIO_PIN_BCLK
     int "MAX98357A I2S BCLK GPIO"
@@ -348,12 +360,32 @@ config ORNAMENT_XIAOZHI_ENABLED
     bool "Enable Xiaozhi AI voice client"
     default y
     help
-        Builds the Xiaozhi-compatible WebSocket + Opus voice client. The client
-        stays idle until a WebSocket URL and microphone pin are configured.
+        Enables the Xiaozhi assistant page and session controls. The transport
+        can run through the local bridge to save firmware space, or use the
+        legacy direct WebSocket + Opus client for fallback testing.
+
+choice ORNAMENT_XIAOZHI_TRANSPORT
+    prompt "Xiaozhi transport"
+    depends on ORNAMENT_XIAOZHI_ENABLED
+    default ORNAMENT_XIAOZHI_TRANSPORT_BRIDGE
+
+config ORNAMENT_XIAOZHI_TRANSPORT_BRIDGE
+    bool "Local bridge proxy"
+    help
+        Use the PC bridge for Xiaozhi service integration. This keeps the ESP32
+        firmware off the WebSocket and Opus dependencies.
+
+config ORNAMENT_XIAOZHI_TRANSPORT_DIRECT
+    bool "Direct WebSocket + Opus"
+    help
+        Build the original ESP32-side Xiaozhi WebSocket and Opus client. Use
+        this only as a fallback because it costs substantially more flash.
+
+endchoice
 
 config ORNAMENT_XIAOZHI_WS_URL
     string "Xiaozhi WebSocket URL"
-    depends on ORNAMENT_XIAOZHI_ENABLED
+    depends on ORNAMENT_XIAOZHI_TRANSPORT_DIRECT
     default ""
     help
         WebSocket endpoint for a Xiaozhi-compatible server, for example a
@@ -362,7 +394,7 @@ config ORNAMENT_XIAOZHI_WS_URL
 
 config ORNAMENT_XIAOZHI_TOKEN
     string "Xiaozhi access token"
-    depends on ORNAMENT_XIAOZHI_ENABLED
+    depends on ORNAMENT_XIAOZHI_TRANSPORT_DIRECT
     default ""
     help
         Optional bearer token sent in the WebSocket Authorization header.
@@ -381,7 +413,7 @@ config ORNAMENT_XIAOZHI_CLIENT_ID
 
 config ORNAMENT_XIAOZHI_PROTOCOL_VERSION
     int "Xiaozhi binary protocol version"
-    depends on ORNAMENT_XIAOZHI_ENABLED
+    depends on ORNAMENT_XIAOZHI_TRANSPORT_DIRECT
     default 1
     range 1 1
     help
@@ -389,7 +421,7 @@ config ORNAMENT_XIAOZHI_PROTOCOL_VERSION
 
 config ORNAMENT_XIAOZHI_FRAME_MS
     int "Xiaozhi Opus frame duration in milliseconds"
-    depends on ORNAMENT_XIAOZHI_ENABLED
+    depends on ORNAMENT_XIAOZHI_TRANSPORT_DIRECT
     default 60
     range 20 60
     help
@@ -397,27 +429,33 @@ config ORNAMENT_XIAOZHI_FRAME_MS
 
 config ORNAMENT_XIAOZHI_OPUS_COMPLEXITY
     int "Xiaozhi Opus encoder complexity"
-    depends on ORNAMENT_XIAOZHI_ENABLED
+    depends on ORNAMENT_XIAOZHI_TRANSPORT_DIRECT
     default 3
     range 0 10
 
 config ORNAMENT_XIAOZHI_WS_BUFFER_BYTES
     int "Xiaozhi WebSocket receive buffer bytes"
-    depends on ORNAMENT_XIAOZHI_ENABLED
+    depends on ORNAMENT_XIAOZHI_TRANSPORT_DIRECT
     default 2048
     range 1024 8192
 
 config ORNAMENT_XIAOZHI_OPUS_MAX_BYTES
     int "Xiaozhi maximum Opus packet bytes"
-    depends on ORNAMENT_XIAOZHI_ENABLED
+    depends on ORNAMENT_XIAOZHI_TRANSPORT_DIRECT
     default 1500
     range 256 4096
 
 config ORNAMENT_XIAOZHI_CONNECT_TIMEOUT_MS
     int "Xiaozhi connect and hello timeout in milliseconds"
-    depends on ORNAMENT_XIAOZHI_ENABLED
+    depends on ORNAMENT_XIAOZHI_TRANSPORT_DIRECT
     default 10000
     range 2000 60000
+
+config ORNAMENT_XIAOZHI_BRIDGE_TIMEOUT_MS
+    int "Xiaozhi bridge request timeout in milliseconds"
+    depends on ORNAMENT_XIAOZHI_TRANSPORT_BRIDGE
+    default 5000
+    range 1000 30000
 
 config ORNAMENT_XIAOZHI_MIC_PIN_DIN
     int "I2S microphone DOUT GPIO"
@@ -437,27 +475,35 @@ config ORNAMENT_XIAOZHI_MIC_SLOT_RIGHT
 
 config ORNAMENT_XIAOZHI_MCP_ENABLED
     bool "Enable Xiaozhi MCP tool handling"
-    depends on ORNAMENT_XIAOZHI_ENABLED
+    depends on ORNAMENT_XIAOZHI_TRANSPORT_DIRECT
     default y
     help
         Advertise MCP capability in the Xiaozhi hello frame and handle
         inbound JSON-RPC tool calls for local music playback.
 
+config ORNAMENT_MUSIC_PLAYER_ENABLED
+    bool "Enable bridge-backed music playback"
+    depends on ORNAMENT_AUDIO_ENABLED
+    default y
+    help
+        Builds the raw-PCM music player that resolves and streams songs from
+        the local PC bridge.
+
 config ORNAMENT_MUSIC_REQUEST_TIMEOUT_MS
     int "Music HTTP request timeout in milliseconds"
-    depends on ORNAMENT_XIAOZHI_MCP_ENABLED
+    depends on ORNAMENT_MUSIC_PLAYER_ENABLED
     default 10000
     range 1000 60000
 
 config ORNAMENT_MUSIC_STREAM_CHUNK_BYTES
     int "Music stream read chunk bytes"
-    depends on ORNAMENT_XIAOZHI_MCP_ENABLED
+    depends on ORNAMENT_MUSIC_PLAYER_ENABLED
     default 2048
     range 512 8192
 
 config ORNAMENT_MUSIC_COVER_ENABLED
     bool "Fetch and cache music cover on device"
-    depends on ORNAMENT_XIAOZHI_MCP_ENABLED
+    depends on ORNAMENT_MUSIC_PLAYER_ENABLED
     default n
     help
         Downloads bridge-rendered RGB565 cover art and keeps it in the music
