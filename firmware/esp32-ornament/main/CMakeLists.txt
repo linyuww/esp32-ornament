@@ -31,6 +31,10 @@ if(CONFIG_ORNAMENT_STANDBY_WALLPAPER_ENABLED)
   list(APPEND ORNAMENT_SRCS "assets/standby_wallpaper_rgb565.c")
 endif()
 
+if(CONFIG_ORNAMENT_TASK_DONE_AUDIO_CLIP_ENABLED)
+  list(APPEND ORNAMENT_EMBED_FILES "assets/task_done.pcm")
+endif()
+
 set(ORNAMENT_REQUIRES
   driver
   esp_driver_i2s
@@ -65,7 +69,6 @@ endif()
 idf_component_register(
   SRCS ${ORNAMENT_SRCS}
   INCLUDE_DIRS "."
-  EMBED_FILES
-    "assets/task_done.pcm"
+  EMBED_FILES ${ORNAMENT_EMBED_FILES}
   REQUIRES ${ORNAMENT_REQUIRES}
 )

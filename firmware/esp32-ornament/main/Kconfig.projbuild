@@ -317,10 +317,21 @@ config ORNAMENT_ASRPRO_TX_WAIT_MS
 endmenu
 
 config ORNAMENT_AUDIO_ENABLED
-    bool "Enable task done voice reminder"
+    bool "Enable I2S audio hardware"
     default y
     help
-        Play the embedded task_done.pcm clip once when a new bridge done event is observed.
+        Initializes the shared I2S speaker/microphone path used by music
+        playback and Xiaozhi voice. This does not embed a task-done clip by
+        itself.
+
+config ORNAMENT_TASK_DONE_AUDIO_CLIP_ENABLED
+    bool "Embed and play local task done PCM clip"
+    depends on ORNAMENT_AUDIO_ENABLED
+    default n
+    help
+        Embeds assets/task_done.pcm and plays it once when a new bridge done
+        event is observed. Keep this disabled in the bridge-first firmware to
+        save flash; use ASRPRO done notification and the display flash instead.
 
 config ORNAMENT_AUDIO_PIN_BCLK
     int "MAX98357A I2S BCLK GPIO"
