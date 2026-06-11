@@ -9,11 +9,14 @@ Opus backend; if none is present the helper reports a clear bridge status error.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
+import os
 import sys
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional
 
@@ -89,7 +92,103 @@ class MissingOpusBackend:
         )
 
 
+class CtypesOpusBackend:
+    available = True
+    OPUS_APPLICATION_VOIP = 2048
+    OPUS_OK = 0
+    MAX_PACKET_BYTES = 1500
+
+    def __init__(self, lib) -> None:
+        self.lib = lib
+        self._bind()
+        err = ctypes.c_int()
+        self.encoder = self.lib.opus_encoder_create(
+            SAMPLE_RATE, CHANNELS, self.OPUS_APPLICATION_VOIP, ctypes.byref(err)
+        )
+        if err.value != self.OPUS_OK or not self.encoder:
+            raise RuntimeError(f"opus_encoder_create failed: {err.value}")
+        self.decoder = self.lib.opus_decoder_create(
+            SAMPLE_RATE, CHANNELS, ctypes.byref(err)
+        )
+        if err.value != self.OPUS_OK or not self.decoder:
+            self.lib.opus_encoder_destroy(self.encoder)
+            raise RuntimeError(f"opus_decoder_create failed: {err.value}")
+
+    def _bind(self) -> None:
+        self.lib.opus_encoder_create.argtypes = [
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_int),
+        ]
+        self.lib.opus_encoder_create.restype = ctypes.c_void_p
+        self.lib.opus_encoder_destroy.argtypes = [ctypes.c_void_p]
+        self.lib.opus_encoder_destroy.restype = None
+        self.lib.opus_decoder_create.argtypes = [
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_int),
+        ]
+        self.lib.opus_decoder_create.restype = ctypes.c_void_p
+        self.lib.opus_decoder_destroy.argtypes = [ctypes.c_void_p]
+        self.lib.opus_decoder_destroy.restype = None
+        self.lib.opus_encode.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_int16),
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_ubyte),
+            ctypes.c_int32,
+        ]
+        self.lib.opus_encode.restype = ctypes.c_int32
+        self.lib.opus_decode.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_ubyte),
+            ctypes.c_int32,
+            ctypes.POINTER(ctypes.c_int16),
+            ctypes.c_int,
+            ctypes.c_int,
+        ]
+        self.lib.opus_decode.restype = ctypes.c_int
+
+    def encode(self, pcm: bytes) -> bytes:
+        frame_size = len(pcm) // 2
+        pcm_buffer = (ctypes.c_int16 * frame_size).from_buffer_copy(pcm)
+        packet = (ctypes.c_ubyte * self.MAX_PACKET_BYTES)()
+        encoded = self.lib.opus_encode(
+            self.encoder, pcm_buffer, frame_size, packet, self.MAX_PACKET_BYTES
+        )
+        if encoded < 0:
+            raise RuntimeError(f"opus_encode failed: {encoded}")
+        return bytes(packet[:encoded])
+
+    def decode(self, packet: bytes) -> bytes:
+        frame_size = SAMPLE_RATE * FRAME_MS // 1000
+        packet_buffer = (ctypes.c_ubyte * len(packet)).from_buffer_copy(packet)
+        pcm = (ctypes.c_int16 * frame_size)()
+        decoded = self.lib.opus_decode(
+            self.decoder, packet_buffer, len(packet), pcm, frame_size, 0
+        )
+        if decoded < 0:
+            raise RuntimeError(f"opus_decode failed: {decoded}")
+        return bytes(pcm)[: decoded * 2]
+
+    def __del__(self) -> None:
+        encoder = getattr(self, "encoder", None)
+        decoder = getattr(self, "decoder", None)
+        lib = getattr(self, "lib", None)
+        if lib is not None and encoder:
+            lib.opus_encoder_destroy(encoder)
+        if lib is not None and decoder:
+            lib.opus_decoder_destroy(decoder)
+
+
 def load_opus_backend():
+    lib = load_opus_dll()
+    if lib is not None:
+        try:
+            return CtypesOpusBackend(lib)
+        except Exception as error:
+            print(f"ctypes Opus backend failed: {error}", file=sys.stderr)
     try:
         import opuslib  # type: ignore
     except Exception:
@@ -109,6 +208,40 @@ def load_opus_backend():
             return self.decoder.decode(packet, SAMPLE_RATE * FRAME_MS // 1000)
 
     return OpusLibBackend()
+
+
+def load_opus_dll():
+    candidates = []
+    env_path = os.environ.get("CODEX_ORNAMENT_OPUS_DLL")
+    if env_path:
+        candidates.append(Path(env_path))
+    home = Path.home()
+    candidates.extend(
+        [
+            home
+            / "Miniconda3"
+            / "envs"
+            / "chatgpt"
+            / "Lib"
+            / "site-packages"
+            / "discord"
+            / "bin"
+            / "libopus-0.x64.dll",
+            home
+            / "AppData"
+            / "Roaming"
+            / "Python"
+            / f"Python{sys.version_info.major}{sys.version_info.minor}"
+            / "site-packages"
+            / "discord"
+            / "bin"
+            / "libopus-0.x64.dll",
+        ]
+    )
+    for path in candidates:
+        if path.is_file():
+            return ctypes.CDLL(str(path))
+    return None
 
 
 def websocket_headers(args: Args) -> list[str]:
