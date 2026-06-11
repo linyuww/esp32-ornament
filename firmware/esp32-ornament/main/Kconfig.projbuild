@@ -458,7 +458,7 @@ config ORNAMENT_XIAOZHI_BRIDGE_TIMEOUT_MS
 
 config ORNAMENT_XIAOZHI_MIC_PIN_DIN
     int "I2S microphone DOUT GPIO"
-    depends on ORNAMENT_XIAOZHI_TRANSPORT_DIRECT
+    depends on ORNAMENT_XIAOZHI_ENABLED
     default -1
     help
         Set to the I2S microphone data output GPIO. BCLK and WS reuse the
@@ -466,7 +466,7 @@ config ORNAMENT_XIAOZHI_MIC_PIN_DIN
 
 config ORNAMENT_XIAOZHI_MIC_SLOT_RIGHT
     bool "Read microphone samples from right I2S slot"
-    depends on ORNAMENT_XIAOZHI_TRANSPORT_DIRECT
+    depends on ORNAMENT_XIAOZHI_ENABLED
     default n
     help
         Enable when the I2S microphone is wired or strapped to transmit on the

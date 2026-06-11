@@ -40,6 +40,10 @@ const MUSIC_COVER_BYTES: usize = MUSIC_COVER_SIZE as usize * MUSIC_COVER_SIZE as
 const YAOHUD_RESOLVE_ATTEMPTS: usize = 3;
 const YAOHUD_RESOLVE_RETRY_DELAY: Duration = Duration::from_millis(300);
 const MUSIC_STREAM_FALLBACK_ATTEMPTS: u32 = 6;
+const XIAOZHI_PCM_CHUNK_BYTES: usize = 3200;
+const XIAOZHI_UPLINK_BUFFER_MAX_BYTES: usize = 16000 * 2 * 5;
+const XIAOZHI_DOWNLINK_BUFFER_MAX_BYTES: usize = 16000 * 2 * 8;
+const XIAOZHI_DOWNLINK_WAIT_MS: u64 = 250;
 const CAIYUN_DAILY_CALL_BUDGET: u32 = 10_000;
 const CAIYUN_NIGHT_END_HOUR: u32 = 6;
 const CAIYUN_NIGHT_SECONDS: u64 = 6 * 60 * 60;
@@ -437,6 +441,8 @@ struct XiaozhiProxySession {
     last_tts: Option<String>,
     uplink_frames: u64,
     downlink_frames: u64,
+    uplink_pcm: VecDeque<u8>,
+    downlink_pcm: VecDeque<u8>,
     updated_at: Instant,
 }
 
@@ -454,6 +460,8 @@ impl Default for XiaozhiProxySession {
             last_tts: None,
             uplink_frames: 0,
             downlink_frames: 0,
+            uplink_pcm: VecDeque::new(),
+            downlink_pcm: VecDeque::new(),
             updated_at: Instant::now(),
         }
     }
@@ -735,6 +743,15 @@ fn handle_connection(
         }
         ("POST", "/v1/xiaozhi/session/stop") => {
             handle_xiaozhi_session_stop(&mut stream, peer, &state)
+        }
+        ("POST", "/v1/xiaozhi/audio/uplink") => {
+            handle_xiaozhi_audio_uplink(&mut stream, peer, &request, &state)
+        }
+        ("GET", "/v1/xiaozhi/audio/downlink") => {
+            handle_xiaozhi_audio_downlink(&mut stream, peer, &request, &state)
+        }
+        ("POST", "/v1/xiaozhi/audio/inject") => {
+            handle_xiaozhi_audio_inject(&mut stream, peer, &request, &state)
         }
         ("POST", "/hook/codex") | ("POST", "/event") => {
             if !post_allowed(peer, &request, &config) {
@@ -2514,16 +2531,93 @@ fn handle_xiaozhi_session_stop(
     write_json(stream, 200, &response)
 }
 
+fn handle_xiaozhi_audio_uplink(
+    stream: &mut TcpStream,
+    peer: Option<SocketAddr>,
+    request: &HttpRequest,
+    state: &SharedBridgeState,
+) -> io::Result<()> {
+    if !music_get_allowed(peer) {
+        return write_json(stream, 403, &json!({"ok": false, "error": "forbidden"}));
+    }
+    if !looks_like_pcm_s16le(request) {
+        return write_json(
+            stream,
+            400,
+            &json!({"ok": false, "error": "expected pcm_s16le body"}),
+        );
+    }
+
+    let response = xiaozhi_push_uplink_pcm(state, &request.body);
+    write_json(stream, 200, &response)
+}
+
+fn handle_xiaozhi_audio_downlink(
+    stream: &mut TcpStream,
+    peer: Option<SocketAddr>,
+    request: &HttpRequest,
+    state: &SharedBridgeState,
+) -> io::Result<()> {
+    if !music_get_allowed(peer) {
+        return write_json(stream, 403, &json!({"ok": false, "error": "forbidden"}));
+    }
+
+    let query = request_query(request);
+    let max_bytes = query
+        .get("max")
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(XIAOZHI_PCM_CHUNK_BYTES)
+        .min(MAX_BODY_BYTES);
+    let wait_ms = query
+        .get("wait_ms")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(XIAOZHI_DOWNLINK_WAIT_MS)
+        .min(1000);
+    let deadline = Instant::now() + Duration::from_millis(wait_ms);
+
+    loop {
+        if let Some(pcm) = xiaozhi_pop_downlink_pcm(state, max_bytes) {
+            return write_response(stream, 200, "audio/L16; rate=16000; channels=1", &pcm);
+        }
+        if Instant::now() >= deadline {
+            return write_response(stream, 204, "application/octet-stream", b"");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn handle_xiaozhi_audio_inject(
+    stream: &mut TcpStream,
+    peer: Option<SocketAddr>,
+    request: &HttpRequest,
+    state: &SharedBridgeState,
+) -> io::Result<()> {
+    if !music_get_allowed(peer) {
+        return write_json(stream, 403, &json!({"ok": false, "error": "forbidden"}));
+    }
+    if !looks_like_pcm_s16le(request) {
+        return write_json(
+            stream,
+            400,
+            &json!({"ok": false, "error": "expected pcm_s16le body"}),
+        );
+    }
+
+    let response = xiaozhi_push_downlink_pcm(state, &request.body);
+    write_json(stream, 200, &response)
+}
+
 fn xiaozhi_start_session(
     state: &SharedBridgeState,
     request: XiaozhiSessionRequest,
 ) -> XiaozhiProxyStatus {
     let mut state = state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     state.xiaozhi.session_requested = true;
-    state.xiaozhi.connected = false;
-    state.xiaozhi.configured = false;
+    state.xiaozhi.connected = true;
+    state.xiaozhi.configured = true;
     state.xiaozhi.client_id = request.client_id.filter(|value| !value.trim().is_empty());
-    state.xiaozhi.state = XiaozhiProxyState::ConfigMissing;
+    state.xiaozhi.state = XiaozhiProxyState::Listening;
     state.xiaozhi.last_stt = None;
     state.xiaozhi.last_tts = None;
     state.xiaozhi.last_error = Some(match (
@@ -2532,10 +2626,12 @@ fn xiaozhi_start_session(
         request.format.as_deref(),
     ) {
         (Some(sample_rate), Some(channels), Some(format)) => format!(
-            "Xiaozhi bridge audio proxy is not configured yet ({sample_rate} Hz, {channels} ch, {format})"
+            "Xiaozhi PCM bridge ready; upstream proxy pending ({sample_rate} Hz, {channels} ch, {format})"
         ),
-        _ => "Xiaozhi bridge audio proxy is not configured yet".to_string(),
+        _ => "Xiaozhi PCM bridge ready; upstream proxy pending".to_string(),
     });
+    state.xiaozhi.uplink_pcm.clear();
+    state.xiaozhi.downlink_pcm.clear();
     state.xiaozhi.updated_at = Instant::now();
     xiaozhi_status_from_session(&state.xiaozhi)
 }
@@ -2547,8 +2643,90 @@ fn xiaozhi_stop_session(state: &SharedBridgeState) -> XiaozhiProxyStatus {
     state.xiaozhi.configured = false;
     state.xiaozhi.state = XiaozhiProxyState::Idle;
     state.xiaozhi.last_error = None;
+    state.xiaozhi.uplink_pcm.clear();
+    state.xiaozhi.downlink_pcm.clear();
     state.xiaozhi.updated_at = Instant::now();
     xiaozhi_status_from_session(&state.xiaozhi)
+}
+
+fn xiaozhi_push_uplink_pcm(state: &SharedBridgeState, pcm: &[u8]) -> XiaozhiProxyStatus {
+    let mut state = state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !state.xiaozhi.session_requested {
+        state.xiaozhi.session_requested = true;
+        state.xiaozhi.connected = true;
+        state.xiaozhi.configured = true;
+        state.xiaozhi.state = XiaozhiProxyState::Listening;
+    }
+    push_limited_pcm(&mut state.xiaozhi.uplink_pcm, pcm, XIAOZHI_UPLINK_BUFFER_MAX_BYTES);
+    state.xiaozhi.uplink_frames = state
+        .xiaozhi
+        .uplink_frames
+        .saturating_add((pcm.len() / 2) as u64);
+    state.xiaozhi.updated_at = Instant::now();
+    xiaozhi_status_from_session(&state.xiaozhi)
+}
+
+fn xiaozhi_push_downlink_pcm(state: &SharedBridgeState, pcm: &[u8]) -> XiaozhiProxyStatus {
+    let mut state = state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    state.xiaozhi.session_requested = true;
+    state.xiaozhi.connected = true;
+    state.xiaozhi.configured = true;
+    state.xiaozhi.state = XiaozhiProxyState::Speaking;
+    push_limited_pcm(
+        &mut state.xiaozhi.downlink_pcm,
+        pcm,
+        XIAOZHI_DOWNLINK_BUFFER_MAX_BYTES,
+    );
+    state.xiaozhi.updated_at = Instant::now();
+    xiaozhi_status_from_session(&state.xiaozhi)
+}
+
+fn xiaozhi_pop_downlink_pcm(state: &SharedBridgeState, max_bytes: usize) -> Option<Vec<u8>> {
+    let mut state = state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !state.xiaozhi.session_requested || state.xiaozhi.downlink_pcm.is_empty() {
+        return None;
+    }
+
+    let byte_count = max_bytes
+        .min(state.xiaozhi.downlink_pcm.len())
+        .saturating_sub(max_bytes.min(state.xiaozhi.downlink_pcm.len()) % 2);
+    if byte_count == 0 {
+        return None;
+    }
+
+    let mut pcm = Vec::with_capacity(byte_count);
+    for _ in 0..byte_count {
+        if let Some(byte) = state.xiaozhi.downlink_pcm.pop_front() {
+            pcm.push(byte);
+        }
+    }
+    state.xiaozhi.downlink_frames = state
+        .xiaozhi
+        .downlink_frames
+        .saturating_add((pcm.len() / 2) as u64);
+    state.xiaozhi.state = if state.xiaozhi.downlink_pcm.is_empty() {
+        XiaozhiProxyState::Listening
+    } else {
+        XiaozhiProxyState::Speaking
+    };
+    state.xiaozhi.updated_at = Instant::now();
+    Some(pcm)
+}
+
+fn push_limited_pcm(buffer: &mut VecDeque<u8>, pcm: &[u8], limit: usize) {
+    let even_len = pcm.len().saturating_sub(pcm.len() % 2);
+    if even_len == 0 || limit < 2 {
+        return;
+    }
+    let incoming = even_len.min(limit);
+    while buffer.len() + incoming > limit {
+        buffer.pop_front();
+    }
+    buffer.extend(pcm[even_len - incoming..even_len].iter().copied());
+}
+
+fn looks_like_pcm_s16le(request: &HttpRequest) -> bool {
+    request.body.len() % 2 == 0
 }
 
 fn xiaozhi_status_snapshot(state: &SharedBridgeState) -> XiaozhiProxyStatus {
@@ -2734,12 +2912,7 @@ fn music_request_cache_key(request: &MusicRequest) -> String {
 }
 
 fn parse_music_request(request: &HttpRequest) -> io::Result<MusicRequest> {
-    let raw_query = request
-        .raw_path
-        .split_once('?')
-        .map(|(_, query)| query)
-        .unwrap_or("");
-    let query = parse_query_params(raw_query);
+    let query = request_query(request);
 
     let song = query
         .get("song")
@@ -2763,6 +2936,15 @@ fn parse_music_request(request: &HttpRequest) -> io::Result<MusicRequest> {
         artist,
         index,
     })
+}
+
+fn request_query(request: &HttpRequest) -> HashMap<String, String> {
+    let raw_query = request
+        .raw_path
+        .split_once('?')
+        .map(|(_, query)| query)
+        .unwrap_or("");
+    parse_query_params(raw_query)
 }
 
 fn music_stream_url(
@@ -5177,9 +5359,17 @@ mod tests {
             },
         );
         assert!(started.ok);
-        assert_eq!(started.state, "configMissing");
+        assert_eq!(started.state, "listening");
         assert!(started.session_requested);
         assert_eq!(started.client_id.as_deref(), Some("esp32-test"));
+
+        let uplink = xiaozhi_push_uplink_pcm(&state, &[1, 0, 2, 0]);
+        assert_eq!(uplink.uplink_frames, 2);
+
+        let injected = xiaozhi_push_downlink_pcm(&state, &[3, 0, 4, 0, 5, 0]);
+        assert_eq!(injected.state, "speaking");
+        let downlink = xiaozhi_pop_downlink_pcm(&state, 4).unwrap();
+        assert_eq!(downlink, vec![3, 0, 4, 0]);
 
         let stopped = xiaozhi_stop_session(&state);
         assert!(stopped.ok);

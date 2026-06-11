@@ -7,7 +7,9 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
 #include "settings.h"
+#include "task_audio.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -24,6 +26,12 @@
 #define XIAOZHI_BRIDGE_RESPONSE_MAX 1536
 #define XIAOZHI_BRIDGE_URL_MAX 192
 #define XIAOZHI_BRIDGE_SESSION_ID_DEFAULT "bridge"
+#define XIAOZHI_BRIDGE_PCM_FRAME_MS 100
+#define XIAOZHI_BRIDGE_PCM_FRAMES (ORNAMENT_AUDIO_SAMPLE_RATE_HZ * XIAOZHI_BRIDGE_PCM_FRAME_MS / 1000)
+#define XIAOZHI_BRIDGE_PCM_BYTES (XIAOZHI_BRIDGE_PCM_FRAMES * sizeof(int16_t))
+#define XIAOZHI_BRIDGE_AUDIO_HTTP_TIMEOUT_MS 1500
+#define XIAOZHI_BRIDGE_AUDIO_TASK_STACK 6144
+#define XIAOZHI_BRIDGE_AUDIO_TASK_PRIO 5
 
 static const char *TAG = "xiaozhi_bridge";
 
@@ -36,6 +44,10 @@ typedef struct {
 static SemaphoreHandle_t s_mutex;
 static xiaozhi_client_snapshot_t s_snapshot;
 static bool s_initialized;
+static TaskHandle_t s_uplink_task;
+static TaskHandle_t s_downlink_task;
+static int16_t s_uplink_pcm[XIAOZHI_BRIDGE_PCM_FRAMES];
+static int16_t s_downlink_pcm[XIAOZHI_BRIDGE_PCM_FRAMES];
 
 static esp_err_t http_event_handler(esp_http_client_event_t *event)
 {
@@ -43,13 +55,15 @@ static esp_err_t http_event_handler(esp_http_client_event_t *event)
     if (event->event_id != HTTP_EVENT_ON_DATA || buffer == NULL || event->data == NULL) {
         return ESP_OK;
     }
-    if (buffer->length + event->data_len >= buffer->capacity) {
+    if (buffer->length + event->data_len > buffer->capacity) {
         ESP_LOGW(TAG, "bridge response too large");
         return ESP_FAIL;
     }
     memcpy(buffer->data + buffer->length, event->data, event->data_len);
     buffer->length += event->data_len;
-    buffer->data[buffer->length] = '\0';
+    if (buffer->length < buffer->capacity) {
+        buffer->data[buffer->length] = '\0';
+    }
     return ESP_OK;
 }
 
@@ -148,6 +162,56 @@ static esp_err_t bridge_request(
     esp_err_t err = esp_http_client_perform(client);
     if (http_status != NULL) {
         *http_status = esp_http_client_get_status_code(client);
+    }
+    esp_http_client_cleanup(client);
+    return err;
+}
+
+static esp_err_t bridge_binary_request(
+    const char *url,
+    esp_http_client_method_t method,
+    const void *body,
+    int body_len,
+    const char *content_type,
+    void *response,
+    int response_capacity,
+    int *response_len,
+    int *http_status,
+    int timeout_ms)
+{
+    if (url == NULL || url[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    xiaozhi_bridge_response_t buffer = {
+        .data = (char *)response,
+        .length = 0,
+        .capacity = response_capacity,
+    };
+    esp_http_client_config_t config = {
+        .url = url,
+        .event_handler = response != NULL && response_capacity > 0 ? http_event_handler : NULL,
+        .user_data = response != NULL && response_capacity > 0 ? &buffer : NULL,
+        .timeout_ms = timeout_ms,
+    };
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (client == NULL) {
+        return ESP_FAIL;
+    }
+
+    esp_http_client_set_method(client, method);
+    if (body != NULL && body_len > 0) {
+        esp_http_client_set_header(client, "Content-Type", content_type != NULL ? content_type : "application/octet-stream");
+        esp_http_client_set_post_field(client, (const char *)body, body_len);
+    }
+
+    esp_err_t err = esp_http_client_perform(client);
+    if (http_status != NULL) {
+        *http_status = esp_http_client_get_status_code(client);
+    }
+    if (response_len != NULL) {
+        *response_len = buffer.length;
     }
     esp_http_client_cleanup(client);
     return err;
@@ -269,6 +333,45 @@ static void set_error_locked(const char *message)
     strlcpy(s_snapshot.last_error, message != NULL ? message : "bridge error", sizeof(s_snapshot.last_error));
 }
 
+static bool session_requested_locked(void)
+{
+    return s_snapshot.session_requested;
+}
+
+static bool session_requested_active(void)
+{
+    if (s_mutex == NULL) {
+        return false;
+    }
+    bool requested = false;
+    if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+        requested = session_requested_locked();
+        xSemaphoreGive(s_mutex);
+    }
+    return requested;
+}
+
+static void mark_audio_error(const char *message)
+{
+    if (s_mutex != NULL && xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        if (s_snapshot.session_requested) {
+            set_error_locked(message);
+        }
+        xSemaphoreGive(s_mutex);
+    }
+}
+
+static void set_audio_state(xiaozhi_client_state_t state)
+{
+    if (s_mutex != NULL && xSemaphoreTake(s_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+        if (s_snapshot.session_requested && s_snapshot.state != XIAOZHI_CLIENT_STATE_ERROR) {
+            s_snapshot.state = state;
+            s_snapshot.connected = true;
+        }
+        xSemaphoreGive(s_mutex);
+    }
+}
+
 static void load_local_config_locked(const ornament_settings_t *settings)
 {
     s_snapshot.enabled = true;
@@ -316,12 +419,214 @@ static esp_err_t refresh_status_with_settings(const ornament_settings_t *setting
     return err;
 }
 
+static void bridge_audio_uplink_task(void *arg)
+{
+    ornament_settings_t settings = *(ornament_settings_t *)arg;
+    free(arg);
+
+    char url[XIAOZHI_BRIDGE_URL_MAX] = {0};
+    esp_err_t err = build_bridge_endpoint(&settings, "/v1/xiaozhi/audio/uplink", url, sizeof(url));
+    if (err != ESP_OK) {
+        mark_audio_error("uplink url invalid");
+        goto done;
+    }
+
+    err = task_audio_input_start();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "mic start failed: %s", esp_err_to_name(err));
+        mark_audio_error("microphone unavailable");
+        goto done;
+    }
+
+    ESP_LOGI(TAG, "Xiaozhi PCM uplink task started");
+    while (session_requested_active()) {
+        err = task_audio_input_read_mono(s_uplink_pcm, XIAOZHI_BRIDGE_PCM_FRAMES, XIAOZHI_BRIDGE_AUDIO_HTTP_TIMEOUT_MS);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "mic read failed: %s", esp_err_to_name(err));
+            mark_audio_error("microphone read failed");
+            break;
+        }
+
+        int http_status = -1;
+        err = bridge_binary_request(
+            url,
+            HTTP_METHOD_POST,
+            s_uplink_pcm,
+            XIAOZHI_BRIDGE_PCM_BYTES,
+            "audio/L16; rate=16000; channels=1",
+            NULL,
+            0,
+            NULL,
+            &http_status,
+            XIAOZHI_BRIDGE_AUDIO_HTTP_TIMEOUT_MS);
+        if (err != ESP_OK || http_status < 200 || http_status >= 300) {
+            ESP_LOGW(TAG, "uplink post failed: err=%s status=%d", esp_err_to_name(err), http_status);
+            mark_audio_error("bridge uplink failed");
+            break;
+        }
+        set_audio_state(XIAOZHI_CLIENT_STATE_LISTENING);
+    }
+
+    task_audio_input_stop();
+
+done:
+    ESP_LOGI(TAG, "Xiaozhi PCM uplink task stopped");
+    if (s_mutex != NULL && xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        s_uplink_task = NULL;
+        xSemaphoreGive(s_mutex);
+    } else {
+        s_uplink_task = NULL;
+    }
+    vTaskDelete(NULL);
+}
+
+static void bridge_audio_downlink_task(void *arg)
+{
+    ornament_settings_t settings = *(ornament_settings_t *)arg;
+    free(arg);
+
+    char url[XIAOZHI_BRIDGE_URL_MAX] = {0};
+    esp_err_t err = build_bridge_endpoint(&settings, "/v1/xiaozhi/audio/downlink?max=3200&wait_ms=250", url, sizeof(url));
+    if (err != ESP_OK) {
+        mark_audio_error("downlink url invalid");
+        goto done;
+    }
+
+    bool output_acquired = false;
+    ESP_LOGI(TAG, "Xiaozhi PCM downlink task started");
+    while (session_requested_active()) {
+        int http_status = -1;
+        int response_len = 0;
+        err = bridge_binary_request(
+            url,
+            HTTP_METHOD_GET,
+            NULL,
+            0,
+            NULL,
+            s_downlink_pcm,
+            XIAOZHI_BRIDGE_PCM_BYTES,
+            &response_len,
+            &http_status,
+            XIAOZHI_BRIDGE_AUDIO_HTTP_TIMEOUT_MS);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "downlink get failed: %s status=%d", esp_err_to_name(err), http_status);
+            mark_audio_error("bridge downlink failed");
+            break;
+        }
+        if (http_status == 204 || response_len == 0) {
+            if (output_acquired) {
+                task_audio_output_release();
+                output_acquired = false;
+            }
+            set_audio_state(XIAOZHI_CLIENT_STATE_LISTENING);
+            continue;
+        }
+        if (http_status < 200 || http_status >= 300) {
+            ESP_LOGW(TAG, "downlink bad status=%d", http_status);
+            mark_audio_error("bridge downlink status failed");
+            break;
+        }
+        if ((response_len % sizeof(int16_t)) != 0) {
+            ESP_LOGW(TAG, "downlink odd pcm bytes=%d", response_len);
+            continue;
+        }
+        if (!output_acquired) {
+            err = task_audio_output_acquire_with_volume(&settings);
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG, "downlink output acquire failed: %s", esp_err_to_name(err));
+                mark_audio_error("speaker unavailable");
+                break;
+            }
+            output_acquired = true;
+        }
+        set_audio_state(XIAOZHI_CLIENT_STATE_SPEAKING);
+        err = task_audio_output_write_mono(s_downlink_pcm, response_len / sizeof(int16_t), 1000);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "downlink output write failed: %s", esp_err_to_name(err));
+            mark_audio_error("speaker write failed");
+            break;
+        }
+    }
+
+    if (output_acquired) {
+        task_audio_output_release();
+    }
+
+done:
+    ESP_LOGI(TAG, "Xiaozhi PCM downlink task stopped");
+    if (s_mutex != NULL && xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        s_downlink_task = NULL;
+        xSemaphoreGive(s_mutex);
+    } else {
+        s_downlink_task = NULL;
+    }
+    vTaskDelete(NULL);
+}
+
+static esp_err_t start_bridge_audio_tasks(const ornament_settings_t *settings)
+{
+    if (settings == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (s_uplink_task != NULL || s_downlink_task != NULL) {
+        return ESP_OK;
+    }
+
+    ornament_settings_t *uplink_settings = calloc(1, sizeof(*uplink_settings));
+    ornament_settings_t *downlink_settings = calloc(1, sizeof(*downlink_settings));
+    if (uplink_settings == NULL || downlink_settings == NULL) {
+        free(uplink_settings);
+        free(downlink_settings);
+        return ESP_ERR_NO_MEM;
+    }
+    *uplink_settings = *settings;
+    *downlink_settings = *settings;
+
+    BaseType_t created = xTaskCreate(
+        bridge_audio_uplink_task,
+        "xz_uplink",
+        XIAOZHI_BRIDGE_AUDIO_TASK_STACK,
+        uplink_settings,
+        XIAOZHI_BRIDGE_AUDIO_TASK_PRIO,
+        &s_uplink_task);
+    if (created != pdPASS) {
+        free(uplink_settings);
+        free(downlink_settings);
+        s_uplink_task = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+
+    created = xTaskCreate(
+        bridge_audio_downlink_task,
+        "xz_downlink",
+        XIAOZHI_BRIDGE_AUDIO_TASK_STACK,
+        downlink_settings,
+        XIAOZHI_BRIDGE_AUDIO_TASK_PRIO,
+        &s_downlink_task);
+    if (created != pdPASS) {
+        free(downlink_settings);
+        s_downlink_task = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+
+    return ESP_OK;
+}
+
 static esp_err_t post_session_command(const char *path, bool request_session)
 {
     ESP_RETURN_ON_ERROR(xiaozhi_client_init(), TAG, "init failed");
 
     ornament_settings_t settings;
     ESP_RETURN_ON_ERROR(settings_load(&settings), TAG, "settings load failed");
+
+    if (!request_session && s_mutex != NULL && xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        s_snapshot.session_requested = false;
+        s_snapshot.connected = false;
+        if (s_snapshot.state != XIAOZHI_CLIENT_STATE_DISABLED) {
+            s_snapshot.state = XIAOZHI_CLIENT_STATE_IDLE;
+        }
+        xSemaphoreGive(s_mutex);
+    }
 
     char url[XIAOZHI_BRIDGE_URL_MAX] = {0};
     ESP_RETURN_ON_ERROR(build_bridge_endpoint(&settings, path, url, sizeof(url)), TAG, "build command endpoint");
@@ -362,6 +667,13 @@ static esp_err_t post_session_command(const char *path, bool request_session)
     }
 
     free(response);
+    if (err == ESP_OK && request_session) {
+        esp_err_t audio_err = start_bridge_audio_tasks(&settings);
+        if (audio_err != ESP_OK) {
+            mark_audio_error("audio task start failed");
+            return audio_err;
+        }
+    }
     return err;
 }
 
