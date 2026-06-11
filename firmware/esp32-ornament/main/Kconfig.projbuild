@@ -61,6 +61,14 @@ config ORNAMENT_PROV_SCAN_MAX
     default 16
     range 4 32
 
+config ORNAMENT_CONFIG_PORTAL_ENABLED
+    bool "Enable Wi-Fi provisioning portal"
+    default n
+    help
+        Builds the ESP32 SoftAP web portal for first-time Wi-Fi/bridge setup.
+        Keep this disabled in the bridge-first firmware to avoid linking the
+        HTTP server. Re-enable it for first-time setup or after erasing NVS.
+
 config ORNAMENT_HOSTNAME_PREFIX
     string "Network hostname prefix"
     default "codex-ornament"
@@ -68,9 +76,18 @@ config ORNAMENT_HOSTNAME_PREFIX
         The firmware appends the last two STA MAC bytes, for example
         codex-ornament-4ad4.local.
 
+config ORNAMENT_WEB_CONSOLE_ENABLED
+    bool "Enable device web console"
+    default n
+    help
+        Builds the ESP32-hosted LAN web console and /status endpoint. Keep this
+        disabled in the bridge-first firmware to save flash/IRAM; use the local
+        PC bridge endpoints for status and configuration instead.
+
 config ORNAMENT_MDNS_ENABLED
     bool "Advertise local web console with mDNS"
-    default y
+    depends on ORNAMENT_WEB_CONSOLE_ENABLED
+    default n
 
 config ORNAMENT_POLL_INTERVAL_MS
     int "Bridge poll interval in milliseconds"
@@ -89,6 +106,14 @@ config ORNAMENT_UI_FRAME_MS
     int "Animated UI frame interval in milliseconds"
     default 250
     range 100 2000
+
+config ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
+    bool "Enable rich Xiaozhi display overlay"
+    default n
+    help
+        Builds the LVGL Xiaozhi chat overlay and bundled Chinese fonts. Keep
+        this disabled in the bridge-first firmware to save substantial flash.
+        The lightweight canvas Xiaozhi status page remains available.
 
 menu "Page button"
 
@@ -163,6 +188,14 @@ config ORNAMENT_TIMEZONE
     default "CST-8"
     help
         POSIX timezone string used by localtime_r(). CST-8 means UTC+8.
+
+config ORNAMENT_LOCAL_WEATHER_ENABLED
+    bool "Fetch weather directly on device"
+    default n
+    help
+        Builds the ESP32-side weather HTTP client. Keep this disabled in the
+        bridge-first firmware because the local PC bridge already includes
+        weather in /state.
 
 config ORNAMENT_WEATHER_LABEL
     string "Default weather label"
@@ -422,6 +455,15 @@ config ORNAMENT_MUSIC_STREAM_CHUNK_BYTES
     default 2048
     range 512 8192
 
+config ORNAMENT_MUSIC_COVER_ENABLED
+    bool "Fetch and cache music cover on device"
+    depends on ORNAMENT_XIAOZHI_MCP_ENABLED
+    default n
+    help
+        Downloads bridge-rendered RGB565 cover art and keeps it in the music
+        snapshot. The bridge preprocesses artwork to a fixed 96x96 RGB565
+        frame so the device does not need JPEG or PNG decoding.
+
 endmenu
 
 config ORNAMENT_STANDBY_CLOCK_MS
@@ -430,6 +472,14 @@ config ORNAMENT_STANDBY_CLOCK_MS
     range 0 3600000
     help
         Set 0 to disable the dedicated standby clock page. Idle status switches to clock after this duration.
+
+config ORNAMENT_STANDBY_WALLPAPER_ENABLED
+    bool "Embed standby wallpaper bitmap"
+    default n
+    help
+        Builds the 240x240 RGB565 standby wallpaper into firmware. Keep this
+        disabled in the bridge-first firmware to save flash; the standby page
+        uses a lightweight procedural background instead.
 
 config ORNAMENT_DISPLAY_DRIVER
     string "Display driver variant"

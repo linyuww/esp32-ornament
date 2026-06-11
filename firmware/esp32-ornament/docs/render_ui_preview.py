@@ -16,6 +16,13 @@ PREVIEW_NAMES = [
     "done-flash-running",
     "unsynced",
     "clock",
+    "music",
+    "xiaozhi-idle",
+    "xiaozhi-listening",
+    "xiaozhi-speaking",
+    "xiaozhi-connecting",
+    "xiaozhi-error",
+    "xiaozhi-done",
 ]
 
 
@@ -41,6 +48,10 @@ def build_preview_tool(project_root: Path) -> Path:
         "-Werror",
         "-DCONFIG_ORNAMENT_QUOTA_CRITICAL_PERCENT=10",
         "-DCONFIG_ORNAMENT_QUOTA_WARN_PERCENT=25",
+        "-DCONFIG_ORNAMENT_MUSIC_COVER_ENABLED=1",
+        "-DCONFIG_ORNAMENT_STANDBY_WALLPAPER_ENABLED=1",
+        "-I",
+        str(docs_dir),
         "-I",
         str(main_dir),
         "-o",

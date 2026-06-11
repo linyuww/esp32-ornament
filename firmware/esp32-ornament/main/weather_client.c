@@ -1,5 +1,11 @@
 #include "weather_client.h"
 
+#ifndef CONFIG_ORNAMENT_LOCAL_WEATHER_ENABLED
+#define CONFIG_ORNAMENT_LOCAL_WEATHER_ENABLED 0
+#endif
+
+#if CONFIG_ORNAMENT_LOCAL_WEATHER_ENABLED
+
 #include "cJSON.h"
 #include "esp_crt_bundle.h"
 #include "esp_http_client.h"
@@ -612,3 +618,26 @@ void weather_client_settings_changed(void)
         xTaskNotifyGive(client_state.task);
     }
 }
+
+#else
+
+esp_err_t weather_client_start(void)
+{
+    return ESP_OK;
+}
+
+void weather_client_apply(ornament_state_t *state)
+{
+    (void)state;
+}
+
+bool weather_client_token_configured(void)
+{
+    return false;
+}
+
+void weather_client_settings_changed(void)
+{
+}
+
+#endif

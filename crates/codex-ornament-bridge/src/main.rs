@@ -8,15 +8,16 @@ use std::{
     borrow::Cow,
     collections::{HashMap, HashSet, VecDeque},
     env,
-    fs::{self, File},
+    fs::{self, File, OpenOptions},
     io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket},
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::{Child, ChildStdout, Command, ExitStatus, Stdio},
     sync::{
         mpsc::{self, Receiver, SyncSender, TrySendError},
         Arc, Mutex,
     },
+    thread::JoinHandle,
     time::{Duration, Instant},
 };
 
@@ -27,13 +28,18 @@ const MAX_STATE_TASKS: usize = 8;
 const MAX_TASK_HISTORY: usize = 16;
 const TASK_EVENT_QUEUE_CAPACITY: usize = 64;
 const TASK_EVENT_ACK_TIMEOUT: Duration = Duration::from_millis(750);
+const DEFAULT_EVENT_LOG_MAX_BYTES: u64 = 8 * 1024 * 1024;
+const DEFAULT_EVENT_LOG_COMPACT_KEEP_EVENTS: usize = 4096;
 const QUOTA_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const QUOTA_CACHE_TTL: Duration = QUOTA_REFRESH_INTERVAL;
 const DEFAULT_WEATHER_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
 const MUSIC_RESOLVE_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
 const MUSIC_RESOLVE_CACHE_MAX: usize = 32;
+const MUSIC_COVER_SIZE: u32 = 96;
+const MUSIC_COVER_BYTES: usize = MUSIC_COVER_SIZE as usize * MUSIC_COVER_SIZE as usize * 2;
 const YAOHUD_RESOLVE_ATTEMPTS: usize = 3;
 const YAOHUD_RESOLVE_RETRY_DELAY: Duration = Duration::from_millis(300);
+const MUSIC_STREAM_FALLBACK_ATTEMPTS: u32 = 6;
 const CAIYUN_DAILY_CALL_BUDGET: u32 = 10_000;
 const CAIYUN_NIGHT_END_HOUR: u32 = 6;
 const CAIYUN_NIGHT_SECONDS: u64 = 6 * 60 * 60;
@@ -97,8 +103,12 @@ struct CachedActiveRecovery {
 struct BridgeConfig {
     bind: String,
     token: Option<String>,
+    event_log_path: Option<PathBuf>,
+    event_log_max_bytes: u64,
+    event_log_compact_keep_events: usize,
     yaohud_key: Option<String>,
     music_public_base_url: Option<String>,
+    music_public_base_url_locked: bool,
     tracked_session_id: Option<String>,
     codex_home: PathBuf,
     weather_latitude: f64,
@@ -127,7 +137,7 @@ struct HttpRequest {
     body: Vec<u8>,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 struct TaskEvent {
     kind: String,
@@ -255,6 +265,23 @@ struct SourceTaskSummary {
 struct BridgeInfo {
     service: &'static str,
     observed_at: String,
+    event_log_enabled: bool,
+    event_log_path: Option<String>,
+    event_log_bytes: Option<u64>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReadyInfo {
+    ok: bool,
+    service: &'static str,
+    observed_at: String,
+    bind: String,
+    event_log_enabled: bool,
+    event_log_path: Option<String>,
+    event_log_bytes: Option<u64>,
+    event_log_writable: bool,
+    event_log_error: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -298,6 +325,13 @@ struct QueuedTaskEvent {
     completion: SyncSender<TaskDispatchResult>,
 }
 
+struct TaskEventJournal {
+    path: PathBuf,
+    file: File,
+    max_bytes: u64,
+    compact_keep_events: usize,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TaskDispatchResult {
     Applied,
@@ -331,12 +365,13 @@ struct MusicResolveResponse {
     title: String,
     album: String,
     picture: String,
+    cover_url: String,
     url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     lyrics: Option<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct MusicRequest {
     song: String,
     artist: Option<String>,
@@ -352,6 +387,23 @@ struct ResolvedSong {
     picture: String,
     url: String,
     lyrics: Option<String>,
+}
+
+struct ReadyPcmStream {
+    child: Child,
+    stdout: ChildStdout,
+    stderr_thread: Option<JoinHandle<String>>,
+    first_chunk: Vec<u8>,
+}
+
+impl Drop for ReadyPcmStream {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if let Some(stderr_thread) = self.stderr_thread.take() {
+            let _ = stderr_thread.join();
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -440,6 +492,26 @@ struct NeteaseArtist {
 #[derive(Debug, Deserialize)]
 struct NeteaseAlbum {
     name: String,
+    #[serde(default, rename = "picUrl")]
+    pic_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NeteaseLyricResponse {
+    #[serde(default)]
+    lrc: Option<NeteaseLyricData>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NeteaseLyricData {
+    #[serde(default)]
+    lyric: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NeteaseSongDetailResponse {
+    #[serde(default)]
+    songs: Vec<NeteaseSong>,
 }
 
 fn main() {
@@ -450,15 +522,22 @@ fn main() {
 }
 
 fn run() -> io::Result<()> {
+    let codex_home = codex_home();
     let config = BridgeConfig {
         bind: env::var("CODEX_ORNAMENT_BIND").unwrap_or_else(|_| DEFAULT_BIND.to_string()),
         token: env::var("CODEX_ORNAMENT_TOKEN")
             .ok()
             .filter(|value| !value.trim().is_empty()),
+        event_log_path: bridge_event_log_path(&codex_home),
+        event_log_max_bytes: env_u64("CODEX_ORNAMENT_EVENT_LOG_MAX_BYTES")
+            .unwrap_or(DEFAULT_EVENT_LOG_MAX_BYTES),
+        event_log_compact_keep_events: env_usize("CODEX_ORNAMENT_EVENT_LOG_COMPACT_KEEP_EVENTS")
+            .unwrap_or(DEFAULT_EVENT_LOG_COMPACT_KEEP_EVENTS),
         yaohud_key: env_text("CODEX_ORNAMENT_YAOHUD_KEY"),
         music_public_base_url: env_text("CODEX_ORNAMENT_MUSIC_PUBLIC_BASE_URL"),
+        music_public_base_url_locked: env_truthy("CODEX_ORNAMENT_LOCK_MUSIC_PUBLIC_BASE_URL"),
         tracked_session_id: env_text("CODEX_ORNAMENT_SESSION_ID"),
-        codex_home: codex_home(),
+        codex_home,
         weather_latitude: env_f64("CODEX_ORNAMENT_WEATHER_LAT").unwrap_or(DEFAULT_WEATHER_LATITUDE),
         weather_longitude: env_f64("CODEX_ORNAMENT_WEATHER_LON")
             .unwrap_or(DEFAULT_WEATHER_LONGITUDE),
@@ -473,9 +552,20 @@ fn run() -> io::Result<()> {
             .or_else(|| env_text("CODEX_ORNAMENT_CAIYUN_KEY")),
     };
     let listener = TcpListener::bind(&config.bind)?;
-    let state = Arc::new(Mutex::new(BridgeState::default()));
+    let restored_state = restore_bridge_state_from_event_log(config.event_log_path.as_deref());
+    let state = Arc::new(Mutex::new(restored_state));
+    let event_journal = TaskEventJournal::open(
+        config.event_log_path.as_deref(),
+        config.event_log_max_bytes,
+        config.event_log_compact_keep_events,
+    );
     let (task_events, task_event_receiver) = mpsc::sync_channel(TASK_EVENT_QUEUE_CAPACITY);
-    spawn_task_event_consumer(Arc::clone(&state), config.clone(), task_event_receiver);
+    spawn_task_event_consumer(
+        Arc::clone(&state),
+        config.clone(),
+        event_journal,
+        task_event_receiver,
+    );
     spawn_discovery_responder(config.clone());
     spawn_quota_refresh_loop(Arc::clone(&state));
 
@@ -513,6 +603,20 @@ fn handle_connection(
         ("GET", "/health") => {
             write_response(&mut stream, 200, "text/plain; charset=utf-8", b"ok\n")
         }
+        ("GET", "/ready") => {
+            let ready = ready_info(&config);
+            let status = if ready.ok { 200 } else { 503 };
+            write_json(&mut stream, status, &ready)
+        }
+        ("GET", "/metrics") => {
+            let metrics = bridge_metrics(&state, &config);
+            write_response(
+                &mut stream,
+                200,
+                "text/plain; version=0.0.4; charset=utf-8",
+                metrics.as_bytes(),
+            )
+        }
         ("GET", "/discover") => write_json(&mut stream, 200, &discover_info(&config)?),
         ("GET", "/quota") => {
             let quota = cached_or_refresh_quota(&state);
@@ -532,10 +636,7 @@ fn handle_connection(
                 unmatched_stop_count: snapshot.unmatched_stop_count,
                 quota: cached_or_refresh_quota_background(&state),
                 weather: cached_or_refresh_weather(&state, &config),
-                bridge: BridgeInfo {
-                    service: "codex-ornament-bridge",
-                    observed_at: now_local(),
-                },
+                bridge: bridge_info(&config),
             };
             write_json(&mut stream, 200, &response)
         }
@@ -544,6 +645,9 @@ fn handle_connection(
         }
         ("GET", "/v1/music/stream") => {
             handle_music_stream(&mut stream, peer, &request, &state, &config)
+        }
+        ("GET", "/v1/music/cover") => {
+            handle_music_cover(&mut stream, peer, &request, &state, &config)
         }
         ("POST", "/hook/codex") | ("POST", "/event") => {
             if !post_allowed(peer, &request, &config) {
@@ -704,9 +808,10 @@ fn hook_payload_is_control_only(payload: &Value) -> bool {
 fn spawn_task_event_consumer(
     state: SharedBridgeState,
     config: BridgeConfig,
+    journal: Option<TaskEventJournal>,
     receiver: TaskEventReceiver,
 ) {
-    std::thread::spawn(move || consume_task_events(state, config, receiver));
+    std::thread::spawn(move || consume_task_events(state, config, journal, receiver));
 }
 
 fn spawn_discovery_responder(config: BridgeConfig) {
@@ -748,13 +853,255 @@ fn run_discovery_responder(config: BridgeConfig) -> io::Result<()> {
     }
 }
 
+fn bridge_info(config: &BridgeConfig) -> BridgeInfo {
+    BridgeInfo {
+        service: "codex-ornament-bridge",
+        observed_at: now_local(),
+        event_log_enabled: config.event_log_path.is_some(),
+        event_log_path: config
+            .event_log_path
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        event_log_bytes: config.event_log_path.as_deref().and_then(event_log_size),
+    }
+}
+
+fn ready_info(config: &BridgeConfig) -> ReadyInfo {
+    let (event_log_writable, event_log_error) = match config.event_log_path.as_deref() {
+        Some(path) => match probe_event_log_writable(path) {
+            Ok(()) => (true, None),
+            Err(error) => (false, Some(error.to_string())),
+        },
+        None => (true, None),
+    };
+
+    ReadyInfo {
+        ok: event_log_writable,
+        service: "codex-ornament-bridge",
+        observed_at: now_local(),
+        bind: config.bind.clone(),
+        event_log_enabled: config.event_log_path.is_some(),
+        event_log_path: config
+            .event_log_path
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        event_log_bytes: config.event_log_path.as_deref().and_then(event_log_size),
+        event_log_writable,
+        event_log_error,
+    }
+}
+
+fn bridge_metrics(state: &SharedBridgeState, config: &BridgeConfig) -> String {
+    let ready = ready_info(config);
+    let (
+        active_task_count,
+        done_seq,
+        codex_done_seq,
+        claude_done_seq,
+        done_task_count,
+        unmatched_stop_count,
+        quota_refreshing,
+        weather_refreshing,
+    ) = match state.lock() {
+        Ok(state) => (
+            state.active_tasks.len(),
+            state.done_seq,
+            state.codex_done_seq,
+            state.claude_done_seq,
+            state.done_tasks.len(),
+            state.unmatched_stops.len(),
+            state.quota_refreshing,
+            state.weather_refreshing,
+        ),
+        Err(_) => (0, 0, 0, 0, 0, 0, false, false),
+    };
+
+    let event_log_bytes = ready.event_log_bytes.unwrap_or(0);
+    let mut metrics = String::with_capacity(768);
+    push_metric_help(
+        &mut metrics,
+        "codex_ornament_bridge_ready",
+        "1 when the bridge readiness checks pass.",
+    );
+    push_metric_gauge(
+        &mut metrics,
+        "codex_ornament_bridge_ready",
+        bool_metric(ready.ok),
+    );
+    push_metric_help(
+        &mut metrics,
+        "codex_ornament_bridge_event_log_writable",
+        "1 when the task event journal can be opened for append.",
+    );
+    push_metric_gauge(
+        &mut metrics,
+        "codex_ornament_bridge_event_log_writable",
+        bool_metric(ready.event_log_writable),
+    );
+    push_metric_help(
+        &mut metrics,
+        "codex_ornament_bridge_event_log_bytes",
+        "Current task event journal size in bytes.",
+    );
+    push_metric_gauge_u64(
+        &mut metrics,
+        "codex_ornament_bridge_event_log_bytes",
+        event_log_bytes,
+    );
+    push_metric_help(
+        &mut metrics,
+        "codex_ornament_bridge_active_tasks",
+        "Current number of active tasks tracked in memory.",
+    );
+    push_metric_gauge_usize(
+        &mut metrics,
+        "codex_ornament_bridge_active_tasks",
+        active_task_count,
+    );
+    push_metric_help(
+        &mut metrics,
+        "codex_ornament_bridge_done_seq",
+        "Monotonic done-task sequence counters.",
+    );
+    push_metric_gauge_u64_with_label(
+        &mut metrics,
+        "codex_ornament_bridge_done_seq",
+        "source",
+        "all",
+        done_seq,
+    );
+    push_metric_gauge_u64_with_label(
+        &mut metrics,
+        "codex_ornament_bridge_done_seq",
+        "source",
+        "codex",
+        codex_done_seq,
+    );
+    push_metric_gauge_u64_with_label(
+        &mut metrics,
+        "codex_ornament_bridge_done_seq",
+        "source",
+        "claude",
+        claude_done_seq,
+    );
+    push_metric_help(
+        &mut metrics,
+        "codex_ornament_bridge_done_tasks",
+        "Bounded in-memory done-task history length.",
+    );
+    push_metric_gauge_usize(
+        &mut metrics,
+        "codex_ornament_bridge_done_tasks",
+        done_task_count,
+    );
+    push_metric_help(
+        &mut metrics,
+        "codex_ornament_bridge_unmatched_stops",
+        "Bounded in-memory unmatched stop history length.",
+    );
+    push_metric_gauge_usize(
+        &mut metrics,
+        "codex_ornament_bridge_unmatched_stops",
+        unmatched_stop_count,
+    );
+    push_metric_help(
+        &mut metrics,
+        "codex_ornament_bridge_quota_refreshing",
+        "1 while a quota refresh worker is running.",
+    );
+    push_metric_gauge(
+        &mut metrics,
+        "codex_ornament_bridge_quota_refreshing",
+        bool_metric(quota_refreshing),
+    );
+    push_metric_help(
+        &mut metrics,
+        "codex_ornament_bridge_weather_refreshing",
+        "1 while a weather refresh worker is running.",
+    );
+    push_metric_gauge(
+        &mut metrics,
+        "codex_ornament_bridge_weather_refreshing",
+        bool_metric(weather_refreshing),
+    );
+    metrics
+}
+
+fn bool_metric(value: bool) -> u8 {
+    if value {
+        1
+    } else {
+        0
+    }
+}
+
+fn push_metric_help(metrics: &mut String, name: &str, help: &str) {
+    metrics.push_str("# HELP ");
+    metrics.push_str(name);
+    metrics.push(' ');
+    metrics.push_str(help);
+    metrics.push('\n');
+    metrics.push_str("# TYPE ");
+    metrics.push_str(name);
+    metrics.push_str(" gauge\n");
+}
+
+fn push_metric_gauge(metrics: &mut String, name: &str, value: u8) {
+    metrics.push_str(name);
+    metrics.push(' ');
+    metrics.push_str(&value.to_string());
+    metrics.push('\n');
+}
+
+fn push_metric_gauge_u64(metrics: &mut String, name: &str, value: u64) {
+    metrics.push_str(name);
+    metrics.push(' ');
+    metrics.push_str(&value.to_string());
+    metrics.push('\n');
+}
+
+fn push_metric_gauge_usize(metrics: &mut String, name: &str, value: usize) {
+    metrics.push_str(name);
+    metrics.push(' ');
+    metrics.push_str(&value.to_string());
+    metrics.push('\n');
+}
+
+fn push_metric_gauge_u64_with_label(
+    metrics: &mut String,
+    name: &str,
+    label_name: &str,
+    label_value: &str,
+    value: u64,
+) {
+    metrics.push_str(name);
+    metrics.push('{');
+    metrics.push_str(label_name);
+    metrics.push_str("=\"");
+    metrics.push_str(label_value);
+    metrics.push_str("\"} ");
+    metrics.push_str(&value.to_string());
+    metrics.push('\n');
+}
+
+fn event_log_size(path: &Path) -> Option<u64> {
+    fs::metadata(path).ok().map(|metadata| metadata.len())
+}
+
+fn probe_event_log_writable(path: &Path) -> io::Result<()> {
+    let mut file = open_task_event_journal(path)?;
+    file.write_all(b"")?;
+    file.flush()
+}
+
 fn consume_task_events(
     state: SharedBridgeState,
     config: BridgeConfig,
+    mut journal: Option<TaskEventJournal>,
     receiver: TaskEventReceiver,
 ) {
     for queued in receiver {
-        let result = consume_task_event(&state, &config, queued.event);
+        let result = consume_task_event(&state, &config, journal.as_mut(), queued.event);
         let _ = queued.completion.send(result);
     }
 }
@@ -762,6 +1109,7 @@ fn consume_task_events(
 fn consume_task_event(
     state: &SharedBridgeState,
     config: &BridgeConfig,
+    journal: Option<&mut TaskEventJournal>,
     event: TaskEvent,
 ) -> TaskDispatchResult {
     if event_is_non_task_lifecycle_hook(&event) {
@@ -773,11 +1121,167 @@ fn consume_task_event(
         return TaskDispatchResult::Filtered;
     }
 
+    if let Some(journal) = journal {
+        if let Err(error) = journal.append(&event) {
+            eprintln!(
+                "task event journal append failed path={}: {error}",
+                journal.path.display()
+            );
+        }
+    }
+
     let Ok(mut state) = state.lock() else {
         return TaskDispatchResult::LockUnavailable;
     };
     apply_task_event(&mut state, event);
     TaskDispatchResult::Applied
+}
+
+impl TaskEventJournal {
+    fn open(path: Option<&Path>, max_bytes: u64, compact_keep_events: usize) -> Option<Self> {
+        let path = path?;
+        match open_task_event_journal(path) {
+            Ok(file) => Some(Self {
+                path: path.to_path_buf(),
+                file,
+                max_bytes,
+                compact_keep_events,
+            }),
+            Err(error) => {
+                eprintln!(
+                    "task event journal disabled path={}: {error}",
+                    path.display()
+                );
+                None
+            }
+        }
+    }
+
+    fn append(&mut self, event: &TaskEvent) -> io::Result<()> {
+        serde_json::to_writer(&mut self.file, event).map_err(io::Error::other)?;
+        self.file.write_all(b"\n")?;
+        self.file.flush()?;
+        self.compact_if_needed()
+    }
+
+    fn compact_if_needed(&mut self) -> io::Result<()> {
+        if self.max_bytes == 0 {
+            return Ok(());
+        }
+        let size = self.file.metadata()?.len();
+        if size <= self.max_bytes {
+            return Ok(());
+        }
+        if self.compact_keep_events == 0 {
+            return Ok(());
+        }
+
+        compact_task_event_journal(&self.path, self.compact_keep_events)?;
+        self.file = open_task_event_journal(&self.path)?;
+        Ok(())
+    }
+}
+
+fn open_task_event_journal(path: &Path) -> io::Result<File> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    OpenOptions::new().create(true).append(true).open(path)
+}
+
+fn compact_task_event_journal(path: &Path, keep_events: usize) -> io::Result<()> {
+    let mut events = VecDeque::new();
+    if let Ok(file) = open_shared_read(path) {
+        for line in BufReader::new(file).lines() {
+            let line = line?;
+            let line = line.trim();
+            if line.is_empty() || serde_json::from_str::<TaskEvent>(line).is_err() {
+                continue;
+            }
+            events.push_back(line.to_string());
+            while events.len() > keep_events {
+                events.pop_front();
+            }
+        }
+    }
+
+    let temp_path = path.with_extension("jsonl.tmp");
+    {
+        let mut temp = File::create(&temp_path)?;
+        for event in &events {
+            temp.write_all(event.as_bytes())?;
+            temp.write_all(b"\n")?;
+        }
+        temp.flush()?;
+    }
+    fs::rename(&temp_path, path)?;
+    eprintln!(
+        "task event journal compacted path={} kept_events={}",
+        path.display(),
+        events.len()
+    );
+    Ok(())
+}
+
+fn restore_bridge_state_from_event_log(path: Option<&Path>) -> BridgeState {
+    let Some(path) = path else {
+        return BridgeState::default();
+    };
+
+    match bridge_state_from_event_log(path) {
+        Ok(state) => state,
+        Err(error) => {
+            eprintln!(
+                "task event journal restore skipped path={}: {error}",
+                path.display()
+            );
+            BridgeState::default()
+        }
+    }
+}
+
+fn bridge_state_from_event_log(path: &Path) -> io::Result<BridgeState> {
+    let file = match open_shared_read(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(BridgeState::default()),
+        Err(error) => return Err(error),
+    };
+    let reader = BufReader::new(file);
+    let mut state = BridgeState::default();
+    let mut restored = 0_usize;
+    let mut skipped = 0_usize;
+
+    for (index, line) in reader.lines().enumerate() {
+        let line = line?;
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<TaskEvent>(line) {
+            Ok(event) => {
+                apply_task_event(&mut state, event);
+                restored += 1;
+            }
+            Err(error) => {
+                skipped += 1;
+                eprintln!(
+                    "task event journal line skipped path={} line={}: {error}",
+                    path.display(),
+                    index + 1
+                );
+            }
+        }
+    }
+
+    if restored > 0 || skipped > 0 {
+        eprintln!(
+            "task event journal restored path={} events={} skipped={}",
+            path.display(),
+            restored,
+            skipped
+        );
+    }
+    Ok(state)
 }
 
 fn dispatch_task_event(
@@ -1733,7 +2237,7 @@ fn handle_music_resolve(
         Ok(song) => write_json(
             stream,
             200,
-            &music_resolve_response(config, &music_request, &song),
+            &music_resolve_response(config, peer, &music_request, &song),
         ),
         Err(error) => {
             eprintln!("music resolve failed: {error}");
@@ -1768,29 +2272,18 @@ fn handle_music_stream(
         }
     };
 
-    let resolved = match resolve_song_cached(state, config, &music_request) {
-        Ok(song) => song,
-        Err(error) => {
-            eprintln!("music stream resolve failed: {error}");
-            return write_json(
-                stream,
-                map_music_status(&error),
-                &json!({"ok": false, "error": error.to_string()}),
-            );
-        }
-    };
-
-    let mut child = match spawn_ffmpeg_pcm_stream(&resolved.url) {
-        Ok(child) => child,
-        Err(error) => {
-            eprintln!("music ffmpeg spawn failed: {error}");
-            return write_json(
-                stream,
-                500,
-                &json!({"ok": false, "error": error.to_string()}),
-            );
-        }
-    };
+    let (_resolved_request, resolved, mut pcm_stream) =
+        match resolve_ready_music_stream(state, config, &music_request) {
+            Ok(stream) => stream,
+            Err(error) => {
+                eprintln!("music stream open failed: {error}");
+                return write_json(
+                    stream,
+                    map_music_status(&error),
+                    &json!({"ok": false, "error": error.to_string()}),
+                );
+            }
+        };
 
     let headers = [
         (
@@ -1808,15 +2301,76 @@ fn handle_music_stream(
     ];
     write_streaming_response(stream, 200, "audio/L16; rate=16000; channels=1", &headers)?;
 
-    let copy_result = stream_child_stdout_to_http(stream, &mut child);
-    let _ = child.kill();
-    let _ = child.wait();
+    stream_ready_pcm_to_http(stream, &mut pcm_stream)
+}
 
-    copy_result
+fn handle_music_cover(
+    stream: &mut TcpStream,
+    peer: Option<SocketAddr>,
+    request: &HttpRequest,
+    state: &SharedBridgeState,
+    config: &BridgeConfig,
+) -> io::Result<()> {
+    if !music_get_allowed(peer) {
+        return write_json(stream, 403, &json!({"ok": false, "error": "forbidden"}));
+    }
+
+    let music_request = match parse_music_request(request) {
+        Ok(request) => request,
+        Err(error) => {
+            return write_json(
+                stream,
+                400,
+                &json!({"ok": false, "error": error.to_string()}),
+            );
+        }
+    };
+
+    let resolved = match resolve_song_cached(state, config, &music_request) {
+        Ok(song) => song,
+        Err(error) => {
+            eprintln!("music cover resolve failed: {error}");
+            return write_json(
+                stream,
+                map_music_status(&error),
+                &json!({"ok": false, "error": error.to_string()}),
+            );
+        }
+    };
+    if resolved.picture.trim().is_empty() {
+        return write_json(
+            stream,
+            404,
+            &json!({"ok": false, "error": "cover unavailable"}),
+        );
+    }
+
+    match render_music_cover_rgb565(&resolved.picture) {
+        Ok(cover) => {
+            let headers = [
+                ("X-Ornament-Cover-Width", MUSIC_COVER_SIZE.to_string()),
+                ("X-Ornament-Cover-Height", MUSIC_COVER_SIZE.to_string()),
+                (
+                    "X-Ornament-Music-Title",
+                    sanitize_header_value(&resolved.title),
+                ),
+            ];
+            write_response_with_headers(stream, 200, "application/octet-stream", &headers, &cover)
+        }
+        Err(error) => {
+            eprintln!("music cover render failed: {error}");
+            write_json(
+                stream,
+                map_music_status(&error),
+                &json!({"ok": false, "error": error.to_string()}),
+            )
+        }
+    }
 }
 
 fn music_resolve_response(
     config: &BridgeConfig,
+    peer: Option<SocketAddr>,
     request: &MusicRequest,
     song: &ResolvedSong,
 ) -> MusicResolveResponse {
@@ -1832,7 +2386,8 @@ fn music_resolve_response(
         title: song.title.clone(),
         album: song.album.clone(),
         picture: song.picture.clone(),
-        url: music_stream_url(config, request),
+        cover_url: music_cover_url(config, peer, request),
+        url: music_stream_url(config, peer, request),
         lyrics: song.lyrics.clone(),
     }
 }
@@ -1849,6 +2404,58 @@ fn resolve_song_cached(
     let song = resolve_song(config, request)?;
     cache_music_resolve(state, request, &song);
     Ok(song)
+}
+
+fn resolve_ready_music_stream(
+    state: &SharedBridgeState,
+    config: &BridgeConfig,
+    request: &MusicRequest,
+) -> io::Result<(MusicRequest, ResolvedSong, ReadyPcmStream)> {
+    let mut last_error = None;
+
+    for offset in 0..MUSIC_STREAM_FALLBACK_ATTEMPTS {
+        let candidate_request =
+            music_request_with_index(request, request.index.saturating_add(offset));
+        let resolved = match resolve_song_cached(state, config, &candidate_request) {
+            Ok(song) => song,
+            Err(error) => {
+                last_error = Some(error);
+                continue;
+            }
+        };
+
+        match open_ready_pcm_stream(&resolved.url) {
+            Ok(pcm_stream) => {
+                if offset > 0 {
+                    eprintln!(
+                        "music stream fallback selected index {} for song {}",
+                        candidate_request.index, request.song
+                    );
+                    cache_music_resolve(state, request, &resolved);
+                } else if candidate_request != *request {
+                    cache_music_resolve(state, request, &resolved);
+                }
+                return Ok((candidate_request, resolved, pcm_stream));
+            }
+            Err(error) => {
+                eprintln!(
+                    "music stream candidate failed: song={} index={} title={} error={}",
+                    request.song, candidate_request.index, resolved.title, error
+                );
+                last_error = Some(error);
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| io::Error::other("no playable music stream found")))
+}
+
+fn music_request_with_index(request: &MusicRequest, index: u32) -> MusicRequest {
+    MusicRequest {
+        song: request.song.clone(),
+        artist: request.artist.clone(),
+        index: index.max(1),
+    }
 }
 
 fn cached_music_resolve(state: &SharedBridgeState, request: &MusicRequest) -> Option<ResolvedSong> {
@@ -1937,11 +2544,12 @@ fn parse_music_request(request: &HttpRequest) -> io::Result<MusicRequest> {
     })
 }
 
-fn music_stream_url(config: &BridgeConfig, request: &MusicRequest) -> String {
-    let base = config
-        .music_public_base_url
-        .clone()
-        .unwrap_or_else(|| discover_music_public_base_url(config));
+fn music_stream_url(
+    config: &BridgeConfig,
+    peer: Option<SocketAddr>,
+    request: &MusicRequest,
+) -> String {
+    let base = music_public_base_url(config, peer);
     let mut url = format!("{}/v1/music/stream?song=", base.trim_end_matches('/'));
     url.push_str(&form_urlencode(&request.song));
     if let Some(artist) = request.artist.as_deref().filter(|value| !value.is_empty()) {
@@ -1951,6 +2559,47 @@ fn music_stream_url(config: &BridgeConfig, request: &MusicRequest) -> String {
     url.push_str("&index=");
     url.push_str(&request.index.to_string());
     url
+}
+
+fn music_cover_url(
+    config: &BridgeConfig,
+    peer: Option<SocketAddr>,
+    request: &MusicRequest,
+) -> String {
+    let base = music_public_base_url(config, peer);
+    let mut url = format!("{}/v1/music/cover?song=", base.trim_end_matches('/'));
+    url.push_str(&form_urlencode(&request.song));
+    if let Some(artist) = request.artist.as_deref().filter(|value| !value.is_empty()) {
+        url.push_str("&artist=");
+        url.push_str(&form_urlencode(artist));
+    }
+    url.push_str("&index=");
+    url.push_str(&request.index.to_string());
+    url
+}
+
+fn music_public_base_url(config: &BridgeConfig, peer: Option<SocketAddr>) -> String {
+    if config.music_public_base_url_locked {
+        if let Some(base) = config.music_public_base_url.clone() {
+            return base;
+        }
+    }
+
+    if let Some(peer) = peer {
+        if let IpAddr::V4(ip) = peer.ip() {
+            if !ip.is_loopback() {
+                if let Some(host) = local_lan_ip_for_peer(IpAddr::V4(ip)) {
+                    let port = bind_port(&config.bind).unwrap_or(8787);
+                    return format!("http://{host}:{port}");
+                }
+            }
+        }
+    }
+
+    config
+        .music_public_base_url
+        .clone()
+        .unwrap_or_else(|| discover_music_public_base_url(config))
 }
 
 fn discover_music_public_base_url(config: &BridgeConfig) -> String {
@@ -2018,7 +2667,25 @@ fn percent_decode(value: &str) -> String {
 
 fn resolve_song(config: &BridgeConfig, request: &MusicRequest) -> io::Result<ResolvedSong> {
     if config.yaohud_key.is_some() {
-        return resolve_song_yaohud(config, request);
+        match resolve_song_yaohud(config, request) {
+            Ok(song) => return Ok(song),
+            Err(error) => {
+                eprintln!(
+                    "Yaohud music resolve failed for song={} index={} kind={:?}; falling back to NetEase",
+                    request.song,
+                    request.index,
+                    error.kind()
+                );
+                return resolve_song_netease(request).map_err(|fallback_error| {
+                    io::Error::new(
+                        fallback_error.kind(),
+                        format!(
+                            "Yaohud provider unavailable; NetEase fallback failed ({fallback_error})"
+                        ),
+                    )
+                });
+            }
+        }
     }
 
     resolve_song_netease(request)
@@ -2090,13 +2757,7 @@ fn resolve_song_yaohud(config: &BridgeConfig, request: &MusicRequest) -> io::Res
     .to_string();
     let album = data.album.unwrap_or_default();
     let picture = data.picture.or(data.pic).unwrap_or_default();
-    let lyrics = data.lrctxt.or(data.lyrics).or(data.lrc).and_then(|value| {
-        if value.trim().is_empty() {
-            None
-        } else {
-            Some(value)
-        }
-    });
+    let lyrics = normalize_lyrics(&client, data.lrctxt.or(data.lyrics).or(data.lrc));
 
     Ok(ResolvedSong {
         source: "yaohud",
@@ -2107,6 +2768,30 @@ fn resolve_song_yaohud(config: &BridgeConfig, request: &MusicRequest) -> io::Res
         url,
         lyrics,
     })
+}
+
+fn normalize_lyrics(client: &reqwest::blocking::Client, value: Option<String>) -> Option<String> {
+    let value = value?.trim().to_string();
+    if value.is_empty() {
+        return None;
+    }
+    if value.starts_with("http://") || value.starts_with("https://") {
+        return fetch_text_url(client, &value)
+            .ok()
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty() && !text.starts_with('{'));
+    }
+    Some(value)
+}
+
+fn fetch_text_url(client: &reqwest::blocking::Client, url: &str) -> io::Result<String> {
+    client
+        .get(url)
+        .header("User-Agent", "Mozilla/5.0")
+        .send()
+        .and_then(|response| response.error_for_status())
+        .and_then(|response| response.text())
+        .map_err(io_other)
 }
 
 fn fetch_yaohud_body(client: &reqwest::blocking::Client, url: &str) -> io::Result<String> {
@@ -2138,7 +2823,7 @@ fn resolve_song_netease(request: &MusicRequest) -> io::Result<ResolvedSong> {
         Some(artist) if !artist.is_empty() => format!("{} {}", request.song, artist),
         _ => request.song.clone(),
     };
-    let limit = request.index.max(1).min(10);
+    let limit = request.index.clamp(1, 10);
     let url = format!(
         "https://music.163.com/api/search/get/web?csrf_token=&type=1&s={}&limit={limit}&offset=0",
         form_urlencode(&query)
@@ -2188,6 +2873,13 @@ fn resolve_song_netease(request: &MusicRequest) -> io::Result<ResolvedSong> {
         .as_ref()
         .map(|album| album.name.clone())
         .unwrap_or_default();
+    let picture = song
+        .album
+        .as_ref()
+        .and_then(|album| album.pic_url.clone())
+        .or_else(|| fetch_netease_album_picture(&client, song.id))
+        .unwrap_or_default();
+    let lyrics = fetch_netease_lyrics(&client, song.id);
     let url = format!(
         "https://music.163.com/song/media/outer/url?id={}.mp3",
         song.id
@@ -2198,10 +2890,50 @@ fn resolve_song_netease(request: &MusicRequest) -> io::Result<ResolvedSong> {
         title: song.name.clone(),
         artist,
         album,
-        picture: String::new(),
+        picture,
         url,
-        lyrics: None,
+        lyrics,
     })
+}
+
+fn fetch_netease_album_picture(client: &reqwest::blocking::Client, song_id: u64) -> Option<String> {
+    let url = format!("https://music.163.com/api/song/detail?ids=[{song_id}]");
+    let body = client
+        .get(url)
+        .header("User-Agent", "Mozilla/5.0")
+        .header("Referer", "https://music.163.com/")
+        .send()
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .text()
+        .ok()?;
+    let parsed: NeteaseSongDetailResponse = serde_json::from_str(&body).ok()?;
+    parsed
+        .songs
+        .first()
+        .and_then(|song| song.album.as_ref())
+        .and_then(|album| album.pic_url.clone())
+        .filter(|url| !url.trim().is_empty())
+}
+
+fn fetch_netease_lyrics(client: &reqwest::blocking::Client, song_id: u64) -> Option<String> {
+    let url = format!("https://music.163.com/api/song/lyric?id={song_id}&lv=1&kv=1&tv=-1");
+    let body = client
+        .get(url)
+        .header("User-Agent", "Mozilla/5.0")
+        .header("Referer", "https://music.163.com/")
+        .send()
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .text()
+        .ok()?;
+    let parsed: NeteaseLyricResponse = serde_json::from_str(&body).ok()?;
+    parsed
+        .lrc
+        .and_then(|lrc| lrc.lyric)
+        .filter(|lyric| !lyric.trim().is_empty())
 }
 
 fn first_nonempty<'a>(values: &[Option<&'a str>]) -> Option<&'a str> {
@@ -2238,6 +2970,54 @@ fn form_urlencode(value: &str) -> Cow<'_, str> {
     }
 }
 
+fn render_music_cover_rgb565(url: &str) -> io::Result<Vec<u8>> {
+    let vf = format!(
+        "scale={0}:{0}:force_original_aspect_ratio=increase,crop={0}:{0},format=rgb565le",
+        MUSIC_COVER_SIZE
+    );
+    let output = Command::new("ffmpeg")
+        .args([
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-user_agent",
+            "Mozilla/5.0",
+            "-headers",
+            "Referer: https://music.163.com/\r\n",
+            "-i",
+            url,
+            "-frames:v",
+            "1",
+            "-vf",
+            &vf,
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb565le",
+            "pipe:1",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(io_other)?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(ffmpeg_stream_error(output.status, &stderr));
+    }
+    if output.stdout.len() != MUSIC_COVER_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "ffmpeg cover output has {} bytes, expected {}",
+                output.stdout.len(),
+                MUSIC_COVER_BYTES
+            ),
+        ));
+    }
+    Ok(output.stdout)
+}
+
 fn spawn_ffmpeg_pcm_stream(url: &str) -> io::Result<Child> {
     Command::new("ffmpeg")
         .args([
@@ -2265,7 +3045,8 @@ fn spawn_ffmpeg_pcm_stream(url: &str) -> io::Result<Child> {
         .spawn()
 }
 
-fn stream_child_stdout_to_http(stream: &mut TcpStream, child: &mut Child) -> io::Result<()> {
+fn open_ready_pcm_stream(url: &str) -> io::Result<ReadyPcmStream> {
+    let mut child = spawn_ffmpeg_pcm_stream(url)?;
     let mut stdout = child
         .stdout
         .take()
@@ -2281,8 +3062,33 @@ fn stream_child_stdout_to_http(stream: &mut TcpStream, child: &mut Child) -> io:
     });
 
     let mut buffer = vec![0_u8; DEFAULT_STREAM_COPY_BYTES];
+    let read = stdout.read(&mut buffer)?;
+    if read > 0 {
+        buffer.truncate(read);
+        return Ok(ReadyPcmStream {
+            child,
+            stdout,
+            stderr_thread: Some(stderr_thread),
+            first_chunk: buffer,
+        });
+    }
+
+    let status = child.wait()?;
+    let stderr_text = stderr_thread.join().unwrap_or_default();
+    Err(ffmpeg_stream_error(status, &stderr_text))
+}
+
+fn stream_ready_pcm_to_http(
+    stream: &mut TcpStream,
+    pcm_stream: &mut ReadyPcmStream,
+) -> io::Result<()> {
+    if !pcm_stream.first_chunk.is_empty() {
+        stream.write_all(&pcm_stream.first_chunk)?;
+    }
+
+    let mut buffer = vec![0_u8; DEFAULT_STREAM_COPY_BYTES];
     loop {
-        let read = stdout.read(&mut buffer)?;
+        let read = pcm_stream.stdout.read(&mut buffer)?;
         if read == 0 {
             break;
         }
@@ -2290,16 +3096,24 @@ fn stream_child_stdout_to_http(stream: &mut TcpStream, child: &mut Child) -> io:
     }
     stream.flush()?;
 
-    let status = child.wait()?;
-    let stderr_text = stderr_thread.join().unwrap_or_default();
+    let status = pcm_stream.child.wait()?;
+    let stderr_text = pcm_stream
+        .stderr_thread
+        .take()
+        .map(|stderr_thread| stderr_thread.join().unwrap_or_default())
+        .unwrap_or_default();
     if status.success() {
         Ok(())
     } else {
-        Err(io::Error::other(format!(
-            "ffmpeg exited with status {status}: {}",
-            clip(stderr_text.trim(), 200)
-        )))
+        Err(ffmpeg_stream_error(status, &stderr_text))
     }
+}
+
+fn ffmpeg_stream_error(status: ExitStatus, stderr_text: &str) -> io::Error {
+    io::Error::other(format!(
+        "ffmpeg exited with status {status}: {}",
+        clip(stderr_text.trim(), 200)
+    ))
 }
 
 fn sanitize_header_value(value: &str) -> String {
@@ -2350,6 +3164,11 @@ fn normalize_event(payload: &Value) -> TaskEvent {
     let kind = text_field(payload, &["hook_event_name", "type"])
         .unwrap_or_else(|| "codex-event".to_string());
     let source = event_source(payload);
+    let session_id = event_text_field(
+        payload,
+        &["session_id", "sessionId", "thread-id", "thread_id"],
+    );
+    let turn_id = event_turn_id(payload, source.as_deref());
     let status = match kind.as_str() {
         "UserPromptSubmit" => "running",
         "Stop" | "agent-turn-complete" => "done",
@@ -2367,11 +3186,8 @@ fn normalize_event(payload: &Value) -> TaskEvent {
         message,
         received_at: now_local(),
         source,
-        session_id: event_text_field(
-            payload,
-            &["session_id", "sessionId", "thread-id", "thread_id"],
-        ),
-        turn_id: event_text_field(payload, &["turn_id", "turnId", "turn-id"]),
+        session_id,
+        turn_id,
         cwd: event_text_field(payload, &["cwd"]).map(|value| clip(&value, 120)),
         model: event_text_field(payload, &["model"]),
     }
@@ -2381,6 +3197,52 @@ fn event_source(payload: &Value) -> Option<String> {
     text_field(payload, &["source", "agent", "client"])
         .map(|value| value.trim().to_ascii_lowercase())
         .filter(|value| !value.is_empty())
+        .or_else(|| payload_looks_like_claude_hook(payload).then(|| "claude".to_string()))
+}
+
+fn payload_looks_like_claude_hook(payload: &Value) -> bool {
+    event_text_field(payload, &["transcript_path", "transcriptPath"])
+        .map(|value| path_looks_like_claude_transcript(&value))
+        .unwrap_or(false)
+}
+
+fn path_looks_like_claude_transcript(path: &str) -> bool {
+    let normalized = normalize_path_for_identity(path);
+    normalized.contains("\\.claude\\")
+}
+
+fn event_turn_id(payload: &Value, source: Option<&str>) -> Option<String> {
+    event_text_field(payload, &["turn_id", "turnId", "turn-id"])
+        .or_else(|| derived_claude_turn_id(payload, source))
+}
+
+fn derived_claude_turn_id(payload: &Value, source: Option<&str>) -> Option<String> {
+    if !source.map(source_is_claude).unwrap_or(false) {
+        return None;
+    }
+
+    let transcript_path = event_text_field(payload, &["transcript_path", "transcriptPath"])?;
+    if !path_looks_like_claude_transcript(&transcript_path) {
+        return None;
+    }
+
+    Some(format!(
+        "claude-transcript-{:016x}",
+        stable_text_hash(&normalize_path_for_identity(&transcript_path))
+    ))
+}
+
+fn normalize_path_for_identity(path: &str) -> String {
+    path.replace('/', "\\").to_ascii_lowercase()
+}
+
+fn stable_text_hash(text: &str) -> u64 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in text.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
 }
 
 fn task_title_for(status: &str, source: Option<&str>) -> String {
@@ -3234,13 +4096,17 @@ fn maybe_spawn_quota_refresh_if_due(state: SharedBridgeState) {
 }
 
 fn quota_refresh_is_due(state: &BridgeState) -> bool {
+    quota_refresh_is_due_at(state, Instant::now())
+}
+
+fn quota_refresh_is_due_at(state: &BridgeState, now: Instant) -> bool {
     if state.quota_refreshing {
         return false;
     }
     state
         .quota
         .as_ref()
-        .map(|cache| cache.fetched_at.elapsed() >= QUOTA_CACHE_TTL)
+        .map(|cache| now.saturating_duration_since(cache.fetched_at) >= QUOTA_CACHE_TTL)
         .unwrap_or(true)
 }
 
@@ -3437,18 +4303,22 @@ fn maybe_spawn_weather_refresh(state: SharedBridgeState, config: BridgeConfig) {
 }
 
 fn weather_refresh_is_due(state: &BridgeState, config: &BridgeConfig) -> bool {
+    weather_refresh_is_due_at(state, config, Instant::now())
+}
+
+fn weather_refresh_is_due_at(state: &BridgeState, config: &BridgeConfig, now: Instant) -> bool {
     if state.weather_refreshing {
         return false;
     }
 
     let interval = weather_refresh_interval(config);
     if let Some(cache) = state.weather.as_ref() {
-        if cache.fetched_at.elapsed() < interval {
+        if now.saturating_duration_since(cache.fetched_at) < interval {
             return false;
         }
     }
     if let Some(last_attempt) = state.weather_last_attempt {
-        if last_attempt.elapsed() < interval {
+        if now.saturating_duration_since(last_attempt) < interval {
             return false;
         }
     }
@@ -3482,7 +4352,7 @@ fn caiyun_refresh_interval_for_hour(hour: u32) -> Duration {
 }
 
 fn ceil_div_u128(numerator: u128, denominator: u128) -> u128 {
-    (numerator + denominator - 1) / denominator
+    numerator.div_ceil(denominator)
 }
 
 fn fetch_weather_snapshot(config: &BridgeConfig) -> io::Result<WeatherSnapshot> {
@@ -3845,41 +4715,36 @@ fn caiyun_icon_for_skycon(skycon: &str) -> &'static str {
 
 fn compact_weather_icon(summary: &str) -> &'static str {
     let summary = summary.to_ascii_lowercase();
-    if summary.contains("晴") || summary.contains("clear") || summary.contains("sun") {
+    if summary.contains("clear") || summary.contains("sun") {
         "sun"
-    } else if summary.contains("多云") && !summary.contains("阴") || summary.contains("partly") {
+    } else if summary.contains("partly") {
         "partly-cloudy"
-    } else if summary.contains("云") || summary.contains("阴") || summary.contains("cloud") {
+    } else if summary.contains("cloud") || summary.contains("overcast") {
         "cloud"
-    } else if summary.contains("霾")
-        || summary.contains("尘")
-        || summary.contains("沙")
-        || summary.contains("haze")
+    } else if summary.contains("haze")
         || summary.contains("dust")
         || summary.contains("sand")
+        || summary.contains("smog")
     {
         "haze"
-    } else if summary.contains("雾") || summary.contains("fog") {
+    } else if summary.contains("fog") {
         "fog"
-    } else if summary.contains("毛毛雨") || summary.contains("drizzle") {
+    } else if summary.contains("drizzle") {
         "drizzle"
-    } else if summary.contains("冻雨") || summary.contains("雨夹雪") || summary.contains("sleet")
-    {
+    } else if summary.contains("sleet") || summary.contains("freezing rain") {
         "sleet"
-    } else if summary.contains("暴雨") || summary.contains("大暴雨") || summary.contains("heavy")
-    {
+    } else if summary.contains("storm") || summary.contains("heavy") {
         "heavy-rain"
-    } else if summary.contains("雨") || summary.contains("rain") {
+    } else if summary.contains("rain") {
         "rain"
-    } else if summary.contains("雪") || summary.contains("snow") {
+    } else if summary.contains("snow") {
         "snow"
-    } else if summary.contains("风") || summary.contains("wind") {
+    } else if summary.contains("wind") {
         "windy"
     } else {
         "unknown"
     }
 }
-
 fn parse_i32_text(value: &str) -> Option<i32> {
     value.parse::<f64>().ok().map(round_f64_to_i32)
 }
@@ -3900,6 +4765,16 @@ fn write_response(
     content_type: &str,
     body: &[u8],
 ) -> io::Result<()> {
+    write_response_with_headers(stream, status, content_type, &[], body)
+}
+
+fn write_response_with_headers(
+    stream: &mut TcpStream,
+    status: u16,
+    content_type: &str,
+    extra_headers: &[(&str, String)],
+    body: &[u8],
+) -> io::Result<()> {
     let reason = match status {
         200 => "OK",
         202 => "Accepted",
@@ -3913,9 +4788,13 @@ fn write_response(
     };
     write!(
         stream,
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: Content-Type, X-Codex-Ornament-Token, Access-Control-Request-Private-Network\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Private-Network: true\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: Content-Type, X-Codex-Ornament-Token, Access-Control-Request-Private-Network\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Private-Network: true\r\nConnection: close\r\n",
         body.len()
     )?;
+    for (name, value) in extra_headers {
+        write!(stream, "{name}: {value}\r\n")?;
+    }
+    write!(stream, "\r\n")?;
     stream.write_all(body)
 }
 
@@ -3932,6 +4811,25 @@ fn env_text(name: &str) -> Option<String> {
 
 fn env_f64(name: &str) -> Option<f64> {
     env_text(name).and_then(|value| value.parse::<f64>().ok())
+}
+
+fn env_u64(name: &str) -> Option<u64> {
+    env_text(name).and_then(|value| value.parse::<u64>().ok())
+}
+
+fn env_usize(name: &str) -> Option<usize> {
+    env_text(name).and_then(|value| value.parse::<usize>().ok())
+}
+
+fn env_truthy(name: &str) -> bool {
+    env_text(name)
+        .map(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
 }
 
 fn env_weather_provider(name: &str) -> Option<WeatherProvider> {
@@ -3955,6 +4853,28 @@ fn codex_home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".codex"))
 }
 
+fn bridge_event_log_path(codex_home: &Path) -> Option<PathBuf> {
+    if !bridge_event_persistence_enabled() {
+        return None;
+    }
+    Some(
+        env_text("CODEX_ORNAMENT_EVENT_LOG")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| codex_home.join("ornament").join("bridge-events.jsonl")),
+    )
+}
+
+fn bridge_event_persistence_enabled() -> bool {
+    env_text("CODEX_ORNAMENT_PERSIST_EVENTS")
+        .map(|value| {
+            !matches!(
+                value.to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            )
+        })
+        .unwrap_or(true)
+}
+
 fn clip(value: &str, max_chars: usize) -> String {
     let mut output = String::new();
     for (index, ch) in value.chars().enumerate() {
@@ -3975,8 +4895,12 @@ mod tests {
         BridgeConfig {
             bind: "127.0.0.1:8787".to_string(),
             token: token.map(str::to_string),
+            event_log_path: None,
+            event_log_max_bytes: DEFAULT_EVENT_LOG_MAX_BYTES,
+            event_log_compact_keep_events: DEFAULT_EVENT_LOG_COMPACT_KEEP_EVENTS,
             yaohud_key: None,
             music_public_base_url: None,
+            music_public_base_url_locked: false,
             tracked_session_id: None,
             codex_home: PathBuf::from(".codex-test"),
             weather_latitude: DEFAULT_WEATHER_LATITUDE,
@@ -3993,8 +4917,12 @@ mod tests {
         BridgeConfig {
             bind: "127.0.0.1:8787".to_string(),
             token: None,
+            event_log_path: None,
+            event_log_max_bytes: DEFAULT_EVENT_LOG_MAX_BYTES,
+            event_log_compact_keep_events: DEFAULT_EVENT_LOG_COMPACT_KEEP_EVENTS,
             yaohud_key: None,
             music_public_base_url: None,
+            music_public_base_url_locked: false,
             tracked_session_id: Some(session_id.to_string()),
             codex_home: codex_home.into(),
             weather_latitude: DEFAULT_WEATHER_LATITUDE,
@@ -4118,36 +5046,59 @@ mod tests {
     fn builds_music_stream_url_from_public_base() {
         let mut config = test_config(None);
         config.music_public_base_url = Some("http://192.168.1.102:8787/".to_string());
+        config.music_public_base_url_locked = true;
         let request = MusicRequest {
-            song: "好运来".to_string(),
-            artist: Some("祖海".to_string()),
+            song: "lucky song".to_string(),
+            artist: Some("zu hai".to_string()),
             index: 2,
         };
 
         assert_eq!(
-            music_stream_url(&config, &request),
-            "http://192.168.1.102:8787/v1/music/stream?song=%E5%A5%BD%E8%BF%90%E6%9D%A5&artist=%E7%A5%96%E6%B5%B7&index=2"
+            music_stream_url(&config, None, &request),
+            "http://192.168.1.102:8787/v1/music/stream?song=lucky+song&artist=zu+hai&index=2"
         );
+        assert_eq!(
+            music_cover_url(&config, None, &request),
+            "http://192.168.1.102:8787/v1/music/cover?song=lucky+song&artist=zu+hai&index=2"
+        );
+    }
+
+    #[test]
+    fn unlocked_music_stream_url_uses_peer_reachable_host_before_configured_base() {
+        let mut config = test_config(None);
+        config.bind = "0.0.0.0:9876".to_string();
+        config.music_public_base_url = Some("http://192.168.1.102:8787/".to_string());
+        let peer = "192.168.1.44:50000".parse::<SocketAddr>().ok();
+        let request = MusicRequest {
+            song: "song".to_string(),
+            artist: None,
+            index: 1,
+        };
+
+        let url = music_stream_url(&config, peer, &request);
+
+        assert!(url.starts_with("http://"));
+        assert!(url.ends_with(":9876/v1/music/stream?song=song&index=1"));
+        assert!(!url.starts_with("http://192.168.1.102:8787/"));
     }
 
     #[test]
     fn caches_music_resolve_for_matching_request_only() {
         let state = Arc::new(Mutex::new(BridgeState::default()));
         let request = MusicRequest {
-            song: "好运来".to_string(),
+            song: "lucky song".to_string(),
             artist: None,
             index: 1,
         };
         let song = ResolvedSong {
             source: "yaohud",
-            title: "好运来".to_string(),
-            artist: "祖海".to_string(),
-            album: "好运来".to_string(),
+            title: "lucky song".to_string(),
+            artist: "test artist".to_string(),
+            album: "lucky album".to_string(),
             picture: String::new(),
             url: "https://music.163.com/song/media/outer/url?id=333750.mp3".to_string(),
             lyrics: None,
         };
-
         cache_music_resolve(&state, &request, &song);
 
         assert_eq!(cached_music_resolve(&state, &request), Some(song));
@@ -4164,7 +5115,7 @@ mod tests {
     #[test]
     fn netease_outer_url_points_to_mp3_proxy() {
         let request = MusicRequest {
-            song: "好运来".to_string(),
+            song: "lucky song".to_string(),
             artist: None,
             index: 1,
         };
@@ -4242,16 +5193,19 @@ mod tests {
     fn weather_refresh_due_throttles_failed_attempts() {
         let mut config = test_config(None);
         config.caiyun_token = Some("token-123".to_string());
+        let now = Instant::now();
 
-        let mut state = BridgeState {
-            weather_last_attempt: Some(Instant::now()),
+        let state = BridgeState {
+            weather_last_attempt: Some(now),
             ..BridgeState::default()
         };
-        assert!(!weather_refresh_is_due(&state, &config));
+        assert!(!weather_refresh_is_due_at(&state, &config, now));
 
-        state.weather_last_attempt =
-            Some(Instant::now() - CAIYUN_NIGHT_REFRESH_INTERVAL - Duration::from_millis(1));
-        assert!(weather_refresh_is_due(&state, &config));
+        assert!(weather_refresh_is_due_at(
+            &state,
+            &config,
+            now + CAIYUN_NIGHT_REFRESH_INTERVAL + Duration::from_millis(1)
+        ));
     }
 
     #[test]
@@ -4324,6 +5278,25 @@ mod tests {
     }
 
     #[test]
+    fn infers_claude_source_from_transcript_path() {
+        let event = normalize_event(&json!({
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "claude-session",
+            "transcript_path": "C:\\Users\\86147\\.claude\\projects\\demo\\session.jsonl",
+            "prompt": "continue"
+        }));
+
+        assert_eq!(event.status, "running");
+        assert_eq!(event.title, "Claude running");
+        assert_eq!(event.source.as_deref(), Some("claude"));
+        assert!(event
+            .turn_id
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with("claude-transcript-"));
+    }
+
+    #[test]
     fn maps_notify_event_to_done() {
         let event = normalize_event(&json!({
             "type": "agent-turn-complete",
@@ -4370,24 +5343,28 @@ mod tests {
 
     #[test]
     fn quota_refresh_due_respects_one_minute_interval() {
+        let now = Instant::now();
         let mut state = BridgeState::default();
-        assert!(quota_refresh_is_due(&state));
+        assert!(quota_refresh_is_due_at(&state, now));
 
         state.quota_refreshing = true;
-        assert!(!quota_refresh_is_due(&state));
+        assert!(!quota_refresh_is_due_at(&state, now));
 
         state.quota_refreshing = false;
         state.quota = Some(CachedQuota {
             snapshot: quota_unavailable(),
-            fetched_at: Instant::now(),
+            fetched_at: now,
         });
-        assert!(!quota_refresh_is_due(&state));
+        assert!(!quota_refresh_is_due_at(&state, now));
 
         state.quota = Some(CachedQuota {
             snapshot: quota_unavailable(),
-            fetched_at: Instant::now() - QUOTA_REFRESH_INTERVAL - Duration::from_millis(1),
+            fetched_at: now,
         });
-        assert!(quota_refresh_is_due(&state));
+        assert!(quota_refresh_is_due_at(
+            &state,
+            now + QUOTA_REFRESH_INTERVAL + Duration::from_millis(1)
+        ));
     }
 
     #[test]
@@ -5142,7 +6119,7 @@ mod tests {
     }
 
     #[test]
-    fn multiple_claude_tasks_same_session_stop_removes_latest_only() {
+    fn repeated_claude_start_with_same_turn_replaces_previous_active_task_like_codex() {
         let state = Arc::new(Mutex::new(BridgeState::default()));
         {
             let mut state = state.lock().unwrap();
@@ -5152,6 +6129,7 @@ mod tests {
                     "hook_event_name": "UserPromptSubmit",
                     "source": "Claude",
                     "session_id": "claude-session",
+                    "turn_id": "shared-turn",
                     "prompt": "first"
                 })),
             );
@@ -5160,16 +6138,9 @@ mod tests {
                 normalize_event(&json!({
                     "hook_event_name": "UserPromptSubmit",
                     "source": "Claude",
-                    "session_id": "claude-session",
+                    "session_id": "claude-session-continued",
+                    "turn_id": "shared-turn",
                     "prompt": "second"
-                })),
-            );
-            apply_task_event(
-                &mut state,
-                normalize_event(&json!({
-                    "hook_event_name": "Stop",
-                    "source": "Claude",
-                    "session_id": "claude-session"
                 })),
             );
         }
@@ -5177,7 +6148,7 @@ mod tests {
         let snapshot = task_snapshot(&state, &test_config(None));
         assert_eq!(snapshot.source_tasks.claude.status, "running");
         assert_eq!(snapshot.source_tasks.claude.active_count, 1);
-        assert_eq!(snapshot.source_tasks.claude.done_seq, 1);
+        assert_eq!(snapshot.source_tasks.claude.done_seq, 0);
         assert_eq!(
             snapshot
                 .source_tasks
@@ -5185,8 +6156,109 @@ mod tests {
                 .task
                 .as_ref()
                 .map(|event| event.message.as_str()),
-            Some("first")
+            Some("second")
         );
+        assert_eq!(
+            snapshot
+                .source_tasks
+                .claude
+                .task
+                .as_ref()
+                .and_then(|event| event.turn_id.as_deref()),
+            Some("shared-turn")
+        );
+    }
+
+    #[test]
+    fn claude_transcript_identity_uses_codex_turn_matching_for_stop_and_continue() {
+        let state = Arc::new(Mutex::new(BridgeState::default()));
+        let start = normalize_event(&json!({
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "claude-session",
+            "transcript_path": "C:\\Users\\86147\\.claude\\projects\\demo\\session.jsonl",
+            "prompt": "first"
+        }));
+        let stop = normalize_event(&json!({
+            "hook_event_name": "Stop",
+            "session_id": "claude-session",
+            "transcript_path": "C:\\Users\\86147\\.claude\\projects\\demo\\session.jsonl",
+            "message": "stopped"
+        }));
+        let continued = normalize_event(&json!({
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "claude-session",
+            "transcript_path": "C:\\Users\\86147\\.claude\\projects\\demo\\session.jsonl",
+            "prompt": "continued"
+        }));
+
+        let derived_turn_id = start.turn_id.as_deref().unwrap_or_default().to_string();
+        assert!(derived_turn_id.starts_with("claude-transcript-"));
+        assert_eq!(stop.turn_id.as_deref(), Some(derived_turn_id.as_str()));
+        assert_eq!(continued.turn_id.as_deref(), Some(derived_turn_id.as_str()));
+
+        {
+            let mut state = state.lock().unwrap();
+            apply_task_event(&mut state, start);
+            apply_task_event(&mut state, stop);
+            apply_task_event(&mut state, continued);
+        }
+
+        let snapshot = task_snapshot(&state, &test_config(None));
+        assert_eq!(snapshot.source_tasks.claude.status, "running");
+        assert_eq!(snapshot.source_tasks.claude.active_count, 1);
+        assert_eq!(snapshot.source_tasks.claude.done_seq, 1);
+        assert_eq!(snapshot.source_tasks.codex.active_count, 0);
+        assert_eq!(
+            snapshot
+                .source_tasks
+                .claude
+                .task
+                .as_ref()
+                .map(|event| event.message.as_str()),
+            Some("continued")
+        );
+        assert_eq!(
+            snapshot
+                .source_tasks
+                .claude
+                .task
+                .as_ref()
+                .and_then(|event| event.turn_id.as_deref()),
+            Some(derived_turn_id.as_str())
+        );
+    }
+
+    #[test]
+    fn claude_session_only_stop_does_not_complete_identified_turn_task() {
+        let state = Arc::new(Mutex::new(BridgeState::default()));
+        {
+            let mut state = state.lock().unwrap();
+            apply_task_event(
+                &mut state,
+                normalize_event(&json!({
+                    "hook_event_name": "UserPromptSubmit",
+                    "source": "Claude",
+                    "session_id": "claude-session",
+                    "turn_id": "turn-1",
+                    "prompt": "first"
+                })),
+            );
+            apply_task_event(
+                &mut state,
+                normalize_event(&json!({
+                    "hook_event_name": "Stop",
+                    "source": "Claude",
+                    "session_id": "claude-session",
+                    "message": "stopped"
+                })),
+            );
+        }
+
+        let snapshot = task_snapshot(&state, &test_config(None));
+        assert_eq!(snapshot.source_tasks.claude.status, "running");
+        assert_eq!(snapshot.source_tasks.claude.active_count, 1);
+        assert_eq!(snapshot.source_tasks.claude.done_seq, 0);
+        assert_eq!(snapshot.unmatched_stop_count, 1);
     }
 
     #[test]
@@ -6296,11 +7368,248 @@ mod tests {
     }
 
     #[test]
+    fn bridge_info_reports_event_journal_status() {
+        let path = env::temp_dir().join(format!(
+            "codex-ornament-bridge-info-events-{}.jsonl",
+            std::process::id()
+        ));
+        fs::write(&path, b"{}\n").unwrap();
+
+        let mut config = test_config(None);
+        config.event_log_path = Some(path.clone());
+
+        let info = bridge_info(&config);
+
+        assert!(info.event_log_enabled);
+        assert_eq!(info.event_log_path.as_deref(), Some(path.to_str().unwrap()));
+        assert_eq!(info.event_log_bytes, Some(3));
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn ready_info_reports_event_journal_writability() {
+        let path = env::temp_dir().join(format!(
+            "codex-ornament-bridge-ready-events-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&path);
+
+        let mut config = test_config(None);
+        config.event_log_path = Some(path.clone());
+
+        let ready = ready_info(&config);
+
+        assert!(ready.ok);
+        assert!(ready.event_log_enabled);
+        assert!(ready.event_log_writable);
+        assert_eq!(
+            ready.event_log_path.as_deref(),
+            Some(path.to_str().unwrap())
+        );
+        assert_eq!(ready.event_log_error, None);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn ready_info_allows_disabled_event_journal() {
+        let config = test_config(None);
+
+        let ready = ready_info(&config);
+
+        assert!(ready.ok);
+        assert!(!ready.event_log_enabled);
+        assert!(ready.event_log_writable);
+        assert_eq!(ready.event_log_path, None);
+    }
+
+    #[test]
+    fn bridge_metrics_reports_readiness_and_bounded_state() {
+        let path = env::temp_dir().join(format!(
+            "codex-ornament-bridge-metrics-events-{}.jsonl",
+            std::process::id()
+        ));
+        fs::write(&path, b"{}\n").unwrap();
+
+        let mut config = test_config(None);
+        config.event_log_path = Some(path.clone());
+        let state = Arc::new(Mutex::new(BridgeState::default()));
+        {
+            let mut state = state.lock().unwrap();
+            apply_task_event(
+                &mut state,
+                normalize_event(&json!({
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": "session-1",
+                    "turn_id": "turn-1",
+                    "prompt": "build"
+                })),
+            );
+            apply_task_event(
+                &mut state,
+                normalize_event(&json!({
+                    "hook_event_name": "Stop",
+                    "session_id": "session-1",
+                    "turn_id": "turn-1",
+                    "message": "done"
+                })),
+            );
+        }
+
+        let metrics = bridge_metrics(&state, &config);
+
+        assert!(metrics.contains("codex_ornament_bridge_ready 1\n"));
+        assert!(metrics.contains("codex_ornament_bridge_event_log_writable 1\n"));
+        assert!(metrics.contains("codex_ornament_bridge_event_log_bytes 3\n"));
+        assert!(metrics.contains("codex_ornament_bridge_active_tasks 0\n"));
+        assert!(metrics.contains("codex_ornament_bridge_done_seq{source=\"all\"} 1\n"));
+        assert!(metrics.contains("codex_ornament_bridge_done_seq{source=\"codex\"} 1\n"));
+        assert!(metrics.contains("codex_ornament_bridge_done_tasks 1\n"));
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn event_journal_restores_applied_task_state() {
+        let path = env::temp_dir().join(format!(
+            "codex-ornament-bridge-events-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&path);
+
+        {
+            let mut journal = TaskEventJournal::open(
+                Some(&path),
+                DEFAULT_EVENT_LOG_MAX_BYTES,
+                DEFAULT_EVENT_LOG_COMPACT_KEEP_EVENTS,
+            )
+            .unwrap();
+            journal
+                .append(&normalize_event(&json!({
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": "session-1",
+                    "turn_id": "turn-1",
+                    "prompt": "first"
+                })))
+                .unwrap();
+            journal
+                .append(&normalize_event(&json!({
+                    "hook_event_name": "Stop",
+                    "session_id": "session-1",
+                    "turn_id": "turn-1",
+                    "message": "done"
+                })))
+                .unwrap();
+            journal
+                .append(&normalize_event(&json!({
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": "session-2",
+                    "turn_id": "turn-2",
+                    "prompt": "second"
+                })))
+                .unwrap();
+        }
+
+        let state = bridge_state_from_event_log(&path).unwrap();
+        assert_eq!(state.done_seq, 1);
+        assert_eq!(state.done_tasks.len(), 1);
+        assert_eq!(state.active_tasks.len(), 1);
+        assert_eq!(
+            ordered_active_tasks(&state)
+                .first()
+                .and_then(|event| event.session_id.as_deref()),
+            Some("session-2")
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn event_journal_compacts_to_recent_valid_events() {
+        let path = env::temp_dir().join(format!(
+            "codex-ornament-bridge-compact-events-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&path);
+
+        {
+            let mut journal = TaskEventJournal::open(Some(&path), 1, 3).unwrap();
+            for index in 0..6 {
+                journal
+                    .append(&normalize_event(&json!({
+                        "hook_event_name": "UserPromptSubmit",
+                        "session_id": format!("session-{index}"),
+                        "turn_id": format!("turn-{index}"),
+                        "prompt": format!("task {index}")
+                    })))
+                    .unwrap();
+            }
+        }
+
+        let lines = fs::read_to_string(&path).unwrap();
+        assert_eq!(lines.lines().count(), 3);
+        assert!(!lines.contains("session-2"));
+        assert!(lines.contains("session-3"));
+        assert!(lines.contains("session-5"));
+
+        let state = bridge_state_from_event_log(&path).unwrap();
+        assert_eq!(state.active_tasks.len(), 3);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn task_consumer_appends_only_applied_events_to_journal() {
+        let path = env::temp_dir().join(format!(
+            "codex-ornament-bridge-consumer-events-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&path);
+        let state = Arc::new(Mutex::new(BridgeState::default()));
+        let config = scoped_test_config("session-1", ".codex-test");
+        let mut journal = TaskEventJournal::open(
+            Some(&path),
+            DEFAULT_EVENT_LOG_MAX_BYTES,
+            DEFAULT_EVENT_LOG_COMPACT_KEEP_EVENTS,
+        )
+        .unwrap();
+
+        let applied = normalize_event(&json!({
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "session-1",
+            "turn_id": "turn-1"
+        }));
+        let filtered = normalize_event(&json!({
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "session-2",
+            "turn_id": "turn-2"
+        }));
+
+        assert_eq!(
+            consume_task_event(&state, &config, Some(&mut journal), applied),
+            TaskDispatchResult::Applied
+        );
+        assert_eq!(
+            consume_task_event(&state, &config, Some(&mut journal), filtered),
+            TaskDispatchResult::Filtered
+        );
+        drop(journal);
+
+        let lines = fs::read_to_string(&path).unwrap();
+        assert_eq!(lines.lines().count(), 1);
+        assert!(lines.contains("\"sessionId\":\"session-1\""));
+        assert!(!lines.contains("session-2"));
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
     fn task_consumer_applies_queued_events_in_order() {
         let state = Arc::new(Mutex::new(BridgeState::default()));
         let config = test_config(None);
         let (sender, receiver) = mpsc::sync_channel(TASK_EVENT_QUEUE_CAPACITY);
-        spawn_task_event_consumer(Arc::clone(&state), config, receiver);
+        spawn_task_event_consumer(Arc::clone(&state), config, None, receiver);
 
         let first = normalize_event(&json!({
             "hook_event_name": "UserPromptSubmit",
@@ -6342,7 +7651,7 @@ mod tests {
         let state = Arc::new(Mutex::new(BridgeState::default()));
         let config = test_config(None);
         let (sender, receiver) = mpsc::sync_channel(TASK_EVENT_QUEUE_CAPACITY);
-        spawn_task_event_consumer(Arc::clone(&state), config, receiver);
+        spawn_task_event_consumer(Arc::clone(&state), config, None, receiver);
 
         let producers = (0..8)
             .map(|index| {
@@ -6376,7 +7685,7 @@ mod tests {
         let state = Arc::new(Mutex::new(BridgeState::default()));
         let config = test_config(None);
         let (sender, receiver) = mpsc::sync_channel(TASK_EVENT_QUEUE_CAPACITY);
-        spawn_task_event_consumer(Arc::clone(&state), config, receiver);
+        spawn_task_event_consumer(Arc::clone(&state), config, None, receiver);
 
         for index in 0..8 {
             let event = normalize_event(&json!({
@@ -6426,7 +7735,7 @@ mod tests {
         let state = Arc::new(Mutex::new(BridgeState::default()));
         let config = test_config(None);
         let (sender, receiver) = mpsc::sync_channel(TASK_EVENT_QUEUE_CAPACITY);
-        spawn_task_event_consumer(Arc::clone(&state), config, receiver);
+        spawn_task_event_consumer(Arc::clone(&state), config, None, receiver);
 
         let starts = (0..6)
             .map(|index| {
@@ -6495,7 +7804,7 @@ mod tests {
         let state = Arc::new(Mutex::new(BridgeState::default()));
         let config = test_config(None);
         let (sender, receiver) = mpsc::sync_channel(TASK_EVENT_QUEUE_CAPACITY);
-        spawn_task_event_consumer(Arc::clone(&state), config, receiver);
+        spawn_task_event_consumer(Arc::clone(&state), config, None, receiver);
 
         let event = normalize_event(&json!({
             "hook_event_name": "UserPromptSubmit",
@@ -6521,7 +7830,7 @@ mod tests {
         let state = Arc::new(Mutex::new(BridgeState::default()));
         let config = scoped_test_config("session-1", ".codex-test");
         let (sender, receiver) = mpsc::sync_channel(TASK_EVENT_QUEUE_CAPACITY);
-        spawn_task_event_consumer(Arc::clone(&state), config, receiver);
+        spawn_task_event_consumer(Arc::clone(&state), config, None, receiver);
 
         let event = normalize_event(&json!({
             "hook_event_name": "UserPromptSubmit",
@@ -6544,7 +7853,7 @@ mod tests {
         let state = Arc::new(Mutex::new(BridgeState::default()));
         let config = test_config(None);
         let (sender, receiver) = mpsc::sync_channel(TASK_EVENT_QUEUE_CAPACITY);
-        spawn_task_event_consumer(Arc::clone(&state), config, receiver);
+        spawn_task_event_consumer(Arc::clone(&state), config, None, receiver);
         let desktop_cwd =
             "C:\\Program Files\\WindowsApps\\OpenAI.Codex_26.601.2237.0_x64__2p2nqsd0c76g0\\app";
 
@@ -6643,7 +7952,7 @@ mod tests {
         }));
 
         assert_eq!(
-            consume_task_event(&state, &test_config(None), event),
+            consume_task_event(&state, &test_config(None), None, event),
             TaskDispatchResult::LockUnavailable
         );
     }

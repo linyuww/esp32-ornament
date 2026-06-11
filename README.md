@@ -150,6 +150,7 @@ $env:CODEX_ORNAMENT_CAIYUN_TOKEN = "replace-with-your-token"
 - 任务身份优先使用 `source + turn_id`，其次使用 `source + session_id`，匿名任务使用递增 ID。
 - Codex 和 Claude 使用独立 source，互不闭合对方任务。
 - `source` 可用 `codex`、`claude` 或 `claudecode`。未提供时默认按 Codex 处理。
+- Claude hook payload 中带 `.claude` transcript path 时会自动按 Claude 处理，并派生稳定 `turn_id` 复用同一套任务身份规则。
 - `sourceTasks.codex` 和 `sourceTasks.claude` 分别给 Web 面板显示。
 - 顶层 `activeTaskCount` 和 `status` 给 ESP 硬件屏幕使用，保持合并任务视图。
 - 对 Codex session 日志会做最近任务恢复，用于处理上下文压缩、进程重启或 hook stop 丢失导致的 orphaned active task。

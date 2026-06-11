@@ -1,8 +1,21 @@
 #include "display_core.h"
-#include "standby_wallpaper.h"
 
+#ifndef CONFIG_ORNAMENT_STANDBY_WALLPAPER_ENABLED
+#define CONFIG_ORNAMENT_STANDBY_WALLPAPER_ENABLED 0
+#endif
+
+#if CONFIG_ORNAMENT_STANDBY_WALLPAPER_ENABLED
+#include "standby_wallpaper.h"
+#endif
+
+#ifndef CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
+#define CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED 0
+#endif
+
+#if CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
 #include "lvgl.h"
 #include "misc/lv_text_private.h"
+#endif
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -11,8 +24,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
 LV_FONT_DECLARE(font_puhui_16_4);
 LV_FONT_DECLARE(font_puhui_basic_16_4);
+#endif
 
 #ifndef CONFIG_ORNAMENT_QUOTA_CRITICAL_PERCENT
 #define CONFIG_ORNAMENT_QUOTA_CRITICAL_PERCENT 10
@@ -40,8 +55,18 @@ LV_FONT_DECLARE(font_puhui_basic_16_4);
 #define HUD_PANEL_BLUE display_core_rgb565(0, 66, 82)
 #define HUD_PANEL_GREEN display_core_rgb565(0, 74, 42)
 #define HUD_TEAL display_core_rgb565(44, 232, 196)
+#define HUD_SOFT_BG display_core_rgb565(7, 11, 16)
+#define HUD_SLATE display_core_rgb565(148, 163, 184)
+#define HUD_HUD_BG display_core_rgb565(0, 2, 4)
+#define HUD_HUD_CYAN display_core_rgb565(0, 238, 255)
+#define HUD_HUD_DIM display_core_rgb565(0, 58, 66)
+#define MUSIC_COVER_BG display_core_rgb565(10, 15, 20)
+#define MUSIC_COVER_DIM display_core_rgb565(25, 36, 48)
 
 static display_core_canvas_t *active_canvas;
+static music_player_snapshot_t music_fallback_snapshot;
+
+static void draw_text_center_fit(int y, const char *text, int preferred_scale, uint16_t color);
 
 uint16_t display_core_rgb565(uint8_t r, uint8_t g, uint8_t b)
 {
@@ -179,6 +204,32 @@ static void draw_rect_outline(int x, int y, int w, int h, int thickness, uint16_
     draw_hline(x, x + w - 1, y + h - thickness, thickness, color);
     draw_vline(x, y, y + h - 1, thickness, color);
     draw_vline(x + w - thickness, y, y + h - 1, thickness, color);
+}
+
+static void draw_line(int x0, int y0, int x1, int y1, int thickness, uint16_t color)
+{
+    int dx = abs(x1 - x0);
+    int sx_dir = x0 < x1 ? 1 : -1;
+    int dy = -abs(y1 - y0);
+    int sy_dir = y0 < y1 ? 1 : -1;
+    int err = dx + dy;
+    int half = thickness > 1 ? thickness / 2 : 0;
+
+    while (true) {
+        fill_rect(x0 - half, y0 - half, thickness, thickness, color);
+        if (x0 == x1 && y0 == y1) {
+            break;
+        }
+        int e2 = err * 2;
+        if (e2 >= dy) {
+            err += dy;
+            x0 += sx_dir;
+        }
+        if (e2 <= dx) {
+            err += dx;
+            y0 += sy_dir;
+        }
+    }
 }
 
 static void fill_circle(int cx, int cy, int radius, uint16_t color)
@@ -442,6 +493,29 @@ static int text_width_xy(const char *text, int x_scale)
     return (int)strlen(text) * 6 * x_scale;
 }
 
+static void draw_circle_outline(int cx, int cy, int radius, int thickness, uint16_t color)
+{
+    if (radius <= 0 || thickness <= 0) {
+        return;
+    }
+
+    int outer_sq = radius * radius;
+    int inner = radius - thickness;
+    int inner_sq = inner > 0 ? inner * inner : 0;
+    for (int y = cy - radius; y <= cy + radius; y++) {
+        for (int x = cx - radius; x <= cx + radius; x++) {
+            int dx = x - cx;
+            int dy = y - cy;
+            int dist_sq = dx * dx + dy * dy;
+            if (dist_sq <= outer_sq && dist_sq >= inner_sq) {
+                draw_pixel(x, y, color);
+            }
+        }
+    }
+}
+
+#if CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
+
 static uint32_t utf8_next(const char *text, uint32_t *offset)
 {
     if (text == NULL || offset == NULL || text[*offset] == '\0') {
@@ -678,9 +752,202 @@ static void draw_utf8_text_wrapped(
     }
 }
 
+static int utf8_text_width(const lv_font_t *font, const char *text, int max_width)
+{
+    if (font == NULL || text == NULL || text[0] == '\0') {
+        return 0;
+    }
+
+    int width = 0;
+    uint32_t offset = 0;
+    while (text[offset] != '\0') {
+        uint32_t letter_offset = offset;
+        uint32_t letter = utf8_next(text, &offset);
+        uint32_t next_offset = offset;
+        uint32_t letter_next = utf8_next(text, &next_offset);
+        if (letter == 0 || offset == letter_offset) {
+            offset++;
+            continue;
+        }
+
+        int adv = lv_font_get_glyph_width(font, letter, letter_next);
+        if (max_width > 0 && width + adv > max_width) {
+            break;
+        }
+        width += adv;
+    }
+    return width;
+}
+
+#endif
+
 static int min_int(int a, int b)
 {
     return a < b ? a : b;
+}
+
+static bool ascii_preview(const char *text, const char *fallback, char *out, size_t out_size)
+{
+    if (out == NULL || out_size == 0) {
+        return false;
+    }
+
+    size_t out_len = 0;
+    bool copied = false;
+    bool pending_space = false;
+    if (text == NULL || text[0] == '\0') {
+        text = fallback;
+    }
+
+    for (const unsigned char *ch = (const unsigned char *)text;
+         ch != NULL && *ch != '\0' && out_len + 1 < out_size;
+         ch++) {
+        if (*ch >= 0x80) {
+            pending_space = copied;
+            continue;
+        }
+        if (*ch == '\r' || *ch == '\n' || *ch == '\t' || *ch == ' ') {
+            pending_space = copied;
+            continue;
+        }
+        if (*ch < 0x20 || *ch > 0x7e) {
+            continue;
+        }
+        if (pending_space && out_len + 1 < out_size) {
+            out[out_len++] = ' ';
+        }
+        out[out_len++] = (char)*ch;
+        copied = true;
+        pending_space = false;
+    }
+
+    if (!copied && fallback != NULL && fallback[0] != '\0' && fallback != text) {
+        for (const char *ch = fallback; *ch != '\0' && out_len + 1 < out_size; ch++) {
+            if (*ch >= 0x20 && *ch <= 0x7e) {
+                out[out_len++] = *ch;
+            }
+        }
+        copied = out_len > 0;
+    }
+    if (!copied && out_len + 3 < out_size) {
+        out[out_len++] = '-';
+        out[out_len++] = '-';
+    }
+    out[out_len] = '\0';
+    return copied;
+}
+
+static void draw_ascii_text_wrapped_xy(
+    int x,
+    int y,
+    const char *text,
+    uint16_t color,
+    int max_width,
+    int max_lines,
+    int x_scale,
+    int y_scale)
+{
+    if (max_lines <= 0 || x_scale <= 0 || y_scale <= 0) {
+        return;
+    }
+
+    char clean[128];
+    ascii_preview(text, "--", clean, sizeof(clean));
+
+    int max_chars = max_width / (6 * x_scale);
+    if (max_chars < 1) {
+        max_chars = 1;
+    }
+    if (max_chars >= 64) {
+        max_chars = 63;
+    }
+
+    const char *cursor = clean;
+    const int line_h = 8 * y_scale + ss(2);
+    for (int line_no = 0; line_no < max_lines && cursor[0] != '\0'; line_no++) {
+        while (cursor[0] == ' ') {
+            cursor++;
+        }
+        if (cursor[0] == '\0') {
+            break;
+        }
+
+        int count = (int)strlen(cursor);
+        if (count > max_chars) {
+            count = max_chars;
+            int break_at = -1;
+            for (int i = count; i > 0; i--) {
+                if (cursor[i] == ' ') {
+                    break_at = i;
+                    break;
+                }
+            }
+            if (break_at > max_chars / 3) {
+                count = break_at;
+            }
+        }
+
+        char line[64];
+        memcpy(line, cursor, (size_t)count);
+        line[count] = '\0';
+        draw_text_xy(x, y + line_no * line_h, line, x_scale, y_scale, color);
+
+        cursor += count;
+        while (cursor[0] == ' ') {
+            cursor++;
+        }
+    }
+}
+
+static void draw_hud_wrapped_text(
+    int x,
+    int y,
+    const char *text,
+    const char *fallback,
+    uint16_t color,
+    int max_width,
+    int max_lines,
+    int x_scale,
+    int y_scale)
+{
+#if CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
+    (void)fallback;
+    (void)x_scale;
+    (void)y_scale;
+    draw_utf8_text_wrapped(x, y, &font_puhui_16_4, text, color, max_width, max_lines);
+#else
+    draw_ascii_text_wrapped_xy(
+        x,
+        y,
+        fallback != NULL && fallback[0] != '\0' ? fallback : text,
+        color,
+        max_width,
+        max_lines,
+        x_scale,
+        y_scale);
+#endif
+}
+
+static void draw_hud_center_text(
+    int y,
+    const char *text,
+    const char *fallback,
+    uint16_t color,
+    int preferred_scale)
+{
+#if CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
+    (void)fallback;
+    (void)preferred_scale;
+    const int max_width = active_canvas->width - sx(32);
+    int width = utf8_text_width(&font_puhui_16_4, text, max_width);
+    int x = ((int)active_canvas->width - width) / 2;
+    if (x < sx(8)) {
+        x = sx(8);
+    }
+    draw_utf8_text(x, y, &font_puhui_16_4, text, color, max_width);
+#else
+    draw_text_center_fit(y, fallback != NULL && fallback[0] != '\0' ? fallback : text, preferred_scale, color);
+#endif
 }
 
 static bool line_band_bounds(int y, int height, int margin, int *left, int *right)
@@ -891,6 +1158,7 @@ static const char *status_text_from_enum(ornament_status_t status)
 
 static void draw_standby_wallpaper(void)
 {
+#if CONFIG_ORNAMENT_STANDBY_WALLPAPER_ENABLED
     if (active_canvas->width != STANDBY_WALLPAPER_WIDTH || active_canvas->height != STANDBY_WALLPAPER_HEIGHT) {
         clear_canvas(HUD_BLACK);
         return;
@@ -899,6 +1167,25 @@ static void draw_standby_wallpaper(void)
         active_canvas->pixels,
         standby_wallpaper_rgb565,
         (size_t)STANDBY_WALLPAPER_WIDTH * STANDBY_WALLPAPER_HEIGHT * sizeof(uint16_t));
+#else
+    clear_canvas(HUD_BLACK);
+    for (int y = 0; y < active_canvas->height; y++) {
+        uint8_t blue = (uint8_t)(18 + (uint32_t)y * 24U / active_canvas->height);
+        uint8_t green = (uint8_t)(10 + (uint32_t)y * 10U / active_canvas->height);
+        uint16_t color = display_core_rgb565(2, green, blue);
+        for (int x = 0; x < active_canvas->width; x++) {
+            active_canvas->pixels[y * active_canvas->width + x] = color;
+        }
+    }
+    for (int i = 0; i < 6; i++) {
+        int x = sx(28 + i * 62);
+        int h = sy(34 + (i % 3) * 18);
+        fill_rect(x, active_canvas->height - h, ss(3), h, HUD_DIM_CYAN);
+    }
+    draw_circle_outline(active_canvas->center_x, active_canvas->center_y, ss(92), ss(1), HUD_DIM_BLUE);
+    draw_circle_outline(active_canvas->center_x, active_canvas->center_y, ss(118), ss(1), HUD_DIM_CYAN);
+    draw_hline(sx(34), sx(326), sy(222), ss(1), HUD_DIM_CYAN);
+#endif
 }
 
 static void standby_temperature_text(const ornament_state_t *state, char *out, size_t out_size)
@@ -1220,6 +1507,277 @@ static void fill_round_rect(int x, int y, int w, int h, int radius, uint16_t col
     fill_circle(x + w - radius - 1, y + h - radius - 1, radius, color);
 }
 
+static void draw_hud_chamfer_box(int x, int y, int w, int h, int cut, int thickness, uint16_t color)
+{
+    if (w <= cut * 2 || h <= cut * 2 || thickness <= 0) {
+        return;
+    }
+    draw_hline(x + cut, x + w - cut, y, thickness, color);
+    draw_hline(x + cut, x + w - cut, y + h - thickness, thickness, color);
+    draw_vline(x, y + cut, y + h - cut, thickness, color);
+    draw_vline(x + w - thickness, y + cut, y + h - cut, thickness, color);
+    draw_line(x + cut, y, x, y + cut, thickness, color);
+    draw_line(x + w - cut, y, x + w - thickness, y + cut, thickness, color);
+    draw_line(x, y + h - cut, x + cut, y + h - thickness, thickness, color);
+    draw_line(x + w - thickness, y + h - cut, x + w - cut, y + h - thickness, thickness, color);
+}
+
+static void draw_hud_user_icon(int x, int y, int size, uint16_t color)
+{
+    draw_hud_chamfer_box(x, y, size, size, ss(8), ss(1), color);
+    draw_circle_outline(x + size / 2, y + size / 3, size / 8, ss(2), color);
+    draw_circle_outline(x + size / 2, y + size * 2 / 3, size / 4, ss(2), color);
+    fill_rect(x + size / 4, y + size * 2 / 3, size / 2, size / 3, HUD_HUD_BG);
+}
+
+static void draw_hud_bot_icon(int x, int y, int size, uint16_t color)
+{
+    draw_hud_chamfer_box(x, y, size, size, ss(8), ss(1), color);
+    int head_x = x + size / 4;
+    int head_y = y + size / 3;
+    int head_w = size / 2;
+    int head_h = size / 3;
+    draw_rect_outline(head_x, head_y, head_w, head_h, ss(2), color);
+    fill_circle(head_x + head_w / 3, head_y + head_h / 2, ss(2), color);
+    fill_circle(head_x + head_w * 2 / 3, head_y + head_h / 2, ss(2), color);
+    fill_circle(x + size / 2, y + size / 4, ss(2), color);
+    draw_vline(x + size / 2, y + size / 4, head_y, ss(1), color);
+    draw_hline(head_x - ss(4), head_x, head_y + head_h / 2, ss(2), color);
+    draw_hline(head_x + head_w, head_x + head_w + ss(4), head_y + head_h / 2, ss(2), color);
+}
+
+static void draw_hud_microphone(int cx, int cy, int size, uint16_t color)
+{
+    int w = size / 4;
+    int h = size / 2;
+    draw_rect_outline(cx - w / 2, cy - h / 2, w, h, ss(2), color);
+    draw_line(cx - size / 4, cy, cx - size / 4, cy + size / 6, ss(2), color);
+    draw_line(cx + size / 4, cy, cx + size / 4, cy + size / 6, ss(2), color);
+    draw_hline(cx - size / 5, cx + size / 5, cy + size / 5, ss(2), color);
+    draw_vline(cx, cy + size / 5, cy + size / 3, ss(2), color);
+    draw_hline(cx - size / 6, cx + size / 6, cy + size / 3, ss(2), color);
+}
+
+static void draw_hud_speaker(int cx, int cy, int size, uint16_t color)
+{
+    fill_rect(cx - size / 3, cy - size / 6, size / 6, size / 3, color);
+    draw_line(cx - size / 6, cy - size / 6, cx + size / 12, cy - size / 3, ss(2), color);
+    draw_line(cx - size / 6, cy + size / 6, cx + size / 12, cy + size / 3, ss(2), color);
+    draw_vline(cx + size / 12, cy - size / 3, cy + size / 3, ss(2), color);
+    draw_circle_outline(cx + size / 8, cy, size / 4, ss(2), color);
+    draw_circle_outline(cx + size / 8, cy, size / 2, ss(2), color);
+    fill_rect(cx + size / 8 - size / 2, cy - size / 2 - ss(1), size / 2, size + ss(2), HUD_HUD_BG);
+}
+
+static void draw_hud_check(int cx, int cy, int size, uint16_t color)
+{
+    draw_circle_outline(cx, cy, size / 2, ss(2), color);
+    draw_line(cx - size / 5, cy, cx - size / 16, cy + size / 6, ss(3), color);
+    draw_line(cx - size / 16, cy + size / 6, cx + size / 4, cy - size / 5, ss(3), color);
+}
+
+static void draw_hud_wave(int cx, int cy, int width, int height, uint16_t color)
+{
+    const int bars = 11;
+    const int gap = width / (bars * 2);
+    int start_x = cx - (bars / 2) * gap;
+    for (int i = 0; i < bars; i++) {
+        int distance = abs(i - bars / 2);
+        int bar_h = height - distance * height / (bars / 2 + 1);
+        if ((i & 1) == 0) {
+            bar_h /= 2;
+        }
+        int x = start_x + i * gap;
+        draw_vline(x, cy - bar_h / 2, cy + bar_h / 2, ss(2), color);
+    }
+}
+
+static void draw_hud_segmented_ring(int cx, int cy, int radius, uint16_t color)
+{
+    int thick = ss(3);
+    int mid_thick = ss(2);
+    int gap = ss(14);
+    if (thick < 2) {
+        thick = 2;
+    }
+    if (mid_thick < 1) {
+        mid_thick = 1;
+    }
+    if (gap < 8) {
+        gap = 8;
+    }
+
+    draw_circle_outline(cx, cy, radius, thick, color);
+    draw_circle_outline(cx, cy, radius - ss(8), mid_thick, color);
+    draw_circle_outline(cx, cy, radius - ss(17), 1, HUD_HUD_DIM);
+
+    fill_rect(cx - gap / 2, cy - radius - thick, gap, thick * 4, HUD_HUD_BG);
+    fill_rect(cx - gap / 2, cy + radius - thick * 3, gap, thick * 5, HUD_HUD_BG);
+    fill_rect(cx - radius - thick, cy - gap / 2, thick * 5, gap, HUD_HUD_BG);
+    fill_rect(cx + radius - thick * 4, cy - gap / 2, thick * 5, gap, HUD_HUD_BG);
+
+    draw_vline(cx - radius + ss(2), cy - ss(8), cy - ss(2), thick, color);
+    draw_vline(cx - radius + ss(2), cy + ss(2), cy + ss(8), thick, color);
+    draw_vline(cx + radius - ss(4), cy - ss(8), cy - ss(2), thick, color);
+    draw_vline(cx + radius - ss(4), cy + ss(2), cy + ss(8), thick, color);
+}
+
+static void draw_hud_panel_marks(int x, int y, int w, int h, uint16_t color)
+{
+    int line = ss(2);
+    if (line < 1) {
+        line = 1;
+    }
+
+    draw_hline(x + ss(40), x + w - ss(40), y + ss(12), 1, HUD_HUD_DIM);
+    for (int i = 0; i < 3; i++) {
+        int mark_x = x + w - ss(28) + i * ss(8);
+        draw_line(mark_x, y + ss(14), mark_x + ss(6), y + ss(8), line, color);
+    }
+    draw_hline(x + ss(12), x + ss(18), y + h - ss(12), line, color);
+    draw_hline(x + ss(22), x + ss(28), y + h - ss(12), line, color);
+    draw_hline(x + ss(32), x + ss(38), y + h - ss(12), line, color);
+}
+
+static const char *xiaozhi_hud_main_ascii(xiaozhi_client_state_t state);
+
+static const char *xiaozhi_hud_main_text(xiaozhi_client_state_t state)
+{
+#if CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
+    switch (state) {
+    case XIAOZHI_CLIENT_STATE_LISTENING:
+        return "\xE5\x80\xBE\xE5\x90\xAC\xE4\xB8\xAD";
+    case XIAOZHI_CLIENT_STATE_SPEAKING:
+        return "\xE5\x9B\x9E\xE7\xAD\x94\xE4\xB8\xAD";
+    case XIAOZHI_CLIENT_STATE_CONNECTING:
+        return "\xE8\xBF\x9E\xE6\x8E\xA5\xE4\xB8\xAD";
+    case XIAOZHI_CLIENT_STATE_ERROR:
+    case XIAOZHI_CLIENT_STATE_CONFIG_MISSING:
+        return "\xE5\xBC\x82\xE5\xB8\xB8";
+    case XIAOZHI_CLIENT_STATE_IDLE:
+    case XIAOZHI_CLIENT_STATE_DISABLED:
+    default:
+        return "\xE5\xBE\x85\xE6\x9C\xBA\xE4\xB8\xAD";
+    }
+#else
+    return xiaozhi_hud_main_ascii(state);
+#endif
+}
+
+static const char *xiaozhi_hud_main_ascii(xiaozhi_client_state_t state)
+{
+    switch (state) {
+    case XIAOZHI_CLIENT_STATE_LISTENING:
+        return "LISTENING";
+    case XIAOZHI_CLIENT_STATE_SPEAKING:
+        return "ANSWERING";
+    case XIAOZHI_CLIENT_STATE_CONNECTING:
+        return "CONNECTING";
+    case XIAOZHI_CLIENT_STATE_ERROR:
+    case XIAOZHI_CLIENT_STATE_CONFIG_MISSING:
+        return "ERROR";
+    case XIAOZHI_CLIENT_STATE_IDLE:
+    case XIAOZHI_CLIENT_STATE_DISABLED:
+    default:
+        return "STANDBY";
+    }
+}
+
+static const char *xiaozhi_hud_assistant_hint(const xiaozhi_client_snapshot_t *snapshot, const char *tts_text)
+{
+    if (snapshot == NULL) {
+#if CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
+        return "\xE8\xBD\xBB\xE8\xA7\xA6\xE5\xBC\x80\xE5\xA7\x8B\xE5\xAF\xB9\xE8\xAF\x9D";
+#else
+        return "PRESS AI TO TALK";
+#endif
+    }
+    if (snapshot->activation_pending) {
+        return snapshot->activation_code[0] != '\0' ? snapshot->activation_code :
+#if CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
+            "\xE8\xAF\xB7\xE5\x85\x88\xE7\xBB\x91\xE5\xAE\x9A\xE8\xAE\xBE\xE5\xA4\x87";
+#else
+            "BIND PENDING";
+#endif
+    }
+    if (snapshot->last_tts[0] != '\0') {
+        return tts_text;
+    }
+    switch (snapshot->state) {
+    case XIAOZHI_CLIENT_STATE_LISTENING:
+#if CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
+        return "\xE6\xAD\xA3\xE5\x9C\xA8\xE6\x8E\xA5\xE6\x94\xB6\xE8\xAF\xAD\xE9\x9F\xB3\x2E\x2E\x2E";
+#else
+        return "RECEIVING VOICE";
+#endif
+    case XIAOZHI_CLIENT_STATE_SPEAKING:
+#if CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
+        return "\xE6\xAD\xA3\xE5\x9C\xA8\xE6\x92\xAD\xE6\x94\xBE\xE5\x9B\x9E\xE5\xA4\x8D";
+#else
+        return "PLAYING REPLY";
+#endif
+    case XIAOZHI_CLIENT_STATE_CONNECTING:
+#if CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
+        return "\xE7\xBD\x91\xE7\xBB\x9C\xE8\xBF\x9E\xE6\x8E\xA5\xE4\xB8\xAD";
+#else
+        return "WAITING CONNECTION";
+#endif
+    case XIAOZHI_CLIENT_STATE_ERROR:
+    case XIAOZHI_CLIENT_STATE_CONFIG_MISSING:
+        return snapshot->last_error[0] != '\0' ? snapshot->last_error :
+#if CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
+            "\xE9\x85\x8D\xE7\xBD\xAE\xE5\xBC\x82\xE5\xB8\xB8";
+#else
+            "CHECK CONFIG";
+#endif
+    case XIAOZHI_CLIENT_STATE_IDLE:
+    case XIAOZHI_CLIENT_STATE_DISABLED:
+    default:
+#if CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
+        return "\xE8\xBD\xBB\xE8\xA7\xA6\xE5\xBC\x80\xE5\xA7\x8B\xE5\xAF\xB9\xE8\xAF\x9D";
+#else
+        return "PRESS AI TO TALK";
+#endif
+    }
+}
+
+static const char *xiaozhi_hud_assistant_ascii(const xiaozhi_client_snapshot_t *snapshot, const char *tts_text)
+{
+    if (snapshot == NULL) {
+        return "PRESS AI TO TALK";
+    }
+    if (snapshot->activation_pending) {
+        return snapshot->activation_code[0] != '\0' ? snapshot->activation_code : "BIND PENDING";
+    }
+    if (snapshot->last_tts[0] != '\0') {
+        return tts_text;
+    }
+    switch (snapshot->state) {
+    case XIAOZHI_CLIENT_STATE_LISTENING:
+        return "RECEIVING VOICE";
+    case XIAOZHI_CLIENT_STATE_SPEAKING:
+        return "PLAYING REPLY";
+    case XIAOZHI_CLIENT_STATE_CONNECTING:
+        return "WAITING CONNECTION";
+    case XIAOZHI_CLIENT_STATE_ERROR:
+    case XIAOZHI_CLIENT_STATE_CONFIG_MISSING:
+        return snapshot->last_error[0] != '\0' ? snapshot->last_error : "CHECK CONFIG";
+    case XIAOZHI_CLIENT_STATE_IDLE:
+    case XIAOZHI_CLIENT_STATE_DISABLED:
+    default:
+        return "PRESS AI TO TALK";
+    }
+}
+
+static const char *xiaozhi_hud_done_text(void)
+{
+#if CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
+    return "\xE5\xB7\xB2\xE5\xAE\x8C\xE6\x88\x90";
+#else
+    return "DONE";
+#endif
+}
+
 static void draw_standby_background(void)
 {
     draw_standby_wallpaper();
@@ -1531,19 +2089,354 @@ void display_core_render_tasks(display_core_canvas_t *canvas, const ornament_sta
     draw_status_badge(state);
 }
 
+static bool parse_lrc_timestamp(const char *text, uint32_t *timestamp_ms, const char **line_text)
+{
+    if (text == NULL || text[0] != '[' || timestamp_ms == NULL || line_text == NULL) {
+        return false;
+    }
+
+    int minute = 0;
+    int second = 0;
+    int fraction = 0;
+    int fraction_digits = 0;
+    const char *cursor = text + 1;
+    if (*cursor < '0' || *cursor > '9') {
+        return false;
+    }
+    while (*cursor >= '0' && *cursor <= '9') {
+        minute = minute * 10 + (*cursor - '0');
+        cursor++;
+    }
+    if (*cursor != ':') {
+        return false;
+    }
+    cursor++;
+    for (int i = 0; i < 2; i++) {
+        if (*cursor < '0' || *cursor > '9') {
+            return false;
+        }
+        second = second * 10 + (*cursor - '0');
+        cursor++;
+    }
+    if (*cursor == '.' || *cursor == ':') {
+        cursor++;
+        while (*cursor >= '0' && *cursor <= '9' && fraction_digits < 3) {
+            fraction = fraction * 10 + (*cursor - '0');
+            fraction_digits++;
+            cursor++;
+        }
+        while (fraction_digits < 3) {
+            fraction *= 10;
+            fraction_digits++;
+        }
+        while (*cursor >= '0' && *cursor <= '9') {
+            cursor++;
+        }
+    }
+    if (*cursor != ']') {
+        return false;
+    }
+    cursor++;
+    while (*cursor == '[') {
+        const char *end = strchr(cursor, ']');
+        if (end == NULL) {
+            break;
+        }
+        cursor = end + 1;
+    }
+    while (*cursor == ' ' || *cursor == '\t') {
+        cursor++;
+    }
+
+    *timestamp_ms = (uint32_t)((minute * 60 + second) * 1000 + fraction);
+    *line_text = cursor;
+    return true;
+}
+
+static int collect_lrc_lines(
+    const char *lyrics,
+    uint32_t playback_ms,
+    const char **lines,
+    uint32_t *timestamps,
+    int max_lines)
+{
+    int count = 0;
+    if (lyrics == NULL || max_lines <= 0) {
+        return 0;
+    }
+
+    const char *cursor = lyrics;
+    while (*cursor != '\0' && count < max_lines) {
+        const char *line_start = cursor;
+        while (*cursor != '\0' && *cursor != '\n' && *cursor != '\r') {
+            cursor++;
+        }
+        char line[160];
+        size_t len = (size_t)(cursor - line_start);
+        if (len >= sizeof(line)) {
+            len = sizeof(line) - 1;
+        }
+        memcpy(line, line_start, len);
+        line[len] = '\0';
+        while (*cursor == '\r' || *cursor == '\n') {
+            cursor++;
+        }
+
+        uint32_t timestamp_ms = 0;
+        const char *line_text = NULL;
+        if (!parse_lrc_timestamp(line, &timestamp_ms, &line_text) || line_text == NULL || line_text[0] == '\0') {
+            continue;
+        }
+        timestamps[count] = timestamp_ms;
+        lines[count] = line_start;
+        count++;
+    }
+
+    (void)playback_ms;
+    return count;
+}
+
+static void copy_lyric_line_text(const char *source, char *target, size_t target_size)
+{
+    if (target == NULL || target_size == 0) {
+        return;
+    }
+    target[0] = '\0';
+    if (source == NULL) {
+        return;
+    }
+
+    char line[160];
+    size_t len = 0;
+    while (source[len] != '\0' && source[len] != '\r' && source[len] != '\n' && len + 1 < sizeof(line)) {
+        line[len] = source[len];
+        len++;
+    }
+    line[len] = '\0';
+
+    uint32_t ignored_ms = 0;
+    const char *text = line;
+    (void)parse_lrc_timestamp(line, &ignored_ms, &text);
+    ascii_preview(text, "--", target, target_size);
+}
+
+#if CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
+static void copy_lyric_line_utf8(const char *source, char *target, size_t target_size)
+{
+    if (target == NULL || target_size == 0) {
+        return;
+    }
+    target[0] = '\0';
+    if (source == NULL) {
+        return;
+    }
+
+    char line[160];
+    size_t len = 0;
+    while (source[len] != '\0' && source[len] != '\r' && source[len] != '\n' && len + 1 < sizeof(line)) {
+        line[len] = source[len];
+        len++;
+    }
+    line[len] = '\0';
+
+    uint32_t ignored_ms = 0;
+    const char *text = line;
+    (void)parse_lrc_timestamp(line, &ignored_ms, &text);
+    strlcpy(target, text != NULL && text[0] != '\0' ? text : "--", target_size);
+}
+#endif
+
+static void draw_cover_placeholder(int x, int y, int size, uint16_t accent)
+{
+    fill_round_rect(x, y, size, size, ss(10), MUSIC_COVER_BG);
+    draw_rect_outline(x, y, size, size, ss(1), HUD_HUD_DIM);
+    fill_circle(x + size / 2, y + size / 2, size / 3, MUSIC_COVER_DIM);
+    fill_circle(x + size / 2, y + size / 2, size / 9, HUD_HUD_BG);
+    draw_circle_outline(x + size / 2, y + size / 2, size / 3, ss(2), accent);
+}
+
+static void draw_cover_pixels(int x, int y, int size, const music_player_snapshot_t *snapshot)
+{
+    if (snapshot == NULL || !snapshot->has_cover || size <= 0) {
+        draw_cover_placeholder(x, y, size, HUD_HUD_CYAN);
+        return;
+    }
+#if CONFIG_ORNAMENT_MUSIC_COVER_ENABLED
+    if (snapshot->cover_pixels == NULL) {
+        draw_cover_placeholder(x, y, size, HUD_HUD_CYAN);
+        return;
+    }
+#endif
+
+    for (int yy = 0; yy < size; yy++) {
+        int src_y = yy * MUSIC_PLAYER_COVER_SIZE / size;
+        for (int xx = 0; xx < size; xx++) {
+            int src_x = xx * MUSIC_PLAYER_COVER_SIZE / size;
+#if CONFIG_ORNAMENT_MUSIC_COVER_ENABLED
+            draw_pixel(x + xx, y + yy, snapshot->cover_pixels[src_y * MUSIC_PLAYER_COVER_SIZE + src_x]);
+#else
+            (void)src_y;
+            (void)src_x;
+            draw_cover_placeholder(x, y, size, HUD_HUD_CYAN);
+            return;
+#endif
+        }
+    }
+    draw_rect_outline(x, y, size, size, ss(1), HUD_HUD_CYAN);
+}
+
+static void draw_music_lyrics(const music_player_snapshot_t *snapshot, int x, int y, int w)
+{
+#if !CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
+    (void)x;
+#endif
+    char lines_text[3][96];
+#if CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
+    char lines_utf8[3][160];
+#endif
+    const char *lrc_lines[96];
+    uint32_t lrc_times[96];
+    int current = 0;
+    int line_count = collect_lrc_lines(snapshot->lyrics, snapshot->playback_ms, lrc_lines, lrc_times, 96);
+
+    memset(lines_text, 0, sizeof(lines_text));
+#if CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
+    memset(lines_utf8, 0, sizeof(lines_utf8));
+#endif
+    if (line_count > 0) {
+        for (int i = 0; i < line_count; i++) {
+            if (lrc_times[i] <= snapshot->playback_ms) {
+                current = i;
+            } else {
+                break;
+            }
+        }
+        int first = current > 0 ? current - 1 : 0;
+        for (int i = 0; i < 3; i++) {
+            int source_index = first + i;
+            if (source_index < line_count) {
+                copy_lyric_line_text(lrc_lines[source_index], lines_text[i], sizeof(lines_text[i]));
+#if CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
+                copy_lyric_line_utf8(lrc_lines[source_index], lines_utf8[i], sizeof(lines_utf8[i]));
+#endif
+            }
+        }
+    } else {
+        char clean[220];
+        ascii_preview(snapshot->lyrics, "NO LYRIC", clean, sizeof(clean));
+        int base_scale = ss(1);
+        if (base_scale < 1) {
+            base_scale = 1;
+        }
+        int max_chars = w / (6 * base_scale);
+        if (max_chars < 8) {
+            max_chars = 8;
+        }
+        int len = (int)strlen(clean);
+        int offset = len > max_chars ? (int)((snapshot->playback_ms / 420) % (uint32_t)(len + 4)) : 0;
+        for (int i = 0; i < 3; i++) {
+            int start = offset + i * max_chars;
+            if (start >= len) {
+                start -= len;
+            }
+            for (int j = 0; j < max_chars && j + 1 < (int)sizeof(lines_text[i]); j++) {
+                int source_index = start + j;
+                if (source_index >= len) {
+                    break;
+                }
+                lines_text[i][j] = clean[source_index];
+                lines_text[i][j + 1] = '\0';
+            }
+        }
+    }
+
+#if CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
+    if (line_count > 0) {
+        for (int i = 0; i < 3; i++) {
+            uint16_t color = i == 1 ? HUD_WHITE : HUD_MUTED;
+            draw_utf8_text(x, y + i * sy(24), &font_puhui_16_4, lines_utf8[i][0] != '\0' ? lines_utf8[i] : "--", color, w);
+        }
+        return;
+    }
+#endif
+
+    for (int i = 0; i < 3; i++) {
+        uint16_t color = i == 1 ? HUD_WHITE : HUD_MUTED;
+        int scale = ss(1);
+        if (scale < 1) {
+            scale = 1;
+        }
+        draw_text_center_fit(y + i * sy(26), lines_text[i][0] != '\0' ? lines_text[i] : "--", scale, color);
+    }
+}
+
+void display_core_render_music(
+    display_core_canvas_t *canvas,
+    const ornament_state_t *state,
+    const music_player_snapshot_t *snapshot)
+{
+    if (!begin_render(canvas)) {
+        return;
+    }
+    if (snapshot == NULL) {
+        memset(&music_fallback_snapshot, 0, sizeof(music_fallback_snapshot));
+        music_fallback_snapshot.state = MUSIC_PLAYER_STATE_IDLE;
+        snapshot = &music_fallback_snapshot;
+    }
+
+    char title[96];
+    char artist[96];
+    char status[32];
+    const char *raw_title = snapshot->title[0] != '\0' ? snapshot->title : snapshot->song_name;
+    const char *raw_artist = snapshot->artist_name[0] != '\0' ? snapshot->artist_name : snapshot->album;
+    ascii_preview(raw_title, "MUSIC", title, sizeof(title));
+    ascii_preview(raw_artist, music_player_state_name(snapshot->state), artist, sizeof(artist));
+    snprintf(
+        status,
+        sizeof(status),
+        "%s %02lu:%02lu",
+        music_player_state_name(snapshot->state),
+        (unsigned long)(snapshot->playback_ms / 60000),
+        (unsigned long)((snapshot->playback_ms / 1000) % 60));
+
+    clear_canvas(HUD_HUD_BG);
+    draw_hud_chamfer_box(sx(8), sy(6), active_canvas->width - sx(16), active_canvas->height - sy(12), ss(12), ss(2), HUD_HUD_CYAN);
+    draw_text_xy(sx(18), sy(18), "MUSIC", ss(1), ss(1), HUD_WHITE);
+    draw_text_right_fit_xy(active_canvas->width - sx(18), sy(18), status, ss(1), ss(1), HUD_HUD_CYAN);
+
+    int cover_size = ss(96);
+    if (cover_size < 64) {
+        cover_size = 64;
+    }
+    if (cover_size > 104) {
+        cover_size = 104;
+    }
+    int cover_x = active_canvas->center_x - cover_size / 2;
+    int cover_y = sy(40);
+    draw_cover_pixels(cover_x, cover_y, cover_size, snapshot);
+
+    draw_text_center_fit(cover_y + cover_size + sy(12), title, ss(1), HUD_WHITE);
+    draw_text_center_fit(cover_y + cover_size + sy(32), artist, ss(1), HUD_MUTED);
+    draw_music_lyrics(snapshot, sx(24), cover_y + cover_size + sy(58), active_canvas->width - sx(48));
+    if (snapshot->stop_requested) {
+        draw_text_center_fit(active_canvas->height - sy(24), "STOPPING", ss(1), HUD_AMBER);
+    } else if (snapshot->last_error[0] != '\0' && snapshot->state == MUSIC_PLAYER_STATE_ERROR) {
+        draw_text_center_fit(active_canvas->height - sy(24), snapshot->last_error, ss(1), HUD_RED);
+    } else {
+        draw_hud_wave(active_canvas->center_x, active_canvas->height - sy(24), sx(70), sy(18), HUD_HUD_CYAN);
+    }
+
+    (void)state;
+}
+
 void display_core_render_xiaozhi(
     display_core_canvas_t *canvas,
     const ornament_state_t *state,
     const xiaozhi_client_snapshot_t *snapshot)
 {
-    ornament_state_t state_fallback;
     xiaozhi_client_snapshot_t snapshot_fallback;
     if (!begin_render(canvas)) {
         return;
-    }
-    if (state == NULL) {
-        ornament_state_init(&state_fallback);
-        state = &state_fallback;
     }
     if (snapshot == NULL) {
         memset(&snapshot_fallback, 0, sizeof(snapshot_fallback));
@@ -1551,69 +2444,129 @@ void display_core_render_xiaozhi(
         snapshot = &snapshot_fallback;
     }
 
-    char status_text[32];
-    char frames_text[48];
-    char config_text[64];
+    char stt_preview[96];
+    char assistant_preview[96];
     const char *stt_text = snapshot->last_stt[0] != '\0' ? snapshot->last_stt :
-        (snapshot->activation_pending ? "\xE7\xAD\x89\xE5\xBE\x85\xE7\xBB\x91\xE5\xAE\x9A..." : "\xE8\xAF\xB7\xE8\xAF\xB4\xE8\xAF\x9D...");
+        (snapshot->activation_pending ? "BIND PENDING" :
+#if CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
+            "\xE6\x98\x8E\xE5\xA4\xA9\xE5\xA4\xA9\xE6\xB0\x94\xE6\x80\x8E\xE4\xB9\x88\xE6\xA0\xB7\xEF\xBC\x9F"
+#else
+            "TOMORROW WEATHER?"
+#endif
+        );
     const char *tts_text = snapshot->last_tts[0] != '\0' ? snapshot->last_tts :
         (snapshot->activation_pending ?
-            (snapshot->activation_code[0] != '\0' ? snapshot->activation_code : "\xE8\xAF\xB7\xE7\xBB\x91\xE5\xAE\x9A\xE5\xAE\x98\xE6\x96\xB9") :
-            "\xE7\xAD\x89\xE5\xBE\x85\xE5\x9B\x9E\xE7\xAD\x94...");
-    snprintf(status_text, sizeof(status_text), "AI %s", xiaozhi_client_state_name(snapshot->state));
-    snprintf(frames_text, sizeof(frames_text), "UP %lu  DOWN %lu", (unsigned long)snapshot->uplink_frames, (unsigned long)snapshot->downlink_frames);
-    if (snapshot->activation_pending) {
-        snprintf(config_text, sizeof(config_text), "BIND %s", snapshot->activation_code[0] != '\0' ? snapshot->activation_code : "PENDING");
-    } else {
-        snprintf(config_text, sizeof(config_text), "%s %s", snapshot->configured ? "CONFIG OK" : "NO CONFIG", snapshot->connected ? "ONLINE" : "OFFLINE");
-    }
+            (snapshot->activation_code[0] != '\0' ? snapshot->activation_code : "BIND DEVICE") :
+            "WAITING REPLY");
+    const bool completed = snapshot->state == XIAOZHI_CLIENT_STATE_IDLE && snapshot->last_tts[0] != '\0';
+    const char *main_text = completed ? xiaozhi_hud_done_text() : xiaozhi_hud_main_text(snapshot->state);
+    const char *main_ascii = completed ? "DONE" : xiaozhi_hud_main_ascii(snapshot->state);
+    const char *assistant_text = xiaozhi_hud_assistant_hint(snapshot, tts_text);
+    const char *assistant_ascii = xiaozhi_hud_assistant_ascii(snapshot, tts_text);
+    ascii_preview(stt_text, "TOMORROW WEATHER?", stt_preview, sizeof(stt_preview));
+    ascii_preview(assistant_ascii, "PRESS AI TO TALK", assistant_preview, sizeof(assistant_preview));
 
-    uint16_t state_color = HUD_MUTED;
+    uint16_t state_color = HUD_HUD_CYAN;
     switch (snapshot->state) {
-    case XIAOZHI_CLIENT_STATE_LISTENING:
-        state_color = HUD_GREEN;
-        break;
-    case XIAOZHI_CLIENT_STATE_SPEAKING:
-        state_color = HUD_CYAN;
-        break;
-    case XIAOZHI_CLIENT_STATE_CONNECTING:
-        state_color = HUD_AMBER;
-        break;
     case XIAOZHI_CLIENT_STATE_ERROR:
     case XIAOZHI_CLIENT_STATE_CONFIG_MISSING:
         state_color = HUD_RED;
         break;
+    case XIAOZHI_CLIENT_STATE_CONNECTING:
+        state_color = HUD_AMBER;
+        break;
+    case XIAOZHI_CLIENT_STATE_LISTENING:
+    case XIAOZHI_CLIENT_STATE_SPEAKING:
     case XIAOZHI_CLIENT_STATE_IDLE:
     case XIAOZHI_CLIENT_STATE_DISABLED:
     default:
-        state_color = HUD_MUTED;
+        state_color = HUD_HUD_CYAN;
         break;
     }
 
-    const int bubble_w = sx(250);
-    const int bubble_h = sy(84);
-    const int bubble_r = ss(12);
-    const int user_y = sy(98);
-    const int ai_y = sy(194);
-    const int user_x = sx(74);
-    const int ai_x = sx(28);
-    const int user_text_x = user_x + ss(16);
-    const int ai_text_x = ai_x + ss(16);
+    const int line = ss(2) > 0 ? ss(2) : 1;
+    const int thin = 1;
+    const int text_scale = ss(1) > 0 ? ss(1) : 1;
+    const int margin = sx(7);
+    const int outer_y = sy(6);
+    const int outer_h = active_canvas->height - sy(12);
+    const int time_y = sy(16);
+    const int top_sep_y = sy(43);
+    const int query_x = sx(18);
+    const int query_y = sy(57);
+    const int query_w = active_canvas->width - sx(36);
+    const int query_h = sy(49);
+    const int icon_size = ss(30);
+    const int ring_cx = active_canvas->center_x;
+    const int ring_cy = sy(172);
+    const int ring_r = ss(68);
+    const int assistant_x = sx(18);
+    const int assistant_y = sy(273);
+    const int assistant_w = active_canvas->width - sx(36);
+    const int assistant_h = active_canvas->height - assistant_y - sy(18);
+    const char *time_text = state != NULL && state->local_time[0] != '\0' ? state->local_time : "--:--";
 
-    clear_canvas(HUD_BLACK);
-    draw_ring_ticks(state);
-    draw_text_center_fit(sy(30), "XIAOZHI AI", ss(3), HUD_WHITE);
-    draw_text_center_fit(sy(62), status_text, ss(2), state_color);
+    clear_canvas(HUD_HUD_BG);
+    draw_hud_chamfer_box(margin, outer_y, active_canvas->width - margin * 2, outer_h, ss(12), line, HUD_HUD_CYAN);
+    draw_hline(margin + sx(2), active_canvas->width - margin - sx(2), top_sep_y, thin, HUD_HUD_DIM);
+    fill_circle(active_canvas->center_x, time_y + ss(3), ss(3), HUD_HUD_CYAN);
+    draw_text_xy(sx(22), time_y, time_text, text_scale, text_scale, HUD_HUD_CYAN);
 
-    fill_round_rect(user_x, user_y, bubble_w, bubble_h, bubble_r, HUD_DIM_GREEN);
-    fill_round_rect(ai_x, ai_y, bubble_w, bubble_h, bubble_r, HUD_DIM_CYAN);
-    draw_text_xy(user_x + ss(12), user_y + ss(10), "YOU", 1, 1, HUD_MUTED);
-    draw_text_xy(ai_x + ss(12), ai_y + ss(10), "AI", 1, 1, HUD_MUTED);
-    draw_utf8_text_wrapped(user_text_x, user_y + ss(28), &font_puhui_16_4, stt_text, HUD_WHITE, bubble_w - ss(30), 2);
-    draw_utf8_text_wrapped(ai_text_x, ai_y + ss(28), &font_puhui_16_4, tts_text, HUD_WHITE, bubble_w - ss(30), 2);
+    draw_hud_chamfer_box(query_x, query_y, query_w, query_h, ss(8), thin, HUD_HUD_DIM);
+    draw_hud_user_icon(query_x + ss(8), query_y + ss(9), icon_size, HUD_HUD_CYAN);
+    draw_hud_wrapped_text(
+        query_x + icon_size + ss(18),
+        query_y + ss(16),
+        stt_text,
+        stt_preview,
+        HUD_HUD_CYAN,
+        query_w - icon_size - ss(50),
+        2,
+        text_scale,
+        text_scale);
+    draw_text_xy(query_x + query_w - ss(30), query_y + query_h - ss(18), "...", text_scale, text_scale, HUD_HUD_CYAN);
 
-    draw_text_center_fit(sy(300), frames_text, ss(1), HUD_TEAL);
-    draw_text_center_fit(sy(324), config_text, ss(1), snapshot->configured ? HUD_WHITE : HUD_AMBER);
+    draw_hud_segmented_ring(ring_cx, ring_cy, ring_r, state_color);
+    if (snapshot->state == XIAOZHI_CLIENT_STATE_LISTENING) {
+        draw_hud_wave(ring_cx - ring_r - ss(28), ring_cy + ss(3), ss(42), ss(35), state_color);
+        draw_hud_wave(ring_cx + ring_r + ss(28), ring_cy + ss(3), ss(42), ss(35), state_color);
+    }
+    draw_hud_center_text(ring_cy - ss(18), main_text, main_ascii, state_color, ss(2));
+    if (snapshot->state == XIAOZHI_CLIENT_STATE_LISTENING) {
+        draw_hud_microphone(ring_cx, ring_cy + ss(24), ss(32), HUD_WHITE);
+    } else if (snapshot->state == XIAOZHI_CLIENT_STATE_SPEAKING) {
+        draw_hud_speaker(ring_cx, ring_cy + ss(24), ss(32), HUD_WHITE);
+        draw_hud_wave(ring_cx, ring_cy + ss(51), ss(48), ss(18), state_color);
+    } else if (completed || snapshot->connected) {
+        draw_hud_check(ring_cx, ring_cy + ss(24), ss(32), HUD_WHITE);
+    } else {
+        draw_hud_microphone(ring_cx, ring_cy + ss(24), ss(32), HUD_WHITE);
+    }
+
+    draw_hud_chamfer_box(assistant_x, assistant_y, assistant_w, assistant_h, ss(8), thin, HUD_HUD_DIM);
+    draw_hud_panel_marks(assistant_x, assistant_y, assistant_w, assistant_h, state_color);
+    draw_hud_bot_icon(assistant_x + ss(8), assistant_y + ss(12), icon_size, state_color);
+#if CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
+    draw_utf8_text(
+        assistant_x + icon_size + ss(18),
+        assistant_y + ss(14),
+        &font_puhui_16_4,
+        "AI\xE5\x8A\xA9\xE6\x89\x8B",
+        state_color,
+        assistant_w - icon_size - ss(36));
+#else
+    draw_text_xy(assistant_x + icon_size + ss(18), assistant_y + ss(14), "AI ASSIST", text_scale, text_scale, state_color);
+#endif
+    draw_hud_wrapped_text(
+        assistant_x + icon_size + ss(18),
+        assistant_y + ss(28),
+        assistant_text,
+        assistant_preview,
+        HUD_HUD_CYAN,
+        assistant_w - icon_size - ss(34),
+        2,
+        text_scale,
+        text_scale);
 }
 
 static void render_message(display_core_canvas_t *canvas, const char *line1, const char *line2, uint16_t color)

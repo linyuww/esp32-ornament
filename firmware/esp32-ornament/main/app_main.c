@@ -11,6 +11,10 @@
 #include "wifi.h"
 #include "xiaozhi_client.h"
 
+#if CONFIG_ORNAMENT_WEB_CONSOLE_ENABLED
+#include "system_diagnostics.h"
+#endif
+
 #include "driver/gpio.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
@@ -127,9 +131,13 @@ static SemaphoreHandle_t voice_control_mutex;
 static voice_control_state_t voice_control;
 static QueueHandle_t voice_command_queue;
 static QueueHandle_t xiaozhi_session_queue;
+static music_player_snapshot_t ui_music_snapshot;
 
 static void log_heap_status(const char *stage)
 {
+#if CONFIG_ORNAMENT_WEB_CONSOLE_ENABLED
+    system_diagnostics_record_heap(stage);
+#endif
     ESP_LOGI(
         TAG,
         "heap %s: free=%u min=%u largest8=%u internal=%u spiram=%u",
@@ -681,6 +689,21 @@ static esp_err_t xiaozhi_start_session_if_needed(const char *reason)
     return err;
 }
 
+static esp_err_t xiaozhi_start_session_after_music_stop(const char *reason)
+{
+    if (music_player_is_active()) {
+        ESP_LOGI(TAG, "stopping music before Xiaozhi session: %s", reason != NULL ? reason : "<none>");
+        music_player_request_stop();
+        esp_err_t stop_err = music_player_stop();
+        if (stop_err != ESP_OK) {
+            ESP_LOGW(TAG, "music stop before Xiaozhi failed: %s", esp_err_to_name(stop_err));
+            return stop_err;
+        }
+    }
+
+    return xiaozhi_start_session_if_needed(reason);
+}
+
 static esp_err_t xiaozhi_stop_session_if_needed(const char *reason)
 {
     esp_err_t err = xiaozhi_client_stop_session();
@@ -1136,13 +1159,12 @@ static void handle_voice_command(asrpro_voice_command_t command)
         voice_control_set_view(VOICE_VIEW_STATUS, now, "QUIET OFF", "QUIET OFF");
         break;
     case ASRPRO_VOICE_COMMAND_XIAOZHI_START: {
-        bool music_active = music_player_is_active();
-        esp_err_t err = music_active ? ESP_ERR_INVALID_STATE : xiaozhi_start_session_if_needed("voice Xiaozhi start");
+        esp_err_t err = xiaozhi_start_session_after_music_stop("voice Xiaozhi start");
         voice_control_set_view(
             VOICE_VIEW_STATUS,
             now,
             "XIAOZHI START",
-            err == ESP_OK ? "AI LISTEN" : (music_active ? "MUSIC PLAYING" : esp_err_to_name(err)));
+            err == ESP_OK ? "AI LISTEN" : esp_err_to_name(err));
         break;
     }
     case ASRPRO_VOICE_COMMAND_XIAOZHI_STOP: {
@@ -1172,6 +1194,7 @@ static bool voice_manual_xiaozhi_page_active(const voice_control_state_t *voice_
            voice_view_active(voice_state->view, voice_state->hold_until_tick, now);
 }
 
+#if CONFIG_ORNAMENT_PAGE_BUTTON_ENABLED || CONFIG_ORNAMENT_AI_BUTTON_ENABLED
 static bool button_pressed_level(int level, bool active_low)
 {
     return active_low ? level == 0 : level != 0;
@@ -1188,11 +1211,12 @@ static esp_err_t configure_button_gpio(gpio_num_t gpio, bool active_low)
     };
     return gpio_config(&config);
 }
+#endif
 
+#if CONFIG_ORNAMENT_PAGE_BUTTON_ENABLED
 static void page_button_task(void *arg)
 {
     (void)arg;
-#if CONFIG_ORNAMENT_PAGE_BUTTON_ENABLED
     const gpio_num_t gpio = (gpio_num_t)CONFIG_ORNAMENT_PAGE_BUTTON_GPIO;
     ESP_ERROR_CHECK(configure_button_gpio(gpio, ORNAMENT_PAGE_BUTTON_ACTIVE_LOW));
 
@@ -1224,15 +1248,13 @@ static void page_button_task(void *arg)
         }
         vTaskDelay(poll_ticks);
     }
-#else
-    vTaskDelete(NULL);
-#endif
 }
+#endif
 
+#if CONFIG_ORNAMENT_AI_BUTTON_ENABLED
 static void ai_button_task(void *arg)
 {
     (void)arg;
-#if CONFIG_ORNAMENT_AI_BUTTON_ENABLED
     const gpio_num_t gpio = (gpio_num_t)CONFIG_ORNAMENT_AI_BUTTON_GPIO;
     ESP_ERROR_CHECK(configure_button_gpio(gpio, ORNAMENT_AI_BUTTON_ACTIVE_LOW));
 
@@ -1264,14 +1286,24 @@ static void ai_button_task(void *arg)
                 if (!voice_control_active_view(now, &active_view, &manual_active) ||
                     !manual_active ||
                     active_view != VOICE_VIEW_XIAOZHI) {
-                    ESP_LOGD(
-                        TAG,
-                        "AI button ignored on page=%s manual=%d",
-                        voice_view_name(active_view),
-                        manual_active);
+                    if (music_player_is_active()) {
+                        ESP_LOGI(TAG, "AI button stopping music and returning to Xiaozhi");
+                        music_player_request_stop();
+                        voice_control_set_view(VOICE_VIEW_XIAOZHI, now, "AI BUTTON", "STOP MUSIC");
+                        queue_xiaozhi_session_action(XIAOZHI_SESSION_ACTION_START, "AI button stopped music");
+                    } else {
+                        ESP_LOGD(
+                            TAG,
+                            "AI button ignored on page=%s manual=%d",
+                            voice_view_name(active_view),
+                            manual_active);
+                    }
                 } else {
                     if (music_player_is_active()) {
-                        ESP_LOGI(TAG, "AI button ignored while music is playing");
+                        ESP_LOGI(TAG, "AI button stopping music on Xiaozhi page");
+                        music_player_request_stop();
+                        voice_control_set_view(VOICE_VIEW_XIAOZHI, now, "AI BUTTON", "STOP MUSIC");
+                        queue_xiaozhi_session_action(XIAOZHI_SESSION_ACTION_START, "AI button stopped music on Xiaozhi page");
                         continue;
                     }
                     ESP_LOGI(TAG, "AI button pressed on Xiaozhi page");
@@ -1281,10 +1313,8 @@ static void ai_button_task(void *arg)
         }
         vTaskDelay(poll_ticks);
     }
-#else
-    vTaskDelete(NULL);
-#endif
 }
+#endif
 
 static void xiaozhi_session_task(void *arg)
 {
@@ -1304,11 +1334,7 @@ static void xiaozhi_session_task(void *arg)
 
         switch (request.action) {
         case XIAOZHI_SESSION_ACTION_START:
-            if (music_player_is_active()) {
-                ESP_LOGI(TAG, "queued Xiaozhi start ignored while music is playing");
-                break;
-            }
-            (void)xiaozhi_start_session_if_needed(request.reason != NULL ? request.reason : "queued start");
+            (void)xiaozhi_start_session_after_music_stop(request.reason != NULL ? request.reason : "queued start");
             break;
         case XIAOZHI_SESSION_ACTION_STOP:
             (void)xiaozhi_stop_session_if_needed(request.reason != NULL ? request.reason : "queued stop");
@@ -1317,7 +1343,7 @@ static void xiaozhi_session_task(void *arg)
             if (xiaozhi_client_session_requested()) {
                 (void)xiaozhi_stop_session_if_needed(request.reason != NULL ? request.reason : "queued toggle off");
             } else if (music_player_is_active()) {
-                ESP_LOGI(TAG, "queued Xiaozhi toggle-on ignored while music is playing");
+                (void)xiaozhi_start_session_after_music_stop(request.reason != NULL ? request.reason : "queued toggle on after music");
             } else {
                 (void)xiaozhi_start_session_if_needed(request.reason != NULL ? request.reason : "queued toggle on");
             }
@@ -1348,8 +1374,12 @@ static void create_app_task(
     uint32_t stack_depth,
     UBaseType_t priority)
 {
-    BaseType_t created = xTaskCreate(task_fn, name, stack_depth, NULL, priority, NULL);
+    TaskHandle_t handle = NULL;
+    BaseType_t created = xTaskCreate(task_fn, name, stack_depth, NULL, priority, &handle);
     ESP_ERROR_CHECK(created == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
+#if CONFIG_ORNAMENT_WEB_CONSOLE_ENABLED
+    system_diagnostics_register_task(name, handle, stack_depth, priority, false);
+#endif
 }
 
 static void create_app_task_psram(
@@ -1358,15 +1388,19 @@ static void create_app_task_psram(
     uint32_t stack_depth,
     UBaseType_t priority)
 {
+    TaskHandle_t handle = NULL;
     BaseType_t created = xTaskCreateWithCaps(
         task_fn,
         name,
         stack_depth,
         NULL,
         priority,
-        NULL,
+        &handle,
         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     ESP_ERROR_CHECK(created == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
+#if CONFIG_ORNAMENT_WEB_CONSOLE_ENABLED
+    system_diagnostics_register_task(name, handle, stack_depth, priority, true);
+#endif
 }
 
 static void poll_task(void *arg)
@@ -1555,6 +1589,7 @@ static void ui_render_task(void *arg)
         apply_local_state(&state, state.bridge_offline);
         web_console_set_last_state(&state, fetch_error);
         xiaozhi_client_status_snapshot(&xiaozhi_snapshot);
+        music_player_status_snapshot(&ui_music_snapshot);
         bool have_voice_state = voice_control_snapshot(&voice_state);
         if (xiaozhi_should_refresh_page_focus(
                 &xiaozhi_snapshot,
@@ -1604,7 +1639,9 @@ static void ui_render_task(void *arg)
             page_rendered = render_voice_override(&state, fetch_error, &xiaozhi_snapshot, &voice_state, now);
         }
         if (!page_rendered) {
-            if (xiaozhi_page_visible) {
+            if (ui_music_snapshot.active || ui_music_snapshot.state == MUSIC_PLAYER_STATE_ERROR) {
+                display_render_music(&state, &ui_music_snapshot);
+            } else if (xiaozhi_page_visible) {
                 display_render_xiaozhi(&state, &xiaozhi_snapshot);
             } else if (!(have_voice_state && render_voice_override(&state, fetch_error, &xiaozhi_snapshot, &voice_state, now))) {
                 render_current_state(&state, idle_since_tick, now);
@@ -1681,8 +1718,12 @@ void app_main(void)
 
     create_app_task(voice_command_task, "voice_cmd", 4096, 5);
     create_app_task(xiaozhi_session_task, "xiaozhi_ctl", 8192, 5);
+#if CONFIG_ORNAMENT_PAGE_BUTTON_ENABLED
     create_app_task(page_button_task, "page_button", 3072, 5);
+#endif
+#if CONFIG_ORNAMENT_AI_BUTTON_ENABLED
     create_app_task(ai_button_task, "ai_button", 4096, 5);
+#endif
     create_app_task(poll_task, "bridge_poll", 8192, 5);
     create_app_task_psram(ui_render_task, "ui_render", UI_RENDER_TASK_STACK, 4);
     log_heap_status("after_tasks");

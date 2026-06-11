@@ -1,5 +1,11 @@
 #include "web_console.h"
 
+#ifndef CONFIG_ORNAMENT_WEB_CONSOLE_ENABLED
+#define CONFIG_ORNAMENT_WEB_CONSOLE_ENABLED 0
+#endif
+
+#if CONFIG_ORNAMENT_WEB_CONSOLE_ENABLED
+
 #include "bridge_client.h"
 #include "device_identity.h"
 #include "esp_heap_caps.h"
@@ -8,7 +14,9 @@
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
+#include "music_player.h"
 #include "settings.h"
+#include "system_diagnostics.h"
 #include "task_audio.h"
 #include "weather_client.h"
 #include "wifi.h"
@@ -33,6 +41,7 @@ static esp_err_t last_fetch_error = ESP_ERR_INVALID_STATE;
 static int64_t last_state_us;
 static ornament_settings_t console_settings;
 static web_console_bridge_debug_t bridge_debug;
+static music_player_snapshot_t console_music_snapshot;
 
 static void refresh_console_settings(void)
 {
@@ -40,6 +49,22 @@ static void refresh_console_settings(void)
         memset(&console_settings, 0, sizeof(console_settings));
         console_settings.audio_volume_percent = CONFIG_ORNAMENT_AUDIO_VOLUME_PERCENT;
     }
+}
+
+static char *alloc_response_buffer(size_t size)
+{
+    char *buffer = heap_caps_calloc(1, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (buffer != NULL) {
+        return buffer;
+    }
+
+    ESP_LOGW(
+        TAG,
+        "PSRAM response allocation failed: size=%u largest_spiram=%u largest_internal=%u",
+        (unsigned int)size,
+        (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT),
+        (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    return heap_caps_calloc(1, size, MALLOC_CAP_8BIT);
 }
 
 static void append(char *text, size_t text_size, size_t *used, const char *chunk)
@@ -251,6 +276,73 @@ static void state_snapshot(ornament_state_t *state, esp_err_t *fetch_error, int6
     }
 }
 
+static void append_diagnostics_json(
+    char *json,
+    size_t json_size,
+    size_t *used,
+    const system_diagnostics_snapshot_t *diag)
+{
+    appendf(
+        json,
+        json_size,
+        used,
+        "\"system\":{\"uptime_ms\":%lld,\"reset_reason\":\"%s\",\"reset_reason_code\":%d,"
+        "\"heap\":{\"free\":%u,\"min_free\":%u,\"largest_free_block\":%u,"
+        "\"internal_free\":%u,\"internal_min_free\":%u,\"largest_internal_block\":%u,"
+        "\"spiram_free\":%u,\"spiram_min_free\":%u,\"largest_spiram_block\":%u},",
+        (long long)diag->uptime_ms,
+        system_diagnostics_reset_reason_name(diag->reset_reason),
+        (int)diag->reset_reason,
+        (unsigned int)diag->free_heap,
+        (unsigned int)diag->minimum_free_heap,
+        (unsigned int)diag->largest_8bit_block,
+        (unsigned int)diag->internal_free,
+        (unsigned int)diag->internal_minimum_free,
+        (unsigned int)diag->largest_internal_block,
+        (unsigned int)diag->spiram_free,
+        (unsigned int)diag->spiram_minimum_free,
+        (unsigned int)diag->largest_spiram_block);
+
+    append(json, json_size, used, "\"tasks\":[");
+    for (size_t i = 0; i < diag->task_count; i++) {
+        const system_diagnostics_task_t *task = &diag->tasks[i];
+        if (!task->valid) {
+            continue;
+        }
+        appendf(
+            json,
+            json_size,
+            used,
+            "%s{\"name\":\"%s\",\"stack_bytes\":%u,\"stack_high_water_bytes\":%u,"
+            "\"priority\":%u,\"external_stack\":%s}",
+            i > 0 ? "," : "",
+            task->name,
+            (unsigned int)task->configured_stack_bytes,
+            (unsigned int)task->stack_high_water_bytes,
+            (unsigned int)task->priority,
+            task->external_stack ? "true" : "false");
+    }
+    append(json, json_size, used, "],\"heap_checkpoints\":[");
+    for (size_t i = 0; i < diag->heap_checkpoint_count; i++) {
+        const system_diagnostics_heap_checkpoint_t *checkpoint = &diag->heap_checkpoints[i];
+        appendf(
+            json,
+            json_size,
+            used,
+            "%s{\"stage\":\"%s\",\"uptime_ms\":%lld,\"free\":%u,\"min_free\":%u,"
+            "\"largest_free_block\":%u,\"internal_free\":%u,\"spiram_free\":%u}",
+            i > 0 ? "," : "",
+            checkpoint->stage,
+            (long long)checkpoint->uptime_ms,
+            (unsigned int)checkpoint->free_heap,
+            (unsigned int)checkpoint->minimum_free_heap,
+            (unsigned int)checkpoint->largest_8bit_block,
+            (unsigned int)checkpoint->internal_free,
+            (unsigned int)checkpoint->spiram_free);
+    }
+    append(json, json_size, used, "]},");
+}
+
 void web_console_set_last_state(const ornament_state_t *state, esp_err_t fetch_error)
 {
     if (state == NULL) {
@@ -305,8 +397,15 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     char xiaozhi_last_error[XIAOZHI_STATUS_TEXT_MAX * 2];
     char xiaozhi_last_stt[XIAOZHI_STATUS_TEXT_MAX * 2];
     char xiaozhi_last_tts[XIAOZHI_STATUS_TEXT_MAX * 2];
+    char music_title[ORNAMENT_TEXT_MAX * 2];
+    char music_artist[ORNAMENT_TEXT_MAX * 2];
+    char music_album[ORNAMENT_TEXT_MAX * 2];
+    char music_picture[ORNAMENT_BRIDGE_URL_MAX * 2];
+    char music_cover_url[ORNAMENT_BRIDGE_URL_MAX * 2];
     xiaozhi_client_snapshot_t xiaozhi = {0};
+    music_player_snapshot_t *music = &console_music_snapshot;
     web_console_bridge_debug_t bridge_diag = {0};
+    system_diagnostics_snapshot_t diag = {0};
 
     ornament_state_init(&state);
     state_snapshot(&state, &fetch_error, &age_ms);
@@ -326,6 +425,7 @@ static esp_err_t status_get_handler(httpd_req_t *req)
 
     json_escape(settings_bridge_url_or_default(&console_settings), bridge_url, sizeof(bridge_url));
     xiaozhi_client_status_snapshot(&xiaozhi);
+    system_diagnostics_snapshot(&diag);
     json_escape(xiaozhi.ws_url, xiaozhi_ws_url, sizeof(xiaozhi_ws_url));
     json_escape(xiaozhi.saved_ws_url, xiaozhi_saved_ws_url, sizeof(xiaozhi_saved_ws_url));
     json_escape(xiaozhi.runtime_ws_url, xiaozhi_runtime_ws_url, sizeof(xiaozhi_runtime_ws_url));
@@ -337,19 +437,26 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     json_escape(xiaozhi.last_error, xiaozhi_last_error, sizeof(xiaozhi_last_error));
     json_escape(xiaozhi.last_stt, xiaozhi_last_stt, sizeof(xiaozhi_last_stt));
     json_escape(xiaozhi.last_tts, xiaozhi_last_tts, sizeof(xiaozhi_last_tts));
+    music_player_status_snapshot(music);
+    json_escape(music->title, music_title, sizeof(music_title));
+    json_escape(music->artist_name, music_artist, sizeof(music_artist));
+    json_escape(music->album, music_album, sizeof(music_album));
+    json_escape(music->picture, music_picture, sizeof(music_picture));
+    json_escape(music->cover_url, music_cover_url, sizeof(music_cover_url));
     if (state_mutex != NULL && xSemaphoreTake(state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         bridge_diag = bridge_debug;
         xSemaphoreGive(state_mutex);
     }
 
-    const size_t json_size = 8192;
-    char *json = calloc(1, json_size);
+    const size_t json_size = 12288;
+    char *json = alloc_response_buffer(json_size);
     if (json == NULL) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
         return ESP_FAIL;
     }
     size_t used = 0;
     append(json, json_size, &used, "{");
+    append_diagnostics_json(json, json_size, &used, &diag);
     appendf(json, json_size, &used, "\"uptime_ms\":%lld,", (long long)(esp_timer_get_time() / 1000));
     appendf(json, json_size, &used, "\"last_state_age_ms\":%lld,", (long long)age_ms);
     appendf(json, json_size, &used, "\"fetch_error\":\"%s\",", esp_err_to_name(fetch_error));
@@ -425,6 +532,23 @@ static esp_err_t status_get_handler(httpd_req_t *req)
         json,
         json_size,
         &used,
+        "\"music\":{\"active\":%s,\"stop_requested\":%s,\"state\":\"%s\",\"title\":\"%s\",\"artist\":\"%s\",\"album\":\"%s\",\"picture\":\"%s\",\"cover_url\":\"%s\",\"has_cover\":%s,\"has_lyrics\":%s,\"lyrics_bytes\":%u,\"playback_ms\":%u},",
+        music->active ? "true" : "false",
+        music->stop_requested ? "true" : "false",
+        music_player_state_name(music->state),
+        music_title,
+        music_artist,
+        music_album,
+        music_picture,
+        music_cover_url,
+        music->has_cover ? "true" : "false",
+        music->lyrics[0] != '\0' ? "true" : "false",
+        (unsigned int)strlen(music->lyrics),
+        (unsigned int)music->playback_ms);
+    appendf(
+        json,
+        json_size,
+        &used,
         "\"xiaozhi\":{\"enabled\":%s,\"configured\":%s,\"connected\":%s,\"ai_enabled\":%s,\"session_requested\":%s,\"state\":\"%s\",\"protocol_version\":%d,\"activation_pending\":%s,\"official_runtime_config\":%s,\"ws_url\":\"%s\",\"saved_ws_url\":\"%s\",\"runtime_ws_url\":\"%s\",\"active_ws_url\":\"%s\",\"client_id\":\"%s\",\"session_id\":\"%s\",\"activation_code\":\"%s\",\"activation_message\":\"%s\",\"last_error\":\"%s\",\"last_stt\":\"%s\",\"last_tts\":\"%s\",\"uplink_frames\":%u,\"downlink_frames\":%u},",
         xiaozhi.enabled ? "true" : "false",
         xiaozhi.configured ? "true" : "false",
@@ -465,10 +589,10 @@ static esp_err_t status_get_handler(httpd_req_t *req)
         json_size,
         &used,
         "\"heap\":{\"free\":%u,\"min_free\":%u,\"largest_free_block\":%u,\"largest_internal_block\":%u}}",
-        (unsigned int)esp_get_free_heap_size(),
-        (unsigned int)esp_get_minimum_free_heap_size(),
-        (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
-        (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+        (unsigned int)diag.free_heap,
+        (unsigned int)diag.minimum_free_heap,
+        (unsigned int)diag.largest_8bit_block,
+        (unsigned int)diag.largest_internal_block);
 
     httpd_resp_set_type(req, "application/json");
     esp_err_t err = httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
@@ -512,6 +636,7 @@ static esp_err_t root_get_handler(httpd_req_t *req)
     char weather_lat_text[24];
     char weather_lon_text[24];
     web_console_bridge_debug_t bridge_diag = {0};
+    system_diagnostics_snapshot_t diag = {0};
     int audio_volume_percent = settings_audio_volume_percent_or_default(&console_settings);
 
     ornament_state_init(&state);
@@ -521,6 +646,7 @@ static esp_err_t root_get_handler(httpd_req_t *req)
     int codex_done_seq = state.has_codex_summary ? state.codex_done_seq : state.done_seq;
     html_escape(settings_bridge_url_or_default(&console_settings), bridge_url, sizeof(bridge_url));
     xiaozhi_client_status_snapshot(&xiaozhi);
+    system_diagnostics_snapshot(&diag);
     html_escape(settings_xiaozhi_ws_url_or_default(&console_settings), xiaozhi_ws_url, sizeof(xiaozhi_ws_url));
     html_escape(xiaozhi.saved_ws_url, xiaozhi_saved_ws_url, sizeof(xiaozhi_saved_ws_url));
     html_escape(xiaozhi.runtime_ws_url, xiaozhi_runtime_ws_url, sizeof(xiaozhi_runtime_ws_url));
@@ -573,8 +699,8 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         snprintf(weather_detail, sizeof(weather_detail), "%s", weather_label[0] != '\0' ? weather_label : "--");
     }
 
-    const size_t html_size = 15360;
-    char *html = calloc(1, html_size);
+    const size_t html_size = 20480;
+    char *html = alloc_response_buffer(html_size);
     if (html == NULL) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
         return ESP_FAIL;
@@ -652,6 +778,29 @@ static esp_err_t root_get_handler(httpd_req_t *req)
     appendf(html, html_size, &used, "<div class=\"card\"><div class=\"k\">Last Success</div><div class=\"v\">%lld ms</div><div class=\"k\">since boot</div></div>", (long long)bridge_diag.last_success_ms);
     appendf(html, html_size, &used, "<div class=\"card\"><div class=\"k\">Last Failure</div><div class=\"v\">%lld ms</div><div class=\"k\">since boot</div></div>", (long long)bridge_diag.last_failure_ms);
     appendf(html, html_size, &used, "<div class=\"card\"><div class=\"k\">Auto Match</div><div class=\"v\">%s</div><div class=\"k\">%s / %s</div></div>", bridge_diag.last_auto_match_ok ? "ok" : "failed", esp_err_to_name(bridge_diag.last_auto_match_error), bridge_diag.last_auto_match_reason[0] != '\0' ? bridge_diag.last_auto_match_reason : "--");
+    append(html, html_size, &used, "</section>");
+    append(html, html_size, &used, "<h2>System</h2><section class=\"grid\">");
+    appendf(html, html_size, &used, "<div class=\"card\"><div class=\"k\">Reset</div><div class=\"v\">%s</div><div class=\"k\">code %d</div></div>", system_diagnostics_reset_reason_name(diag.reset_reason), (int)diag.reset_reason);
+    appendf(html, html_size, &used, "<div class=\"card\"><div class=\"k\">Heap Free</div><div class=\"v\">%u KB</div><div class=\"k\">min %u KB</div></div>", (unsigned int)(diag.free_heap / 1024), (unsigned int)(diag.minimum_free_heap / 1024));
+    appendf(html, html_size, &used, "<div class=\"card\"><div class=\"k\">Internal RAM</div><div class=\"v\">%u KB</div><div class=\"k\">largest block %u KB</div></div>", (unsigned int)(diag.internal_free / 1024), (unsigned int)(diag.largest_internal_block / 1024));
+    appendf(html, html_size, &used, "<div class=\"card\"><div class=\"k\">PSRAM</div><div class=\"v\">%u KB</div><div class=\"k\">largest block %u KB</div></div>", (unsigned int)(diag.spiram_free / 1024), (unsigned int)(diag.largest_spiram_block / 1024));
+    append(html, html_size, &used, "</section><section class=\"grid\">");
+    for (size_t i = 0; i < diag.task_count; i++) {
+        const system_diagnostics_task_t *task = &diag.tasks[i];
+        if (!task->valid) {
+            continue;
+        }
+        appendf(
+            html,
+            html_size,
+            &used,
+            "<div class=\"card\"><div class=\"k\">%s</div><div class=\"v\">%u B</div>"
+            "<div class=\"k\">stack low water / %u B %s</div></div>",
+            task->name,
+            (unsigned int)task->stack_high_water_bytes,
+            (unsigned int)task->configured_stack_bytes,
+            task->external_stack ? "psram" : "internal");
+    }
     append(html, html_size, &used, "</section>");
     append(html, html_size, &used, "<h2>Xiaozhi AI</h2><section class=\"grid\">");
     appendf(
@@ -1687,3 +1836,23 @@ esp_err_t web_console_start(void)
     ESP_LOGI(TAG, "web console started on http://<device-ip>/");
     return ESP_OK;
 }
+
+#else
+
+esp_err_t web_console_start(void)
+{
+    return ESP_OK;
+}
+
+void web_console_set_last_state(const ornament_state_t *state, esp_err_t fetch_error)
+{
+    (void)state;
+    (void)fetch_error;
+}
+
+void web_console_set_bridge_debug(const web_console_bridge_debug_t *debug)
+{
+    (void)debug;
+}
+
+#endif

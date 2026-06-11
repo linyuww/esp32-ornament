@@ -23,6 +23,8 @@
 
 #if CONFIG_ORNAMENT_XIAOZHI_ENABLED && CONFIG_ORNAMENT_XIAOZHI_MCP_ENABLED
 
+static music_player_snapshot_t mcp_music_snapshot;
+
 static void append_text(char *target, size_t target_size, const char *text)
 {
     if (target == NULL || target_size == 0 || text == NULL) {
@@ -140,23 +142,27 @@ static cJSON *text_content(const char *text)
 
 static cJSON *music_status_json(void)
 {
-    music_player_snapshot_t snapshot = {0};
-    music_player_status_snapshot(&snapshot);
+    music_player_snapshot_t *snapshot = &mcp_music_snapshot;
+    music_player_status_snapshot(snapshot);
 
     cJSON *status = cJSON_CreateObject();
     if (status == NULL) {
         return NULL;
     }
-    cJSON_AddBoolToObject(status, "active", snapshot.active);
-    cJSON_AddBoolToObject(status, "stop_requested", snapshot.stop_requested);
-    cJSON_AddStringToObject(status, "state", music_player_state_name(snapshot.state));
-    cJSON_AddNumberToObject(status, "index", (double)snapshot.index);
-    cJSON_AddStringToObject(status, "song_name", snapshot.song_name);
-    cJSON_AddStringToObject(status, "artist_name", snapshot.artist_name);
-    cJSON_AddStringToObject(status, "title", snapshot.title);
-    cJSON_AddStringToObject(status, "album", snapshot.album);
-    cJSON_AddStringToObject(status, "picture", snapshot.picture);
-    cJSON_AddStringToObject(status, "last_error", snapshot.last_error);
+    cJSON_AddBoolToObject(status, "active", snapshot->active);
+    cJSON_AddBoolToObject(status, "stop_requested", snapshot->stop_requested);
+    cJSON_AddStringToObject(status, "state", music_player_state_name(snapshot->state));
+    cJSON_AddNumberToObject(status, "index", (double)snapshot->index);
+    cJSON_AddStringToObject(status, "song_name", snapshot->song_name);
+    cJSON_AddStringToObject(status, "artist_name", snapshot->artist_name);
+    cJSON_AddStringToObject(status, "title", snapshot->title);
+    cJSON_AddStringToObject(status, "album", snapshot->album);
+    cJSON_AddStringToObject(status, "picture", snapshot->picture);
+    cJSON_AddStringToObject(status, "cover_url", snapshot->cover_url);
+    cJSON_AddBoolToObject(status, "has_cover", snapshot->has_cover);
+    cJSON_AddNumberToObject(status, "playback_ms", (double)snapshot->playback_ms);
+    cJSON_AddStringToObject(status, "lyrics", snapshot->lyrics);
+    cJSON_AddStringToObject(status, "last_error", snapshot->last_error);
     return status;
 }
 
@@ -350,17 +356,14 @@ static esp_err_t handle_play_song_call(
             song_name->valuestring,
             cJSON_IsString(artist_name) ? artist_name->valuestring : NULL,
             1);
-    music_player_snapshot_t snapshot = {0};
-    music_player_status_snapshot(&snapshot);
-
     char detail[256];
     if (err == ESP_OK) {
         detail[0] = '\0';
         append_text(detail, sizeof(detail), "Music started: ");
-        append_text(detail, sizeof(detail), snapshot.song_name);
-        if (snapshot.artist_name[0] != '\0') {
+        append_text(detail, sizeof(detail), song_name->valuestring);
+        if (cJSON_IsString(artist_name) && artist_name->valuestring != NULL && artist_name->valuestring[0] != '\0') {
             append_text(detail, sizeof(detail), " - ");
-            append_text(detail, sizeof(detail), snapshot.artist_name);
+            append_text(detail, sizeof(detail), artist_name->valuestring);
         }
         append_text(detail, sizeof(detail), ".");
         if (started_detail != NULL && started_detail_size > 0) {

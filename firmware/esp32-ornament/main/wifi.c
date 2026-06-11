@@ -14,6 +14,10 @@
 
 #include <string.h>
 
+#ifndef CONFIG_ORNAMENT_CONFIG_PORTAL_ENABLED
+#define CONFIG_ORNAMENT_CONFIG_PORTAL_ENABLED 0
+#endif
+
 static const char *TAG = "wifi";
 static EventGroupHandle_t wifi_event_group;
 static const int WIFI_CONNECTED_BIT = BIT0;
@@ -170,7 +174,9 @@ static esp_err_t wifi_runtime_init(void)
     ESP_ERROR_CHECK(device_identity_init());
     sta_netif = esp_netif_create_default_wifi_sta();
     ESP_ERROR_CHECK(esp_netif_set_hostname(sta_netif, device_identity_hostname()));
+#if CONFIG_ORNAMENT_CONFIG_PORTAL_ENABLED
     esp_netif_create_default_wifi_ap();
+#endif
 
     wifi_init_config_t init_config = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&init_config));
@@ -188,6 +194,7 @@ static esp_err_t wifi_runtime_init(void)
 
 static esp_err_t enter_config_portal(const char *reason)
 {
+#if CONFIG_ORNAMENT_CONFIG_PORTAL_ENABLED
     ESP_LOGW(TAG, "starting config portal: %s", reason);
     sta_connect_active = false;
     esp_err_t err = config_portal_start();
@@ -195,6 +202,11 @@ static esp_err_t enter_config_portal(const char *reason)
         ESP_LOGW(TAG, "connect phone to SSID=%s and open http://192.168.4.1", config_portal_ssid());
     }
     return err == ESP_OK ? ESP_ERR_WIFI_NOT_CONNECT : err;
+#else
+    ESP_LOGE(TAG, "config portal disabled: %s", reason);
+    sta_connect_active = false;
+    return ESP_ERR_WIFI_NOT_CONNECT;
+#endif
 }
 
 esp_err_t wifi_connect(void)

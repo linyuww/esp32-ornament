@@ -99,6 +99,10 @@ ESP32 访问的是 PC 的局域网 IP，不是 `127.0.0.1`。`/discover` 会返�
 }
 ```
 
+如果需要让网桥长期运行，或评估放到服务器上运行，请看
+[`docs/bridge-persistent-runtime.md`](docs/bridge-persistent-runtime.md)。局域网 PC
+常驻推荐用 Windows Scheduled Task；云服务器常驻需要让 Codex/Claude hook 主动转发到服务器，并手动配置 ESP32 的 Bridge URL。
+
 ## 首次配网
 
 没有保存 Wi-Fi 时，ESP32 会启动配置热点：

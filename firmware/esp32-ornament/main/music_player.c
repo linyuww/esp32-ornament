@@ -31,11 +31,18 @@
 #define CONFIG_ORNAMENT_MUSIC_STREAM_CHUNK_BYTES 2048
 #endif
 
+#ifndef CONFIG_ORNAMENT_MUSIC_COVER_ENABLED
+#define CONFIG_ORNAMENT_MUSIC_COVER_ENABLED 0
+#endif
+
 #if CONFIG_ORNAMENT_XIAOZHI_ENABLED && CONFIG_ORNAMENT_XIAOZHI_MCP_ENABLED
 
 #define MUSIC_PLAYER_TASK_DONE BIT0
 #define MUSIC_PLAYER_URL_MAX 768
 #define MUSIC_PLAYER_RESPONSE_MAX 4096
+#if CONFIG_ORNAMENT_MUSIC_COVER_ENABLED
+#define MUSIC_PLAYER_COVER_BYTES (MUSIC_PLAYER_COVER_PIXELS * sizeof(uint16_t))
+#endif
 #define MUSIC_PLAYER_TASK_STACK_MAX 14336
 #define MUSIC_PLAYER_TASK_STACK_MIN 8192
 #define MUSIC_PLAYER_EMPTY_READ_DELAY_MS 20
@@ -61,6 +68,8 @@ typedef struct {
     char artist[ORNAMENT_TEXT_MAX];
     char album[ORNAMENT_TEXT_MAX];
     char picture[ORNAMENT_BRIDGE_URL_MAX];
+    char cover_url[ORNAMENT_BRIDGE_URL_MAX];
+    char lyrics[MUSIC_PLAYER_LYRICS_MAX];
 } resolved_song_t;
 
 static const char *TAG = "music_player";
@@ -69,6 +78,9 @@ static SemaphoreHandle_t s_mutex;
 static EventGroupHandle_t s_events;
 static TaskHandle_t s_task;
 static music_player_snapshot_t s_snapshot;
+#if CONFIG_ORNAMENT_MUSIC_COVER_ENABLED
+static uint16_t *s_cover_pixels;
+#endif
 static bool s_stop_requested;
 static size_t s_task_stack_bytes;
 static bool s_task_stack_in_spiram;
@@ -146,7 +158,16 @@ static void clear_metadata_locked(void)
     s_snapshot.title[0] = '\0';
     s_snapshot.album[0] = '\0';
     s_snapshot.picture[0] = '\0';
+    s_snapshot.cover_url[0] = '\0';
+    s_snapshot.lyrics[0] = '\0';
+    s_snapshot.has_cover = false;
     s_snapshot.last_error[0] = '\0';
+#if CONFIG_ORNAMENT_MUSIC_COVER_ENABLED
+    s_snapshot.cover_pixels = s_cover_pixels;
+    if (s_cover_pixels != NULL) {
+        memset(s_cover_pixels, 0, MUSIC_PLAYER_COVER_BYTES);
+    }
+#endif
 }
 
 static void set_error_locked(const char *message)
@@ -173,6 +194,17 @@ static bool stop_requested(void)
         xSemaphoreGive(s_mutex);
     }
     return requested;
+}
+
+static void update_playback_ms(size_t total_frames)
+{
+    if (s_mutex == NULL) {
+        return;
+    }
+    if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+        s_snapshot.playback_ms = (uint32_t)((total_frames * 1000ULL) / ORNAMENT_AUDIO_SAMPLE_RATE_HZ);
+        xSemaphoreGive(s_mutex);
+    }
 }
 
 static esp_err_t http_event_handler(esp_http_client_event_t *event)
@@ -371,6 +403,8 @@ static esp_err_t resolve_song(
     copy_json_string(root, "artist", parsed.artist, sizeof(parsed.artist));
     copy_json_string(root, "album", parsed.album, sizeof(parsed.album));
     copy_json_string(root, "picture", parsed.picture, sizeof(parsed.picture));
+    copy_json_string(root, "coverUrl", parsed.cover_url, sizeof(parsed.cover_url));
+    copy_json_string(root, "lyrics", parsed.lyrics, sizeof(parsed.lyrics));
     cJSON *ok = cJSON_GetObjectItemCaseSensitive(root, "ok");
     cJSON *error = cJSON_GetObjectItemCaseSensitive(root, "error");
     if (cJSON_IsString(error) && error->valuestring != NULL) {
@@ -392,6 +426,76 @@ static esp_err_t resolve_song(
     *resolved = parsed;
     return ESP_OK;
 }
+
+#if CONFIG_ORNAMENT_MUSIC_COVER_ENABLED
+static esp_err_t fetch_cover_pixels(const char *cover_url, uint16_t *pixels, size_t pixel_count)
+{
+    if (cover_url == NULL || cover_url[0] == '\0' || pixels == NULL ||
+        pixel_count != MUSIC_PLAYER_COVER_PIXELS) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    esp_http_client_config_t config = {
+        .url = cover_url,
+        .timeout_ms = CONFIG_ORNAMENT_MUSIC_REQUEST_TIMEOUT_MS,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (client == NULL) {
+        return ESP_FAIL;
+    }
+
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_http_client_set_header(client, "Accept", "application/octet-stream"));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_http_client_set_header(client, "User-Agent", MUSIC_PLAYER_USER_AGENT));
+
+    esp_err_t err = esp_http_client_open(client, 0);
+    if (err != ESP_OK) {
+        esp_http_client_cleanup(client);
+        return err;
+    }
+
+    (void)esp_http_client_fetch_headers(client);
+    int status_code = esp_http_client_get_status_code(client);
+    if (status_code != 200) {
+        ESP_LOGW(TAG, "cover rejected: status=%d", status_code);
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        return ESP_ERR_HTTP_FETCH_HEADER;
+    }
+
+    uint8_t *target = (uint8_t *)pixels;
+    size_t total = 0;
+    while (total < MUSIC_PLAYER_COVER_BYTES && !stop_requested()) {
+        int read = esp_http_client_read(client, (char *)target + total, MUSIC_PLAYER_COVER_BYTES - total);
+        if (read == -ESP_ERR_HTTP_EAGAIN) {
+            continue;
+        }
+        if (read < 0) {
+            err = ESP_FAIL;
+            break;
+        }
+        if (read == 0) {
+            if (esp_http_client_is_complete_data_received(client)) {
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(MUSIC_PLAYER_EMPTY_READ_DELAY_MS));
+            continue;
+        }
+        total += (size_t)read;
+    }
+
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+
+    if (err != ESP_OK) {
+        return err;
+    }
+    if (total != MUSIC_PLAYER_COVER_BYTES) {
+        ESP_LOGW(TAG, "cover size mismatch: got=%u expected=%u", (unsigned int)total, (unsigned int)MUSIC_PLAYER_COVER_BYTES);
+        return ESP_ERR_INVALID_SIZE;
+    }
+    return ESP_OK;
+}
+#endif
 
 static bool content_type_is_rejected(const char *content_type)
 {
@@ -582,6 +686,7 @@ static esp_err_t stream_song(
         }
         carry = next_carry;
         total_frames += frames;
+        update_playback_ms(total_frames);
     }
 
     ESP_LOGI(
@@ -635,12 +740,41 @@ static void music_player_task(void *arg)
         strlcpy(s_snapshot.title, resolved->title, sizeof(s_snapshot.title));
         strlcpy(s_snapshot.album, resolved->album, sizeof(s_snapshot.album));
         strlcpy(s_snapshot.picture, resolved->picture, sizeof(s_snapshot.picture));
+        strlcpy(s_snapshot.cover_url, resolved->cover_url, sizeof(s_snapshot.cover_url));
+        strlcpy(s_snapshot.lyrics, resolved->lyrics, sizeof(s_snapshot.lyrics));
         if (resolved->artist[0] != '\0') {
             strlcpy(s_snapshot.artist_name, resolved->artist, sizeof(s_snapshot.artist_name));
         }
         set_state_locked(MUSIC_PLAYER_STATE_PLAYING);
         xSemaphoreGive(s_mutex);
     }
+
+#if CONFIG_ORNAMENT_MUSIC_COVER_ENABLED
+    if (resolved->cover_url[0] != '\0') {
+        uint16_t *cover_pixels = heap_caps_malloc(
+            MUSIC_PLAYER_COVER_BYTES,
+            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (cover_pixels == NULL) {
+            cover_pixels = heap_caps_malloc(MUSIC_PLAYER_COVER_BYTES, MALLOC_CAP_8BIT);
+        }
+        if (cover_pixels != NULL) {
+            esp_err_t cover_err = fetch_cover_pixels(resolved->cover_url, cover_pixels, MUSIC_PLAYER_COVER_PIXELS);
+            if (cover_err == ESP_OK && s_mutex != NULL && xSemaphoreTake(s_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                if (s_cover_pixels != NULL) {
+                    memcpy(s_cover_pixels, cover_pixels, MUSIC_PLAYER_COVER_BYTES);
+                    s_snapshot.cover_pixels = s_cover_pixels;
+                    s_snapshot.has_cover = true;
+                }
+                xSemaphoreGive(s_mutex);
+            } else if (cover_err != ESP_OK) {
+                ESP_LOGW(TAG, "cover fetch failed: %s", esp_err_to_name(cover_err));
+            }
+            free(cover_pixels);
+        } else {
+            ESP_LOGW(TAG, "cover buffer alloc failed");
+        }
+    }
+#endif
 
     free(resolved);
     resolved = NULL;
@@ -706,6 +840,23 @@ esp_err_t music_player_init(void)
 
     memset(&s_snapshot, 0, sizeof(s_snapshot));
     s_snapshot.state = MUSIC_PLAYER_STATE_IDLE;
+#if CONFIG_ORNAMENT_MUSIC_COVER_ENABLED
+    if (s_cover_pixels == NULL) {
+        s_cover_pixels = heap_caps_calloc(MUSIC_PLAYER_COVER_PIXELS, sizeof(uint16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (s_cover_pixels == NULL) {
+            s_cover_pixels = heap_caps_calloc(MUSIC_PLAYER_COVER_PIXELS, sizeof(uint16_t), MALLOC_CAP_8BIT);
+        }
+        if (s_cover_pixels == NULL) {
+            vEventGroupDelete(s_events);
+            vSemaphoreDelete(s_mutex);
+            s_events = NULL;
+            s_mutex = NULL;
+            ESP_LOGW(TAG, "cover cache allocation failed");
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    s_snapshot.cover_pixels = s_cover_pixels;
+#endif
     xEventGroupSetBits(s_events, MUSIC_PLAYER_TASK_DONE);
     return ESP_OK;
 }
@@ -745,6 +896,7 @@ static esp_err_t start_music_request(
     s_stop_requested = false;
     s_snapshot.stop_requested = false;
     s_snapshot.index = request->index;
+    s_snapshot.playback_ms = 0;
     strlcpy(s_snapshot.song_name, request->song_name, sizeof(s_snapshot.song_name));
     strlcpy(s_snapshot.artist_name, request->artist_name, sizeof(s_snapshot.artist_name));
     clear_metadata_locked();
