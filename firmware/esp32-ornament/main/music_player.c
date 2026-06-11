@@ -587,11 +587,13 @@ static esp_err_t stream_song(
             }
             empty_reads++;
             if (empty_reads == 1 || empty_reads % 10 == 0) {
+                unsigned int content_length_log =
+                    content_length >= 0 && content_length <= UINT32_MAX ? (unsigned int)content_length : 0;
                 ESP_LOGW(
                     TAG,
-                    "stream empty read before complete: total_read=%u content_length=%lld retries=%u",
+                    "stream empty read before complete: total_read=%u content_length=%u retries=%u",
                     (unsigned int)total_read,
-                    (long long)content_length,
+                    content_length_log,
                     (unsigned int)empty_reads);
             }
             if (empty_reads >= MUSIC_PLAYER_EMPTY_READ_RETRY_MAX) {
