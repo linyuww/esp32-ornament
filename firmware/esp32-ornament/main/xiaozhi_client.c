@@ -238,6 +238,47 @@ static uint32_t json_u32_or_current(cJSON *parent, const char *name, uint32_t cu
     return (uint32_t)item->valuedouble;
 }
 
+static void append_json_escaped(char *target, size_t target_size, const char *text)
+{
+    if (target == NULL || target_size == 0 || text == NULL) {
+        return;
+    }
+    size_t used = strnlen(target, target_size);
+    for (const unsigned char *cursor = (const unsigned char *)text; *cursor != '\0' && used + 1 < target_size; cursor++) {
+        const char *escape = NULL;
+        switch (*cursor) {
+        case '\\':
+            escape = "\\\\";
+            break;
+        case '"':
+            escape = "\\\"";
+            break;
+        case '\n':
+            escape = "\\n";
+            break;
+        case '\r':
+            escape = "\\r";
+            break;
+        case '\t':
+            escape = "\\t";
+            break;
+        default:
+            break;
+        }
+        if (escape != NULL) {
+            size_t escape_len = strlen(escape);
+            if (used + escape_len >= target_size) {
+                break;
+            }
+            memcpy(target + used, escape, escape_len);
+            used += escape_len;
+        } else if (*cursor >= 0x20) {
+            target[used++] = (char)*cursor;
+        }
+        target[used] = '\0';
+    }
+}
+
 static xiaozhi_client_state_t state_from_bridge_text(const char *text)
 {
     if (text == NULL) {
@@ -631,12 +672,25 @@ static esp_err_t post_session_command(const char *path, bool request_session)
     char url[XIAOZHI_BRIDGE_URL_MAX] = {0};
     ESP_RETURN_ON_ERROR(build_bridge_endpoint(&settings, path, url, sizeof(url)), TAG, "build command endpoint");
 
-    char body[160] = {0};
-    snprintf(
-        body,
-        sizeof(body),
-        "{\"clientId\":\"%s\",\"sampleRate\":16000,\"channels\":1,\"format\":\"pcm_s16le\"}",
-        device_identity_hostname());
+    char body[640] = {0};
+    strlcpy(body, "{\"clientId\":\"", sizeof(body));
+    append_json_escaped(body, sizeof(body), device_identity_hostname());
+    strlcat(body, "\",\"sampleRate\":16000,\"channels\":1,\"format\":\"pcm_s16le\"", sizeof(body));
+    if (request_session) {
+        const char *ws_url = settings_xiaozhi_ws_url_or_default(&settings);
+        const char *token = settings_xiaozhi_token_or_default(&settings);
+        if (ws_url != NULL && ws_url[0] != '\0') {
+            strlcat(body, ",\"wsUrl\":\"", sizeof(body));
+            append_json_escaped(body, sizeof(body), ws_url);
+            strlcat(body, "\"", sizeof(body));
+        }
+        if (token != NULL && token[0] != '\0') {
+            strlcat(body, ",\"token\":\"", sizeof(body));
+            append_json_escaped(body, sizeof(body), token);
+            strlcat(body, "\"", sizeof(body));
+        }
+    }
+    strlcat(body, "}", sizeof(body));
 
     char *response = calloc(1, XIAOZHI_BRIDGE_RESPONSE_MAX);
     if (response == NULL) {

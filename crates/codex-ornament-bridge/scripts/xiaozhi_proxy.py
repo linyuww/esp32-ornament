@@ -71,6 +71,11 @@ def get_pcm(base: str, path: str) -> bytes:
         raise
 
 
+def get_json(base: str, path: str) -> dict:
+    with urllib.request.urlopen(base.rstrip("/") + path, timeout=2) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
 def update_status(base: str, **payload: object) -> None:
     try:
         post_json(base, "/v1/xiaozhi/proxy/status", payload)
@@ -363,6 +368,11 @@ def run_proxy(args: Args) -> int:
                 packet = opus.encode(pcm[:PCM_FRAME_BYTES])
                 if packet:
                     ws.send_binary(packet)
+            if now - float(state.get("last_status_check") or 0.0) > 1.0:
+                status = get_json(args.bridge, "/v1/xiaozhi/session/status")
+                state["last_status_check"] = now
+                if not status.get("sessionRequested", False):
+                    break
     finally:
         try:
             send_listen(ws, str(state.get("session_id") or "bridge"), "stop")
@@ -374,7 +384,7 @@ def run_proxy(args: Args) -> int:
             state="idle",
             connected=False,
             upstreamRunning=False,
-            lastError="Xiaozhi upstream proxy stopped",
+            lastError="",
         )
 
 
