@@ -20,6 +20,7 @@ static const int DISCOVERY_UDP_PORT = 8787;
 static const char *DISCOVERY_MAGIC = "codex-ornament-discover-v1";
 static const int DISCOVERY_TIMEOUT_MS = 1200;
 static const int BRIDGE_PROBE_TIMEOUT_MS = 900;
+static const int BRIDGE_MDNS_PROBE_TIMEOUT_MS = 3000;
 static const int SUBNET_PROBE_RADIUS = 8;
 
 typedef struct {
@@ -273,6 +274,24 @@ static esp_err_t fetch_url_raw(const char *url, char *response, int response_cap
     return err;
 }
 
+static bool url_uses_mdns_host(const char *url)
+{
+    if (url == NULL) {
+        return false;
+    }
+
+    const char *host = strstr(url, "://");
+    if (host == NULL) {
+        host = url;
+    } else {
+        host += 3;
+    }
+
+    size_t host_len = strcspn(host, ":/?#");
+    return host_len > strlen(".local") &&
+           strncmp(host + host_len - strlen(".local"), ".local", strlen(".local")) == 0;
+}
+
 static esp_err_t save_bridge_url(const char *url)
 {
     if (url == NULL || url[0] == '\0') {
@@ -514,9 +533,15 @@ esp_err_t bridge_client_probe_url(const char *url, bridge_probe_result_t *result
         return result->error;
     }
 
+    bool mdns_host = url_uses_mdns_host(url);
+    int timeout_ms = mdns_host ? BRIDGE_MDNS_PROBE_TIMEOUT_MS : BRIDGE_PROBE_TIMEOUT_MS;
+    if (mdns_host) {
+        ESP_LOGI(TAG, "probing bridge mDNS URL: %s timeout_ms=%d", url, timeout_ms);
+    }
+
     int status_code = 0;
     int response_len = 0;
-    esp_err_t err = fetch_url_raw(url, response, MAX_RESPONSE_BYTES, BRIDGE_PROBE_TIMEOUT_MS, &status_code, &response_len);
+    esp_err_t err = fetch_url_raw(url, response, MAX_RESPONSE_BYTES, timeout_ms, &status_code, &response_len);
     result->error = err;
     result->http_status = status_code;
     result->response_bytes = response_len;
