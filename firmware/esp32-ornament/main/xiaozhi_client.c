@@ -3,11 +3,11 @@
 #include "cJSON.h"
 #include "device_identity.h"
 #include "esp_check.h"
-#include "esp_http_client.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "ornament_http_client.h"
 #include "settings.h"
 #include "task_audio.h"
 
@@ -35,37 +35,11 @@
 
 static const char *TAG = "xiaozhi_bridge";
 
-typedef struct {
-    char *data;
-    int length;
-    int capacity;
-} xiaozhi_bridge_response_t;
-
 static SemaphoreHandle_t s_mutex;
 static xiaozhi_client_snapshot_t s_snapshot;
 static bool s_initialized;
 static TaskHandle_t s_uplink_task;
 static TaskHandle_t s_downlink_task;
-static int16_t s_uplink_pcm[XIAOZHI_BRIDGE_PCM_FRAMES];
-static int16_t s_downlink_pcm[XIAOZHI_BRIDGE_PCM_FRAMES];
-
-static esp_err_t http_event_handler(esp_http_client_event_t *event)
-{
-    xiaozhi_bridge_response_t *buffer = (xiaozhi_bridge_response_t *)event->user_data;
-    if (event->event_id != HTTP_EVENT_ON_DATA || buffer == NULL || event->data == NULL) {
-        return ESP_OK;
-    }
-    if (buffer->length + event->data_len > buffer->capacity) {
-        ESP_LOGW(TAG, "bridge response too large");
-        return ESP_FAIL;
-    }
-    memcpy(buffer->data + buffer->length, event->data, event->data_len);
-    buffer->length += event->data_len;
-    if (buffer->length < buffer->capacity) {
-        buffer->data[buffer->length] = '\0';
-    }
-    return ESP_OK;
-}
 
 static bool string_ends_with_len(const char *value, size_t value_len, const char *suffix)
 {
@@ -126,7 +100,7 @@ static esp_err_t build_bridge_endpoint(
 
 static esp_err_t bridge_request(
     const char *url,
-    esp_http_client_method_t method,
+    const char *method,
     const char *body,
     char *response,
     int response_capacity,
@@ -136,40 +110,26 @@ static esp_err_t bridge_request(
         return ESP_ERR_INVALID_ARG;
     }
 
-    xiaozhi_bridge_response_t buffer = {
-        .data = response,
-        .length = 0,
-        .capacity = response_capacity,
-    };
-    esp_http_client_config_t config = {
+    size_t response_len = 0;
+    ornament_http_request_t request = {
+        .method = method,
         .url = url,
-        .event_handler = http_event_handler,
-        .user_data = &buffer,
+        .accept = "application/json",
+        .content_type = body != NULL ? "application/json" : NULL,
+        .body = body,
+        .body_len = body != NULL ? strlen(body) : 0,
+        .response = response,
+        .response_capacity = (size_t)response_capacity,
+        .response_len = &response_len,
+        .status_code = http_status,
         .timeout_ms = CONFIG_ORNAMENT_XIAOZHI_BRIDGE_TIMEOUT_MS,
     };
-
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-    if (client == NULL) {
-        return ESP_FAIL;
-    }
-
-    esp_http_client_set_method(client, method);
-    if (body != NULL) {
-        esp_http_client_set_header(client, "Content-Type", "application/json");
-        esp_http_client_set_post_field(client, body, strlen(body));
-    }
-
-    esp_err_t err = esp_http_client_perform(client);
-    if (http_status != NULL) {
-        *http_status = esp_http_client_get_status_code(client);
-    }
-    esp_http_client_cleanup(client);
-    return err;
+    return ornament_http_request(&request);
 }
 
 static esp_err_t bridge_binary_request(
     const char *url,
-    esp_http_client_method_t method,
+    const char *method,
     const void *body,
     int body_len,
     const char *content_type,
@@ -183,37 +143,24 @@ static esp_err_t bridge_binary_request(
         return ESP_ERR_INVALID_ARG;
     }
 
-    xiaozhi_bridge_response_t buffer = {
-        .data = (char *)response,
-        .length = 0,
-        .capacity = response_capacity,
-    };
-    esp_http_client_config_t config = {
+    size_t received = 0;
+    ornament_http_request_t request = {
+        .method = method,
         .url = url,
-        .event_handler = response != NULL && response_capacity > 0 ? http_event_handler : NULL,
-        .user_data = response != NULL && response_capacity > 0 ? &buffer : NULL,
+        .accept = response != NULL && response_capacity > 0 ? "application/octet-stream" : "*/*",
+        .content_type = body != NULL && body_len > 0 ? (content_type != NULL ? content_type : "application/octet-stream") : NULL,
+        .body = body,
+        .body_len = body != NULL && body_len > 0 ? (size_t)body_len : 0,
+        .response = response,
+        .response_capacity = response != NULL && response_capacity > 0 ? (size_t)response_capacity : 0,
+        .response_len = &received,
+        .status_code = http_status,
         .timeout_ms = timeout_ms,
     };
-
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-    if (client == NULL) {
-        return ESP_FAIL;
-    }
-
-    esp_http_client_set_method(client, method);
-    if (body != NULL && body_len > 0) {
-        esp_http_client_set_header(client, "Content-Type", content_type != NULL ? content_type : "application/octet-stream");
-        esp_http_client_set_post_field(client, (const char *)body, body_len);
-    }
-
-    esp_err_t err = esp_http_client_perform(client);
-    if (http_status != NULL) {
-        *http_status = esp_http_client_get_status_code(client);
-    }
+    esp_err_t err = ornament_http_request(&request);
     if (response_len != NULL) {
-        *response_len = buffer.length;
+        *response_len = (int)received;
     }
-    esp_http_client_cleanup(client);
     return err;
 }
 
@@ -440,7 +387,7 @@ static esp_err_t refresh_status_with_settings(const ornament_settings_t *setting
     }
 
     int http_status = -1;
-    esp_err_t err = bridge_request(url, HTTP_METHOD_GET, NULL, response, XIAOZHI_BRIDGE_RESPONSE_MAX, &http_status);
+    esp_err_t err = bridge_request(url, "GET", NULL, response, XIAOZHI_BRIDGE_RESPONSE_MAX, &http_status);
     if (err == ESP_OK && (http_status < 200 || http_status >= 300)) {
         err = ESP_FAIL;
     }
@@ -464,6 +411,11 @@ static void bridge_audio_uplink_task(void *arg)
 {
     ornament_settings_t settings = *(ornament_settings_t *)arg;
     free(arg);
+    int16_t *uplink_pcm = calloc(XIAOZHI_BRIDGE_PCM_FRAMES, sizeof(*uplink_pcm));
+    if (uplink_pcm == NULL) {
+        mark_audio_error("uplink buffer alloc failed");
+        goto done;
+    }
 
     char url[XIAOZHI_BRIDGE_URL_MAX] = {0};
     esp_err_t err = build_bridge_endpoint(&settings, "/v1/xiaozhi/audio/uplink", url, sizeof(url));
@@ -481,7 +433,7 @@ static void bridge_audio_uplink_task(void *arg)
 
     ESP_LOGI(TAG, "Xiaozhi PCM uplink task started");
     while (session_requested_active()) {
-        err = task_audio_input_read_mono(s_uplink_pcm, XIAOZHI_BRIDGE_PCM_FRAMES, XIAOZHI_BRIDGE_AUDIO_HTTP_TIMEOUT_MS);
+        err = task_audio_input_read_mono(uplink_pcm, XIAOZHI_BRIDGE_PCM_FRAMES, XIAOZHI_BRIDGE_AUDIO_HTTP_TIMEOUT_MS);
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "mic read failed: %s", esp_err_to_name(err));
             mark_audio_error("microphone read failed");
@@ -491,8 +443,8 @@ static void bridge_audio_uplink_task(void *arg)
         int http_status = -1;
         err = bridge_binary_request(
             url,
-            HTTP_METHOD_POST,
-            s_uplink_pcm,
+            "POST",
+            uplink_pcm,
             XIAOZHI_BRIDGE_PCM_BYTES,
             "audio/L16; rate=16000; channels=1",
             NULL,
@@ -511,6 +463,7 @@ static void bridge_audio_uplink_task(void *arg)
     task_audio_input_stop();
 
 done:
+    free(uplink_pcm);
     ESP_LOGI(TAG, "Xiaozhi PCM uplink task stopped");
     if (s_mutex != NULL && xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         s_uplink_task = NULL;
@@ -525,6 +478,11 @@ static void bridge_audio_downlink_task(void *arg)
 {
     ornament_settings_t settings = *(ornament_settings_t *)arg;
     free(arg);
+    int16_t *downlink_pcm = calloc(XIAOZHI_BRIDGE_PCM_FRAMES, sizeof(*downlink_pcm));
+    if (downlink_pcm == NULL) {
+        mark_audio_error("downlink buffer alloc failed");
+        goto done;
+    }
 
     char url[XIAOZHI_BRIDGE_URL_MAX] = {0};
     esp_err_t err = build_bridge_endpoint(&settings, "/v1/xiaozhi/audio/downlink?max=3200&wait_ms=250", url, sizeof(url));
@@ -540,11 +498,11 @@ static void bridge_audio_downlink_task(void *arg)
         int response_len = 0;
         err = bridge_binary_request(
             url,
-            HTTP_METHOD_GET,
+            "GET",
             NULL,
             0,
             NULL,
-            s_downlink_pcm,
+            downlink_pcm,
             XIAOZHI_BRIDGE_PCM_BYTES,
             &response_len,
             &http_status,
@@ -581,7 +539,7 @@ static void bridge_audio_downlink_task(void *arg)
             output_acquired = true;
         }
         set_audio_state(XIAOZHI_CLIENT_STATE_SPEAKING);
-        err = task_audio_output_write_mono(s_downlink_pcm, response_len / sizeof(int16_t), 1000);
+        err = task_audio_output_write_mono(downlink_pcm, response_len / sizeof(int16_t), 1000);
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "downlink output write failed: %s", esp_err_to_name(err));
             mark_audio_error("speaker write failed");
@@ -594,6 +552,7 @@ static void bridge_audio_downlink_task(void *arg)
     }
 
 done:
+    free(downlink_pcm);
     ESP_LOGI(TAG, "Xiaozhi PCM downlink task stopped");
     if (s_mutex != NULL && xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         s_downlink_task = NULL;
@@ -698,7 +657,7 @@ static esp_err_t post_session_command(const char *path, bool request_session)
     }
 
     int http_status = -1;
-    esp_err_t err = bridge_request(url, HTTP_METHOD_POST, body, response, XIAOZHI_BRIDGE_RESPONSE_MAX, &http_status);
+    esp_err_t err = bridge_request(url, "POST", body, response, XIAOZHI_BRIDGE_RESPONSE_MAX, &http_status);
     if (err == ESP_OK && (http_status < 200 || http_status >= 300)) {
         err = ESP_FAIL;
     }
@@ -822,7 +781,7 @@ esp_err_t xiaozhi_client_probe(const char *ws_url_override, const char *token_ov
     }
 
     int http_status = -1;
-    err = bridge_request(url, HTTP_METHOD_GET, NULL, response, XIAOZHI_BRIDGE_RESPONSE_MAX, &http_status);
+    err = bridge_request(url, "GET", NULL, response, XIAOZHI_BRIDGE_RESPONSE_MAX, &http_status);
     result->http_status = http_status;
     result->configured = err == ESP_OK && http_status >= 200 && http_status < 300;
     result->websocket_connected = result->configured;

@@ -4,6 +4,7 @@ set(ORNAMENT_SRCS
   "bridge_client.c"
   "device_identity.c"
   "ornament_state.c"
+  "ornament_http_client.c"
   "settings.c"
   "system_status.c"
   "task_audio.c"
@@ -42,17 +43,18 @@ endif()
 set(ORNAMENT_REQUIRES
   driver
   esp_driver_i2s
-  esp-tls
-  esp_http_client
   esp_lcd
   esp_netif
   esp_timer
   esp_wifi
   json
   lwip
-  mbedtls
   nvs_flash
 )
+
+if(CONFIG_ORNAMENT_LOCAL_WEATHER_ENABLED OR CONFIG_ORNAMENT_XIAOZHI_TRANSPORT_DIRECT)
+  list(APPEND ORNAMENT_REQUIRES esp-tls esp_http_client mbedtls)
+endif()
 
 if(CONFIG_ORNAMENT_CONFIG_PORTAL_ENABLED OR CONFIG_ORNAMENT_WEB_CONSOLE_ENABLED)
   list(APPEND ORNAMENT_REQUIRES esp_http_server)
