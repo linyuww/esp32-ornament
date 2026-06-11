@@ -23,6 +23,26 @@ static void set_text(char *dst, size_t dst_size, const char *src)
     snprintf(dst, dst_size, "%s", src);
 }
 
+typedef struct {
+    const char *last_stt;
+    const char *last_tts;
+} preview_xiaozhi_context_t;
+
+static preview_xiaozhi_context_t preview_xiaozhi_context(void)
+{
+    preview_xiaozhi_context_t context = {
+        .last_stt = getenv("ORNAMENT_PREVIEW_XIAOZHI_STT"),
+        .last_tts = getenv("ORNAMENT_PREVIEW_XIAOZHI_TTS"),
+    };
+    if (context.last_stt == NULL) {
+        context.last_stt = "";
+    }
+    if (context.last_tts == NULL) {
+        context.last_tts = "";
+    }
+    return context;
+}
+
 static uint8_t expand_5_to_8(uint16_t value)
 {
     return (uint8_t)((value << 3) | (value >> 2));
@@ -368,6 +388,7 @@ int main(int argc, char **argv)
     if (render_music(output_dir, &normal) != 0) {
         return 1;
     }
+    const preview_xiaozhi_context_t xiaozhi_context = preview_xiaozhi_context();
     if (render_xiaozhi(
             output_dir,
             &normal,
@@ -387,7 +408,7 @@ int main(int argc, char **argv)
             XIAOZHI_CLIENT_STATE_LISTENING,
             true,
             true,
-            "LIVE USER CONTEXT",
+            xiaozhi_context.last_stt,
             "",
             "") != 0) {
         return 1;
@@ -399,8 +420,8 @@ int main(int argc, char **argv)
             XIAOZHI_CLIENT_STATE_SPEAKING,
             true,
             true,
-            "LIVE USER CONTEXT",
-            "LIVE ASSISTANT CONTEXT",
+            xiaozhi_context.last_stt,
+            xiaozhi_context.last_tts,
             "") != 0) {
         return 1;
     }
@@ -435,8 +456,8 @@ int main(int argc, char **argv)
             XIAOZHI_CLIENT_STATE_IDLE,
             true,
             true,
-            "LIVE USER CONTEXT",
-            "LIVE ASSISTANT CONTEXT",
+            xiaozhi_context.last_stt,
+            xiaozhi_context.last_tts,
             "") != 0) {
         return 1;
     }
