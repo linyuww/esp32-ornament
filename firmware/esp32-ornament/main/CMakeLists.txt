@@ -2,15 +2,12 @@ set(ORNAMENT_SRCS
   "app_main.c"
   "asrpro_link.c"
   "bridge_client.c"
-  "config_portal.c"
   "device_identity.c"
   "ornament_state.c"
   "settings.c"
   "system_status.c"
   "task_audio.c"
   "music_player.c"
-  "weather_client.c"
-  "web_console.c"
   "xiaozhi_client.c"
   "xiaozhi_mcp.c"
   "display.c"
@@ -18,8 +15,16 @@ set(ORNAMENT_SRCS
   "wifi.c"
 )
 
+if(CONFIG_ORNAMENT_CONFIG_PORTAL_ENABLED)
+  list(APPEND ORNAMENT_SRCS "config_portal.c")
+endif()
+
+if(CONFIG_ORNAMENT_LOCAL_WEATHER_ENABLED)
+  list(APPEND ORNAMENT_SRCS "weather_client.c")
+endif()
+
 if(CONFIG_ORNAMENT_WEB_CONSOLE_ENABLED)
-  list(APPEND ORNAMENT_SRCS "system_diagnostics.c")
+  list(APPEND ORNAMENT_SRCS "web_console.c" "system_diagnostics.c")
 endif()
 
 if(CONFIG_ORNAMENT_STANDBY_WALLPAPER_ENABLED)
