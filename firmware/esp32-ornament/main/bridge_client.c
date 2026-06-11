@@ -2,8 +2,8 @@
 
 #include "cJSON.h"
 #include "esp_check.h"
-#include "esp_http_client.h"
 #include "esp_log.h"
+#include "ornament_http_client.h"
 #include "settings.h"
 #include "lwip/inet.h"
 #include "lwip/sockets.h"
@@ -22,31 +22,6 @@ static const int DISCOVERY_TIMEOUT_MS = 1200;
 static const int BRIDGE_PROBE_TIMEOUT_MS = 900;
 static const int BRIDGE_MDNS_PROBE_TIMEOUT_MS = 3000;
 static const int SUBNET_PROBE_RADIUS = 8;
-
-typedef struct {
-    char *data;
-    int length;
-    int capacity;
-} response_buffer_t;
-
-static esp_err_t http_event_handler(esp_http_client_event_t *event)
-{
-    response_buffer_t *buffer = (response_buffer_t *)event->user_data;
-
-    if (event->event_id != HTTP_EVENT_ON_DATA || buffer == NULL || event->data == NULL) {
-        return ESP_OK;
-    }
-
-    if (buffer->length + event->data_len >= buffer->capacity) {
-        ESP_LOGW(TAG, "bridge response too large");
-        return ESP_FAIL;
-    }
-
-    memcpy(buffer->data + buffer->length, event->data, event->data_len);
-    buffer->length += event->data_len;
-    buffer->data[buffer->length] = '\0';
-    return ESP_OK;
-}
 
 static void copy_json_string(cJSON *parent, const char *name, char *target, size_t target_size)
 {
@@ -246,31 +221,21 @@ static esp_err_t fetch_url_raw(const char *url, char *response, int response_cap
         return ESP_ERR_INVALID_ARG;
     }
 
-    response_buffer_t buffer = {
-        .data = response,
-        .length = 0,
-        .capacity = response_capacity,
-    };
-    esp_http_client_config_t config = {
+    size_t received = 0;
+    ornament_http_request_t request = {
+        .method = "GET",
         .url = url,
-        .event_handler = http_event_handler,
-        .user_data = &buffer,
+        .response = response,
+        .response_capacity = (size_t)response_capacity,
+        .response_len = &received,
+        .status_code = status_code,
         .timeout_ms = timeout_ms,
     };
 
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-    if (client == NULL) {
-        return ESP_FAIL;
-    }
-
-    esp_err_t err = esp_http_client_perform(client);
-    if (status_code != NULL) {
-        *status_code = esp_http_client_get_status_code(client);
-    }
+    esp_err_t err = ornament_http_request(&request);
     if (response_len != NULL) {
-        *response_len = buffer.length;
+        *response_len = (int)received;
     }
-    esp_http_client_cleanup(client);
     return err;
 }
 
@@ -512,7 +477,7 @@ esp_err_t bridge_client_fetch_state(ornament_state_t *state)
     if (err == ESP_OK && status_code == 200) {
         err = parse_state_json(response, state);
     } else if (err == ESP_OK) {
-        err = ESP_ERR_HTTP_BASE + status_code;
+        err = ESP_ERR_INVALID_RESPONSE;
     }
 
     free(response);

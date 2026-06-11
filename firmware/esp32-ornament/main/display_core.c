@@ -1641,6 +1641,64 @@ static void draw_hud_panel_marks(int x, int y, int w, int h, uint16_t color)
 
 static const char *xiaozhi_hud_main_ascii(xiaozhi_client_state_t state);
 
+static const char *xiaozhi_hud_user_hint(const xiaozhi_client_snapshot_t *snapshot)
+{
+    if (snapshot == NULL) {
+#if CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
+        return "\xE6\x9A\x82\xE6\x97\xA0\xE8\xAF\xAD\xE9\x9F\xB3";
+#else
+        return "NO VOICE YET";
+#endif
+    }
+    if (snapshot->activation_pending) {
+        return snapshot->activation_code[0] != '\0' ? snapshot->activation_code :
+#if CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
+            "\xE7\xAD\x89\xE5\xBE\x85\xE7\xBB\x91\xE5\xAE\x9A";
+#else
+            "BIND PENDING";
+#endif
+    }
+    if (snapshot->last_stt[0] != '\0') {
+        return snapshot->last_stt;
+    }
+    switch (snapshot->state) {
+    case XIAOZHI_CLIENT_STATE_LISTENING:
+#if CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
+        return "\xE6\xAD\xA3\xE5\x9C\xA8\xE5\x90\xAC\xE4\xBD\xA0\xE8\xAF\xB4";
+#else
+        return "LISTENING NOW";
+#endif
+    case XIAOZHI_CLIENT_STATE_SPEAKING:
+#if CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
+        return "\xE5\xB7\xB2\xE6\x94\xB6\xE5\x88\xB0\xE8\xAF\xAD\xE9\x9F\xB3";
+#else
+        return "VOICE RECEIVED";
+#endif
+    case XIAOZHI_CLIENT_STATE_CONNECTING:
+#if CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
+        return "\xE6\xAD\xA3\xE5\x9C\xA8\xE8\xBF\x9E\xE6\x8E\xA5";
+#else
+        return "CONNECTING";
+#endif
+    case XIAOZHI_CLIENT_STATE_ERROR:
+    case XIAOZHI_CLIENT_STATE_CONFIG_MISSING:
+        return snapshot->last_error[0] != '\0' ? snapshot->last_error :
+#if CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
+            "\xE8\xAF\xB7\xE6\xA3\x80\xE6\x9F\xA5\xE9\x85\x8D\xE7\xBD\xAE";
+#else
+            "CHECK CONFIG";
+#endif
+    case XIAOZHI_CLIENT_STATE_IDLE:
+    case XIAOZHI_CLIENT_STATE_DISABLED:
+    default:
+#if CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
+        return "\xE6\x9A\x82\xE6\x97\xA0\xE8\xAF\xAD\xE9\x9F\xB3";
+#else
+        return "NO VOICE YET";
+#endif
+    }
+}
+
 static const char *xiaozhi_hud_main_text(xiaozhi_client_state_t state)
 {
 #if CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
@@ -1687,9 +1745,9 @@ static const char *xiaozhi_hud_assistant_hint(const xiaozhi_client_snapshot_t *s
 {
     if (snapshot == NULL) {
 #if CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
-        return "\xE8\xBD\xBB\xE8\xA7\xA6\xE5\xBC\x80\xE5\xA7\x8B\xE5\xAF\xB9\xE8\xAF\x9D";
+        return "\xE6\x9A\x82\xE6\x97\xA0\xE5\x9B\x9E\xE5\xA4\x8D";
 #else
-        return "PRESS AI TO TALK";
+        return "NO REPLY YET";
 #endif
     }
     if (snapshot->activation_pending) {
@@ -1734,9 +1792,9 @@ static const char *xiaozhi_hud_assistant_hint(const xiaozhi_client_snapshot_t *s
     case XIAOZHI_CLIENT_STATE_DISABLED:
     default:
 #if CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
-        return "\xE8\xBD\xBB\xE8\xA7\xA6\xE5\xBC\x80\xE5\xA7\x8B\xE5\xAF\xB9\xE8\xAF\x9D";
+        return "\xE6\x9A\x82\xE6\x97\xA0\xE5\x9B\x9E\xE5\xA4\x8D";
 #else
-        return "PRESS AI TO TALK";
+        return "NO REPLY YET";
 #endif
     }
 }
@@ -1744,7 +1802,7 @@ static const char *xiaozhi_hud_assistant_hint(const xiaozhi_client_snapshot_t *s
 static const char *xiaozhi_hud_assistant_ascii(const xiaozhi_client_snapshot_t *snapshot, const char *tts_text)
 {
     if (snapshot == NULL) {
-        return "PRESS AI TO TALK";
+        return "NO REPLY YET";
     }
     if (snapshot->activation_pending) {
         return snapshot->activation_code[0] != '\0' ? snapshot->activation_code : "BIND PENDING";
@@ -1765,7 +1823,7 @@ static const char *xiaozhi_hud_assistant_ascii(const xiaozhi_client_snapshot_t *
     case XIAOZHI_CLIENT_STATE_IDLE:
     case XIAOZHI_CLIENT_STATE_DISABLED:
     default:
-        return "PRESS AI TO TALK";
+        return "NO REPLY YET";
     }
 }
 
@@ -2446,25 +2504,18 @@ void display_core_render_xiaozhi(
 
     char stt_preview[96];
     char assistant_preview[96];
-    const char *stt_text = snapshot->last_stt[0] != '\0' ? snapshot->last_stt :
-        (snapshot->activation_pending ? "BIND PENDING" :
-#if CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
-            "\xE6\x98\x8E\xE5\xA4\xA9\xE5\xA4\xA9\xE6\xB0\x94\xE6\x80\x8E\xE4\xB9\x88\xE6\xA0\xB7\xEF\xBC\x9F"
-#else
-            "TOMORROW WEATHER?"
-#endif
-        );
+    const char *stt_text = xiaozhi_hud_user_hint(snapshot);
     const char *tts_text = snapshot->last_tts[0] != '\0' ? snapshot->last_tts :
         (snapshot->activation_pending ?
             (snapshot->activation_code[0] != '\0' ? snapshot->activation_code : "BIND DEVICE") :
-            "WAITING REPLY");
+            "");
     const bool completed = snapshot->state == XIAOZHI_CLIENT_STATE_IDLE && snapshot->last_tts[0] != '\0';
     const char *main_text = completed ? xiaozhi_hud_done_text() : xiaozhi_hud_main_text(snapshot->state);
     const char *main_ascii = completed ? "DONE" : xiaozhi_hud_main_ascii(snapshot->state);
     const char *assistant_text = xiaozhi_hud_assistant_hint(snapshot, tts_text);
     const char *assistant_ascii = xiaozhi_hud_assistant_ascii(snapshot, tts_text);
-    ascii_preview(stt_text, "TOMORROW WEATHER?", stt_preview, sizeof(stt_preview));
-    ascii_preview(assistant_ascii, "PRESS AI TO TALK", assistant_preview, sizeof(assistant_preview));
+    ascii_preview(stt_text, "NO VOICE YET", stt_preview, sizeof(stt_preview));
+    ascii_preview(assistant_ascii, "NO REPLY YET", assistant_preview, sizeof(assistant_preview));
 
     uint16_t state_color = HUD_HUD_CYAN;
     switch (snapshot->state) {
@@ -2546,20 +2597,9 @@ void display_core_render_xiaozhi(
     draw_hud_chamfer_box(assistant_x, assistant_y, assistant_w, assistant_h, ss(8), thin, HUD_HUD_DIM);
     draw_hud_panel_marks(assistant_x, assistant_y, assistant_w, assistant_h, state_color);
     draw_hud_bot_icon(assistant_x + ss(8), assistant_y + ss(12), icon_size, state_color);
-#if CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
-    draw_utf8_text(
-        assistant_x + icon_size + ss(18),
-        assistant_y + ss(14),
-        &font_puhui_16_4,
-        "AI\xE5\x8A\xA9\xE6\x89\x8B",
-        state_color,
-        assistant_w - icon_size - ss(36));
-#else
-    draw_text_xy(assistant_x + icon_size + ss(18), assistant_y + ss(14), "AI ASSIST", text_scale, text_scale, state_color);
-#endif
     draw_hud_wrapped_text(
         assistant_x + icon_size + ss(18),
-        assistant_y + ss(28),
+        assistant_y + ss(18),
         assistant_text,
         assistant_preview,
         HUD_HUD_CYAN,

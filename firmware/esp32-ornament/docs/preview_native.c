@@ -387,7 +387,7 @@ int main(int argc, char **argv)
             XIAOZHI_CLIENT_STATE_LISTENING,
             true,
             true,
-            "Tomorrow weather?",
+            "Summarize current task?",
             "",
             "") != 0) {
         return 1;
@@ -399,8 +399,8 @@ int main(int argc, char **argv)
             XIAOZHI_CLIENT_STATE_SPEAKING,
             true,
             true,
-            "Tomorrow weather?",
-            "Cloudy with light rain.",
+            "Summarize current task?",
+            "Updated UI preview is ready.",
             "") != 0) {
         return 1;
     }
@@ -435,8 +435,8 @@ int main(int argc, char **argv)
             XIAOZHI_CLIENT_STATE_IDLE,
             true,
             true,
-            "Tomorrow weather?",
-            "Dialog finished",
+            "Summarize current task?",
+            "Context reply finished.",
             "") != 0) {
         return 1;
     }

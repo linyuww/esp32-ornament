@@ -3,12 +3,12 @@
 #include "cJSON.h"
 #include "esp_check.h"
 #include "esp_heap_caps.h"
-#include "esp_http_client.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "ornament_http_client.h"
 #include "settings.h"
 #include "task_audio.h"
 #include "xiaozhi_client.h"
@@ -19,8 +19,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#ifndef CONFIG_ORNAMENT_XIAOZHI_MCP_ENABLED
-#define CONFIG_ORNAMENT_XIAOZHI_MCP_ENABLED 0
+#ifndef CONFIG_ORNAMENT_MUSIC_PLAYER_ENABLED
+#define CONFIG_ORNAMENT_MUSIC_PLAYER_ENABLED 0
 #endif
 
 #ifndef CONFIG_ORNAMENT_MUSIC_REQUEST_TIMEOUT_MS
@@ -35,7 +35,7 @@
 #define CONFIG_ORNAMENT_MUSIC_COVER_ENABLED 0
 #endif
 
-#if CONFIG_ORNAMENT_XIAOZHI_ENABLED && CONFIG_ORNAMENT_XIAOZHI_MCP_ENABLED
+#if CONFIG_ORNAMENT_MUSIC_PLAYER_ENABLED
 
 #define MUSIC_PLAYER_TASK_DONE BIT0
 #define MUSIC_PLAYER_URL_MAX 768
@@ -47,14 +47,9 @@
 #define MUSIC_PLAYER_TASK_STACK_MIN 8192
 #define MUSIC_PLAYER_EMPTY_READ_DELAY_MS 20
 #define MUSIC_PLAYER_EMPTY_READ_RETRY_MAX 50
+#define MUSIC_PLAYER_STREAM_READ_TIMEOUT_MS 250
 #define MUSIC_PLAYER_USER_AGENT "ESP32-Music-Player/1.0"
 #define MUSIC_PLAYER_PCM_SAMPLE_BYTES 2
-
-typedef struct {
-    char *data;
-    int length;
-    int capacity;
-} music_response_buffer_t;
 
 typedef struct {
     char song_name[ORNAMENT_TEXT_MAX];
@@ -207,21 +202,6 @@ static void update_playback_ms(size_t total_frames)
     }
 }
 
-static esp_err_t http_event_handler(esp_http_client_event_t *event)
-{
-    music_response_buffer_t *buffer = (music_response_buffer_t *)event->user_data;
-    if (event->event_id != HTTP_EVENT_ON_DATA || buffer == NULL || event->data == NULL) {
-        return ESP_OK;
-    }
-    if (buffer->length + event->data_len >= buffer->capacity) {
-        return ESP_FAIL;
-    }
-    memcpy(buffer->data + buffer->length, event->data, event->data_len);
-    buffer->length += event->data_len;
-    buffer->data[buffer->length] = '\0';
-    return ESP_OK;
-}
-
 static void copy_json_string(const cJSON *root, const char *name, char *target, size_t target_size)
 {
     if (root == NULL || name == NULL || target == NULL || target_size == 0) {
@@ -355,30 +335,20 @@ static esp_err_t resolve_song(
         return ESP_ERR_NO_MEM;
     }
 
-    music_response_buffer_t buffer = {
-        .data = response,
-        .length = 0,
-        .capacity = MUSIC_PLAYER_RESPONSE_MAX,
-    };
-    esp_http_client_config_t config = {
+    size_t response_len = 0;
+    int status_code = -1;
+    ornament_http_request_t http_request = {
+        .method = "GET",
         .url = url,
-        .event_handler = http_event_handler,
-        .user_data = &buffer,
+        .accept = "application/json",
+        .user_agent = MUSIC_PLAYER_USER_AGENT,
+        .response = response,
+        .response_capacity = MUSIC_PLAYER_RESPONSE_MAX,
+        .response_len = &response_len,
+        .status_code = &status_code,
         .timeout_ms = CONFIG_ORNAMENT_MUSIC_REQUEST_TIMEOUT_MS,
     };
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-    if (client == NULL) {
-        free(url);
-        free(response);
-        return ESP_FAIL;
-    }
-
-    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_http_client_set_header(client, "Accept", "application/json"));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_http_client_set_header(client, "User-Agent", MUSIC_PLAYER_USER_AGENT));
-
-    err = esp_http_client_perform(client);
-    int status_code = esp_http_client_get_status_code(client);
-    esp_http_client_cleanup(client);
+    err = ornament_http_request(&http_request);
     free(url);
     if (err != ESP_OK) {
         free(response);
@@ -387,7 +357,7 @@ static esp_err_t resolve_song(
     if (status_code != 200) {
         ESP_LOGW(TAG, "resolve rejected: status=%d body=%.*s", status_code, 160, response);
         free(response);
-        return ESP_ERR_HTTP_FETCH_HEADER;
+        return ESP_ERR_INVALID_RESPONSE;
     }
 
     cJSON *root = cJSON_Parse(response);
@@ -435,46 +405,39 @@ static esp_err_t fetch_cover_pixels(const char *cover_url, uint16_t *pixels, siz
         return ESP_ERR_INVALID_ARG;
     }
 
-    esp_http_client_config_t config = {
+    ornament_http_request_t request = {
+        .method = "GET",
         .url = cover_url,
+        .accept = "application/octet-stream",
+        .user_agent = MUSIC_PLAYER_USER_AGENT,
         .timeout_ms = CONFIG_ORNAMENT_MUSIC_REQUEST_TIMEOUT_MS,
     };
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-    if (client == NULL) {
-        return ESP_FAIL;
-    }
-
-    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_http_client_set_header(client, "Accept", "application/octet-stream"));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_http_client_set_header(client, "User-Agent", MUSIC_PLAYER_USER_AGENT));
-
-    esp_err_t err = esp_http_client_open(client, 0);
+    ornament_http_stream_t *stream = NULL;
+    esp_err_t err = ornament_http_open_stream(&request, &stream);
     if (err != ESP_OK) {
-        esp_http_client_cleanup(client);
         return err;
     }
 
-    (void)esp_http_client_fetch_headers(client);
-    int status_code = esp_http_client_get_status_code(client);
+    int status_code = ornament_http_stream_status_code(stream);
     if (status_code != 200) {
         ESP_LOGW(TAG, "cover rejected: status=%d", status_code);
-        esp_http_client_close(client);
-        esp_http_client_cleanup(client);
-        return ESP_ERR_HTTP_FETCH_HEADER;
+        ornament_http_stream_close(stream);
+        return ESP_ERR_INVALID_RESPONSE;
     }
 
     uint8_t *target = (uint8_t *)pixels;
     size_t total = 0;
     while (total < MUSIC_PLAYER_COVER_BYTES && !stop_requested()) {
-        int read = esp_http_client_read(client, (char *)target + total, MUSIC_PLAYER_COVER_BYTES - total);
-        if (read == -ESP_ERR_HTTP_EAGAIN) {
+        size_t read = 0;
+        err = ornament_http_stream_read(stream, target + total, MUSIC_PLAYER_COVER_BYTES - total, &read);
+        if (err == ESP_ERR_TIMEOUT) {
             continue;
         }
-        if (read < 0) {
-            err = ESP_FAIL;
+        if (err != ESP_OK) {
             break;
         }
         if (read == 0) {
-            if (esp_http_client_is_complete_data_received(client)) {
+            if (ornament_http_stream_is_complete(stream)) {
                 break;
             }
             vTaskDelay(pdMS_TO_TICKS(MUSIC_PLAYER_EMPTY_READ_DELAY_MS));
@@ -483,8 +446,7 @@ static esp_err_t fetch_cover_pixels(const char *cover_url, uint16_t *pixels, siz
         total += (size_t)read;
     }
 
-    esp_http_client_close(client);
-    esp_http_client_cleanup(client);
+    ornament_http_stream_close(stream);
 
     if (err != ESP_OK) {
         return err;
@@ -557,43 +519,34 @@ static esp_err_t stream_song(
         return err;
     }
 
-    esp_http_client_config_t config = {
+    ornament_http_request_t http_request = {
+        .method = "GET",
         .url = url,
+        .accept = "audio/L16",
+        .user_agent = MUSIC_PLAYER_USER_AGENT,
         .timeout_ms = CONFIG_ORNAMENT_MUSIC_REQUEST_TIMEOUT_MS,
     };
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-    if (client == NULL) {
-        free(url);
-        return ESP_FAIL;
-    }
-
-    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_http_client_set_header(client, "Accept", "audio/L16"));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_http_client_set_header(client, "User-Agent", MUSIC_PLAYER_USER_AGENT));
-
-    err = esp_http_client_open(client, 0);
+    ornament_http_stream_t *stream = NULL;
+    err = ornament_http_open_stream(&http_request, &stream);
     free(url);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "stream open failed: %s", esp_err_to_name(err));
-        esp_http_client_cleanup(client);
         return err;
     }
 
-    (void)esp_http_client_fetch_headers(client);
-    int status_code = esp_http_client_get_status_code(client);
-    int64_t content_length = esp_http_client_get_content_length(client);
-    char *content_type = NULL;
-    (void)esp_http_client_get_header(client, "Content-Type", &content_type);
+    int status_code = ornament_http_stream_status_code(stream);
+    int64_t content_length = ornament_http_stream_content_length(stream);
+    const char *content_type = ornament_http_stream_content_type(stream);
     if (status_code < 200 || status_code >= 300) {
-        esp_http_client_close(client);
-        esp_http_client_cleanup(client);
-        return ESP_ERR_HTTP_FETCH_HEADER;
+        ornament_http_stream_close(stream);
+        return ESP_ERR_INVALID_RESPONSE;
     }
     if (content_type_is_rejected(content_type)) {
         ESP_LOGW(TAG, "stream content type is not raw PCM: %s", content_type);
-        esp_http_client_close(client);
-        esp_http_client_cleanup(client);
+        ornament_http_stream_close(stream);
         return ESP_ERR_NOT_SUPPORTED;
     }
+    (void)ornament_http_stream_set_timeout(stream, MUSIC_PLAYER_STREAM_READ_TIMEOUT_MS);
 
     uint8_t *read_buffer = heap_caps_calloc(CONFIG_ORNAMENT_MUSIC_STREAM_CHUNK_BYTES + 1, 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (read_buffer == NULL) {
@@ -602,8 +555,7 @@ static esp_err_t stream_song(
             "stream buffer alloc failed read=%p",
             (void *)read_buffer);
         free(read_buffer);
-        esp_http_client_close(client);
-        esp_http_client_cleanup(client);
+        ornament_http_stream_close(stream);
         return ESP_ERR_NO_MEM;
     }
 
@@ -616,20 +568,20 @@ static esp_err_t stream_song(
     err = ESP_OK;
 
     while (!stop_requested()) {
-        int read = esp_http_client_read(
-            client,
-            (char *)read_buffer + carry,
-            CONFIG_ORNAMENT_MUSIC_STREAM_CHUNK_BYTES - (int)carry);
-        if (read == -ESP_ERR_HTTP_EAGAIN) {
+        size_t read = 0;
+        err = ornament_http_stream_read(
+            stream,
+            read_buffer + carry,
+            CONFIG_ORNAMENT_MUSIC_STREAM_CHUNK_BYTES - carry,
+            &read);
+        if (err == ESP_ERR_TIMEOUT) {
             continue;
         }
-        if (read < 0) {
-            err = ESP_FAIL;
+        if (err != ESP_OK) {
             break;
         }
         if (read == 0) {
-            if (esp_http_client_is_complete_data_received(client) ||
-                (content_length < 0 && total_read > 0)) {
+            if (ornament_http_stream_is_complete(stream)) {
                 err = ESP_OK;
                 break;
             }
@@ -652,7 +604,7 @@ static esp_err_t stream_song(
 
         empty_reads = 0;
         if (!first_chunk_logged) {
-            size_t preview_bytes = carry + (size_t)read;
+            size_t preview_bytes = carry + read;
             if (buffer_looks_like_non_pcm(read_buffer, preview_bytes)) {
                 ESP_LOGW(TAG, "stream body is not raw PCM, refusing playback");
                 err = ESP_ERR_NOT_SUPPORTED;
@@ -667,10 +619,10 @@ static esp_err_t stream_song(
             output_acquired = true;
         }
 
-        size_t total = carry + (size_t)read;
+        size_t total = carry + read;
         size_t bytes_to_write = total & ~(size_t)(MUSIC_PLAYER_PCM_SAMPLE_BYTES - 1);
         size_t next_carry = total - bytes_to_write;
-        total_read += (size_t)read;
+        total_read += read;
         if (bytes_to_write == 0) {
             carry = next_carry;
             continue;
@@ -702,8 +654,7 @@ static esp_err_t stream_song(
         (void)task_audio_output_write_silence(ORNAMENT_AUDIO_SAMPLE_RATE_HZ / 20, 1000);
         task_audio_output_release();
     }
-    esp_http_client_close(client);
-    esp_http_client_cleanup(client);
+    ornament_http_stream_close(stream);
 
     if (stop_requested()) {
         return ESP_OK;
@@ -1047,6 +998,19 @@ esp_err_t music_player_play_song(const char *song_name, const char *artist_name,
     (void)song_name;
     (void)artist_name;
     (void)index;
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
+esp_err_t music_player_play_song_with_settings(
+    const char *song_name,
+    const char *artist_name,
+    uint32_t index,
+    const ornament_settings_t *settings)
+{
+    (void)song_name;
+    (void)artist_name;
+    (void)index;
+    (void)settings;
     return ESP_ERR_NOT_SUPPORTED;
 }
 
