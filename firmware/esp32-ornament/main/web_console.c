@@ -631,6 +631,11 @@ static esp_err_t root_get_handler(httpd_req_t *req)
     char xiaozhi_last_stt[XIAOZHI_STATUS_TEXT_MAX * 2];
     char xiaozhi_last_tts[XIAOZHI_STATUS_TEXT_MAX * 2];
     xiaozhi_client_snapshot_t xiaozhi = {0};
+    char music_title[ORNAMENT_TEXT_MAX * 2];
+    char music_artist[ORNAMENT_TEXT_MAX * 2];
+    char music_album[ORNAMENT_TEXT_MAX * 2];
+    char music_error[ORNAMENT_TEXT_MAX * 2];
+    music_player_snapshot_t music = {0};
     char settings_weather_label[ORNAMENT_WEATHER_LABEL_MAX * 2];
     const char *settings_weather_source = settings_weather_source_or_default(&console_settings);
     char weather_lat_text[24];
@@ -657,6 +662,11 @@ static esp_err_t root_get_handler(httpd_req_t *req)
     html_escape(xiaozhi.last_error, xiaozhi_last_error, sizeof(xiaozhi_last_error));
     html_escape(xiaozhi.last_stt, xiaozhi_last_stt, sizeof(xiaozhi_last_stt));
     html_escape(xiaozhi.last_tts, xiaozhi_last_tts, sizeof(xiaozhi_last_tts));
+    music_player_status_snapshot(&music);
+    html_escape(music.title[0] != '\0' ? music.title : music.song_name, music_title, sizeof(music_title));
+    html_escape(music.artist_name, music_artist, sizeof(music_artist));
+    html_escape(music.album, music_album, sizeof(music_album));
+    html_escape(music.last_error, music_error, sizeof(music_error));
     html_escape(state.wifi_ssid, wifi_ssid, sizeof(wifi_ssid));
     html_escape(state.weather_label, weather_label, sizeof(weather_label));
     html_escape(state.weather_source, weather_source, sizeof(weather_source));
@@ -890,6 +900,48 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "<button class=\"warn\" type=\"submit\" formaction=\"/xiaozhi-start\">Start AI</button>"
         "<button class=\"danger\" type=\"submit\" formaction=\"/xiaozhi-stop\">Stop AI</button></div>"
         "<footer>Start AI keeps Xiaozhi listening in the background. When idle, the screen returns to the quota or standby page. When wake-word or dialog activity appears, the screen switches back to Xiaozhi. Stop AI fully disables wake listening.</footer>"
+        "</form></section>");
+    append(html, html_size, &used, "<h2>Music</h2><section class=\"grid\">");
+    appendf(
+        html,
+        html_size,
+        &used,
+        "<div class=\"card\"><div class=\"k\">State</div><div class=\"v\">%s</div><div class=\"k\">active %s stop %s</div></div>",
+        music_player_state_name(music.state),
+        music.active ? "yes" : "no",
+        music.stop_requested ? "yes" : "no");
+    appendf(
+        html,
+        html_size,
+        &used,
+        "<div class=\"card\"><div class=\"k\">Track</div><div class=\"v\">%s</div><div class=\"k\">%s</div></div>",
+        music_title[0] != '\0' ? music_title : "--",
+        music_artist[0] != '\0' ? music_artist : "--");
+    appendf(
+        html,
+        html_size,
+        &used,
+        "<div class=\"card\"><div class=\"k\">Album</div><div class=\"v\">%s</div><div class=\"k\">cover %s lyrics %u B</div></div>",
+        music_album[0] != '\0' ? music_album : "--",
+        music.has_cover ? "yes" : "no",
+        (unsigned int)strlen(music.lyrics));
+    appendf(
+        html,
+        html_size,
+        &used,
+        "<div class=\"card\"><div class=\"k\">Playback</div><div class=\"v\">%u ms</div><div class=\"k\">%s</div></div>",
+        (unsigned int)music.playback_ms,
+        music_error[0] != '\0' ? music_error : "no error");
+    append(
+        html,
+        html_size,
+        &used,
+        "</section><section class=\"ops\"><form method=\"post\" action=\"/play-music\">"
+        "<label class=\"k\">Song</label><input name=\"song_name\" maxlength=\"63\" value=\"bad guy\">"
+        "<label class=\"k\">Artist</label><input name=\"artist_name\" maxlength=\"63\" value=\"billie eilish\">"
+        "<div class=\"actions\"><button type=\"submit\">Play Music</button>"
+        "<button class=\"danger\" type=\"submit\" formaction=\"/stop-music\">Stop Music</button></div>"
+        "<footer>Music commands are LAN-only web console tooling for validating bridge-resolved audio, lyrics, and cover art.</footer>"
         "</form></section>");
     appendf(
         html,
@@ -1651,6 +1703,45 @@ static esp_err_t xiaozhi_test_post_handler(httpd_req_t *req)
     return send_xiaozhi_test_page(req, &result);
 }
 
+static esp_err_t play_music_post_handler(httpd_req_t *req)
+{
+    char body[256] = {0};
+    char song_name[ORNAMENT_TEXT_MAX] = {0};
+    char artist_name[ORNAMENT_TEXT_MAX] = {0};
+    if (read_form_body(req, body, sizeof(body)) != ESP_OK) {
+        return ESP_FAIL;
+    }
+    form_value(body, "song_name", song_name, sizeof(song_name));
+    form_value(body, "artist_name", artist_name, sizeof(artist_name));
+    if (song_name[0] == '\0') {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Song is required");
+        return ESP_FAIL;
+    }
+
+    esp_err_t err = music_player_play_song_with_settings(
+        song_name,
+        artist_name[0] != '\0' ? artist_name : NULL,
+        1,
+        &console_settings);
+    char detail[160];
+    snprintf(
+        detail,
+        sizeof(detail),
+        err == ESP_OK ? "Music start queued: %s" : "Music start failed: %s",
+        err == ESP_OK ? song_name : esp_err_to_name(err));
+    return send_simple_page(req, "Music", detail);
+}
+
+static esp_err_t stop_music_post_handler(httpd_req_t *req)
+{
+    if (req->content_len > 0) {
+        char body[256] = {0};
+        (void)read_form_body(req, body, sizeof(body));
+    }
+    music_player_request_stop();
+    return send_simple_page(req, "Music", "Music stop requested.");
+}
+
 static esp_err_t auto_bridge_post_handler(httpd_req_t *req)
 {
     if (req->content_len > 0) {
@@ -1727,7 +1818,7 @@ esp_err_t web_console_start(void)
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
     config.lru_purge_enable = true;
-    config.max_uri_handlers = 20;
+    config.max_uri_handlers = 22;
     config.stack_size = 16384;
 
     esp_err_t err = httpd_start(&server, &config);
@@ -1806,6 +1897,16 @@ esp_err_t web_console_start(void)
         .method = HTTP_POST,
         .handler = xiaozhi_test_post_handler,
     };
+    const httpd_uri_t play_music = {
+        .uri = "/play-music",
+        .method = HTTP_POST,
+        .handler = play_music_post_handler,
+    };
+    const httpd_uri_t stop_music = {
+        .uri = "/stop-music",
+        .method = HTTP_POST,
+        .handler = stop_music_post_handler,
+    };
     const httpd_uri_t reboot = {
         .uri = "/reboot",
         .method = HTTP_POST,
@@ -1831,6 +1932,8 @@ esp_err_t web_console_start(void)
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &xiaozhi_start));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &xiaozhi_stop));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &xiaozhi_test));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &play_music));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &stop_music));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &reboot));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &clear_config));
     ESP_LOGI(TAG, "web console started on http://<device-ip>/");
