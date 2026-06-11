@@ -2757,7 +2757,8 @@ fn resolve_song_yaohud(config: &BridgeConfig, request: &MusicRequest) -> io::Res
     .to_string();
     let album = data.album.unwrap_or_default();
     let picture = data.picture.or(data.pic).unwrap_or_default();
-    let lyrics = normalize_lyrics(&client, data.lrctxt.or(data.lyrics).or(data.lrc));
+    let lyrics = normalize_lyrics(&client, data.lrctxt.or(data.lyrics).or(data.lrc))
+        .or_else(|| fetch_netease_lyrics_for_request(request));
 
     Ok(ResolvedSong {
         source: "yaohud",
@@ -2934,6 +2935,12 @@ fn fetch_netease_lyrics(client: &reqwest::blocking::Client, song_id: u64) -> Opt
         .lrc
         .and_then(|lrc| lrc.lyric)
         .filter(|lyric| !lyric.trim().is_empty())
+}
+
+fn fetch_netease_lyrics_for_request(request: &MusicRequest) -> Option<String> {
+    resolve_song_netease(request)
+        .ok()
+        .and_then(|song| song.lyrics)
 }
 
 fn first_nonempty<'a>(values: &[Option<&'a str>]) -> Option<&'a str> {
