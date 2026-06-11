@@ -8,12 +8,16 @@ set(ORNAMENT_SRCS
   "system_status.c"
   "task_audio.c"
   "music_player.c"
-  "xiaozhi_client.c"
-  "xiaozhi_mcp.c"
   "display.c"
   "display_core.c"
   "wifi.c"
 )
+
+if(CONFIG_ORNAMENT_XIAOZHI_TRANSPORT_DIRECT)
+  list(APPEND ORNAMENT_SRCS "xiaozhi_client_direct.c" "xiaozhi_mcp.c")
+else()
+  list(APPEND ORNAMENT_SRCS "xiaozhi_client.c")
+endif()
 
 if(CONFIG_ORNAMENT_CONFIG_PORTAL_ENABLED)
   list(APPEND ORNAMENT_SRCS "config_portal.c")
@@ -58,7 +62,7 @@ if(CONFIG_ORNAMENT_MDNS_ENABLED)
   list(APPEND ORNAMENT_REQUIRES mdns)
 endif()
 
-if(CONFIG_ORNAMENT_XIAOZHI_ENABLED)
+if(CONFIG_ORNAMENT_XIAOZHI_TRANSPORT_DIRECT)
   list(APPEND ORNAMENT_REQUIRES esp_websocket_client esp-opus)
 endif()
 

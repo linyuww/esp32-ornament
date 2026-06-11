@@ -1,3 +1,8 @@
+if(NOT CONFIG_ORNAMENT_XIAOZHI_TRANSPORT_DIRECT)
+    idf_component_register(INCLUDE_DIRS "include")
+    return()
+endif()
+
 set(CELT_SOURCES
     celt/bands.c
     celt/celt.c

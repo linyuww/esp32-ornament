@@ -19,8 +19,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#ifndef CONFIG_ORNAMENT_XIAOZHI_MCP_ENABLED
-#define CONFIG_ORNAMENT_XIAOZHI_MCP_ENABLED 0
+#ifndef CONFIG_ORNAMENT_MUSIC_PLAYER_ENABLED
+#define CONFIG_ORNAMENT_MUSIC_PLAYER_ENABLED 0
 #endif
 
 #ifndef CONFIG_ORNAMENT_MUSIC_REQUEST_TIMEOUT_MS
@@ -35,7 +35,7 @@
 #define CONFIG_ORNAMENT_MUSIC_COVER_ENABLED 0
 #endif
 
-#if CONFIG_ORNAMENT_XIAOZHI_ENABLED && CONFIG_ORNAMENT_XIAOZHI_MCP_ENABLED
+#if CONFIG_ORNAMENT_MUSIC_PLAYER_ENABLED
 
 #define MUSIC_PLAYER_TASK_DONE BIT0
 #define MUSIC_PLAYER_URL_MAX 768
@@ -1047,6 +1047,19 @@ esp_err_t music_player_play_song(const char *song_name, const char *artist_name,
     (void)song_name;
     (void)artist_name;
     (void)index;
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
+esp_err_t music_player_play_song_with_settings(
+    const char *song_name,
+    const char *artist_name,
+    uint32_t index,
+    const ornament_settings_t *settings)
+{
+    (void)song_name;
+    (void)artist_name;
+    (void)index;
+    (void)settings;
     return ESP_ERR_NOT_SUPPORTED;
 }
 

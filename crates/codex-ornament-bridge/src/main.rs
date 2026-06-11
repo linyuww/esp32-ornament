@@ -85,6 +85,7 @@ struct BridgeState {
     weather_last_attempt: Option<Instant>,
     active_recovery: Option<CachedActiveRecovery>,
     music_resolves: HashMap<String, CachedMusicResolve>,
+    xiaozhi: XiaozhiProxySession,
 }
 
 #[derive(Clone, Debug)]
@@ -412,6 +413,83 @@ struct CachedMusicResolve {
     fetched_at: Instant,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+enum XiaozhiProxyState {
+    Idle,
+    ConfigMissing,
+    Connecting,
+    Listening,
+    Speaking,
+    Error,
+}
+
+#[derive(Clone, Debug)]
+struct XiaozhiProxySession {
+    state: XiaozhiProxyState,
+    session_requested: bool,
+    connected: bool,
+    configured: bool,
+    session_id: String,
+    client_id: Option<String>,
+    last_error: Option<String>,
+    last_stt: Option<String>,
+    last_tts: Option<String>,
+    uplink_frames: u64,
+    downlink_frames: u64,
+    updated_at: Instant,
+}
+
+impl Default for XiaozhiProxySession {
+    fn default() -> Self {
+        Self {
+            state: XiaozhiProxyState::Idle,
+            session_requested: false,
+            connected: false,
+            configured: false,
+            session_id: "bridge".to_string(),
+            client_id: None,
+            last_error: None,
+            last_stt: None,
+            last_tts: None,
+            uplink_frames: 0,
+            downlink_frames: 0,
+            updated_at: Instant::now(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct XiaozhiProxyStatus {
+    ok: bool,
+    state: &'static str,
+    configured: bool,
+    connected: bool,
+    session_requested: bool,
+    runtime_config: bool,
+    activation_pending: bool,
+    session_id: String,
+    client_id: Option<String>,
+    last_error: String,
+    last_stt: String,
+    last_tts: String,
+    activation_code: String,
+    activation_message: String,
+    uplink_frames: u64,
+    downlink_frames: u64,
+    observed_at: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct XiaozhiSessionRequest {
+    client_id: Option<String>,
+    sample_rate: Option<u32>,
+    channels: Option<u8>,
+    format: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct YaohudMusicResponse {
     #[serde(default)]
@@ -648,6 +726,15 @@ fn handle_connection(
         }
         ("GET", "/v1/music/cover") => {
             handle_music_cover(&mut stream, peer, &request, &state, &config)
+        }
+        ("GET", "/v1/xiaozhi/session/status") => {
+            handle_xiaozhi_status(&mut stream, peer, &state)
+        }
+        ("POST", "/v1/xiaozhi/session/start") => {
+            handle_xiaozhi_session_start(&mut stream, peer, &request, &state)
+        }
+        ("POST", "/v1/xiaozhi/session/stop") => {
+            handle_xiaozhi_session_stop(&mut stream, peer, &state)
         }
         ("POST", "/hook/codex") | ("POST", "/event") => {
             if !post_allowed(peer, &request, &config) {
@@ -2365,6 +2452,140 @@ fn handle_music_cover(
                 &json!({"ok": false, "error": error.to_string()}),
             )
         }
+    }
+}
+
+fn handle_xiaozhi_status(
+    stream: &mut TcpStream,
+    peer: Option<SocketAddr>,
+    state: &SharedBridgeState,
+) -> io::Result<()> {
+    if !music_get_allowed(peer) {
+        return write_json(stream, 403, &json!({"ok": false, "error": "forbidden"}));
+    }
+
+    write_json(stream, 200, &xiaozhi_status_snapshot(state))
+}
+
+fn handle_xiaozhi_session_start(
+    stream: &mut TcpStream,
+    peer: Option<SocketAddr>,
+    request: &HttpRequest,
+    state: &SharedBridgeState,
+) -> io::Result<()> {
+    if !music_get_allowed(peer) {
+        return write_json(stream, 403, &json!({"ok": false, "error": "forbidden"}));
+    }
+
+    let body = if request.body.is_empty() {
+        XiaozhiSessionRequest {
+            client_id: None,
+            sample_rate: None,
+            channels: None,
+            format: None,
+        }
+    } else {
+        match serde_json::from_slice::<XiaozhiSessionRequest>(&request.body) {
+            Ok(body) => body,
+            Err(error) => {
+                return write_json(
+                    stream,
+                    400,
+                    &json!({"ok": false, "error": format!("invalid Xiaozhi session json: {error}")}),
+                );
+            }
+        }
+    };
+
+    let response = xiaozhi_start_session(state, body);
+    write_json(stream, 200, &response)
+}
+
+fn handle_xiaozhi_session_stop(
+    stream: &mut TcpStream,
+    peer: Option<SocketAddr>,
+    state: &SharedBridgeState,
+) -> io::Result<()> {
+    if !music_get_allowed(peer) {
+        return write_json(stream, 403, &json!({"ok": false, "error": "forbidden"}));
+    }
+
+    let response = xiaozhi_stop_session(state);
+    write_json(stream, 200, &response)
+}
+
+fn xiaozhi_start_session(
+    state: &SharedBridgeState,
+    request: XiaozhiSessionRequest,
+) -> XiaozhiProxyStatus {
+    let mut state = state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    state.xiaozhi.session_requested = true;
+    state.xiaozhi.connected = false;
+    state.xiaozhi.configured = false;
+    state.xiaozhi.client_id = request.client_id.filter(|value| !value.trim().is_empty());
+    state.xiaozhi.state = XiaozhiProxyState::ConfigMissing;
+    state.xiaozhi.last_stt = None;
+    state.xiaozhi.last_tts = None;
+    state.xiaozhi.last_error = Some(match (
+        request.sample_rate,
+        request.channels,
+        request.format.as_deref(),
+    ) {
+        (Some(sample_rate), Some(channels), Some(format)) => format!(
+            "Xiaozhi bridge audio proxy is not configured yet ({sample_rate} Hz, {channels} ch, {format})"
+        ),
+        _ => "Xiaozhi bridge audio proxy is not configured yet".to_string(),
+    });
+    state.xiaozhi.updated_at = Instant::now();
+    xiaozhi_status_from_session(&state.xiaozhi)
+}
+
+fn xiaozhi_stop_session(state: &SharedBridgeState) -> XiaozhiProxyStatus {
+    let mut state = state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    state.xiaozhi.session_requested = false;
+    state.xiaozhi.connected = false;
+    state.xiaozhi.configured = false;
+    state.xiaozhi.state = XiaozhiProxyState::Idle;
+    state.xiaozhi.last_error = None;
+    state.xiaozhi.updated_at = Instant::now();
+    xiaozhi_status_from_session(&state.xiaozhi)
+}
+
+fn xiaozhi_status_snapshot(state: &SharedBridgeState) -> XiaozhiProxyStatus {
+    let state = state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    xiaozhi_status_from_session(&state.xiaozhi)
+}
+
+fn xiaozhi_status_from_session(session: &XiaozhiProxySession) -> XiaozhiProxyStatus {
+    XiaozhiProxyStatus {
+        ok: true,
+        state: xiaozhi_state_name(session.state),
+        configured: session.configured,
+        connected: session.connected,
+        session_requested: session.session_requested,
+        runtime_config: false,
+        activation_pending: false,
+        session_id: session.session_id.clone(),
+        client_id: session.client_id.clone(),
+        last_error: session.last_error.clone().unwrap_or_default(),
+        last_stt: session.last_stt.clone().unwrap_or_default(),
+        last_tts: session.last_tts.clone().unwrap_or_default(),
+        activation_code: String::new(),
+        activation_message: String::new(),
+        uplink_frames: session.uplink_frames,
+        downlink_frames: session.downlink_frames,
+        observed_at: now_local(),
+    }
+}
+
+fn xiaozhi_state_name(state: XiaozhiProxyState) -> &'static str {
+    match state {
+        XiaozhiProxyState::Idle => "idle",
+        XiaozhiProxyState::ConfigMissing => "configMissing",
+        XiaozhiProxyState::Connecting => "connecting",
+        XiaozhiProxyState::Listening => "listening",
+        XiaozhiProxyState::Speaking => "speaking",
+        XiaozhiProxyState::Error => "error",
     }
 }
 
@@ -4940,6 +5161,30 @@ mod tests {
             qweather_token: None,
             caiyun_token: None,
         }
+    }
+
+    #[test]
+    fn xiaozhi_session_api_tracks_requested_state() {
+        let state = Arc::new(Mutex::new(BridgeState::default()));
+
+        let started = xiaozhi_start_session(
+            &state,
+            XiaozhiSessionRequest {
+                client_id: Some("esp32-test".to_string()),
+                sample_rate: Some(16000),
+                channels: Some(1),
+                format: Some("pcm_s16le".to_string()),
+            },
+        );
+        assert!(started.ok);
+        assert_eq!(started.state, "configMissing");
+        assert!(started.session_requested);
+        assert_eq!(started.client_id.as_deref(), Some("esp32-test"));
+
+        let stopped = xiaozhi_stop_session(&state);
+        assert!(stopped.ok);
+        assert_eq!(stopped.state, "idle");
+        assert!(!stopped.session_requested);
     }
 
     fn recent_timestamp(seconds_ago: i64) -> String {
