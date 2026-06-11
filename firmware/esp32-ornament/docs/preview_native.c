@@ -387,7 +387,7 @@ int main(int argc, char **argv)
             XIAOZHI_CLIENT_STATE_LISTENING,
             true,
             true,
-            "Tomorrow weather?",
+            "\xE6\x98\x8E\xE5\xA4\xA9\xE5\xA4\xA9\xE6\xB0\x94\xE6\x80\x8E\xE4\xB9\x88\xE6\xA0\xB7\xEF\xBC\x9F",
             "",
             "") != 0) {
         return 1;
@@ -399,8 +399,8 @@ int main(int argc, char **argv)
             XIAOZHI_CLIENT_STATE_SPEAKING,
             true,
             true,
-            "Tomorrow weather?",
-            "Cloudy with light rain.",
+            "\xE6\x98\x8E\xE5\xA4\xA9\xE5\xA4\xA9\xE6\xB0\x94\xE6\x80\x8E\xE4\xB9\x88\xE6\xA0\xB7\xEF\xBC\x9F",
+            "\xE6\x98\x8E\xE5\xA4\xA9\xE5\xA4\x9A\xE4\xBA\x91\xE6\x9C\x89\xE5\xB0\x8F\xE9\x9B\xA8",
             "") != 0) {
         return 1;
     }
@@ -435,8 +435,8 @@ int main(int argc, char **argv)
             XIAOZHI_CLIENT_STATE_IDLE,
             true,
             true,
-            "Tomorrow weather?",
-            "Dialog finished",
+            "\xE6\x98\x8E\xE5\xA4\xA9\xE5\xA4\xA9\xE6\xB0\x94\xE6\x80\x8E\xE4\xB9\x88\xE6\xA0\xB7\xEF\xBC\x9F",
+            "\xE5\xAF\xB9\xE8\xAF\x9D\xE5\xB7\xB2\xE5\xAE\x8C\xE6\x88\x90",
             "") != 0) {
         return 1;
     }
