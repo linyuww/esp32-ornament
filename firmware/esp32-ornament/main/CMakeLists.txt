@@ -67,9 +67,17 @@ if(CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED)
   list(APPEND ORNAMENT_REQUIRES lvgl 78__xiaozhi-fonts)
 endif()
 
-idf_component_register(
-  SRCS ${ORNAMENT_SRCS}
-  INCLUDE_DIRS "."
-  EMBED_FILES ${ORNAMENT_EMBED_FILES}
-  REQUIRES ${ORNAMENT_REQUIRES}
-)
+if(ORNAMENT_EMBED_FILES)
+  idf_component_register(
+    SRCS ${ORNAMENT_SRCS}
+    INCLUDE_DIRS "."
+    EMBED_FILES ${ORNAMENT_EMBED_FILES}
+    REQUIRES ${ORNAMENT_REQUIRES}
+  )
+else()
+  idf_component_register(
+    SRCS ${ORNAMENT_SRCS}
+    INCLUDE_DIRS "."
+    REQUIRES ${ORNAMENT_REQUIRES}
+  )
+endif()
