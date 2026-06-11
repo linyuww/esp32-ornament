@@ -910,16 +910,26 @@ static void draw_hud_wrapped_text(
     int x_scale,
     int y_scale)
 {
+    const char *render_text;
+#if CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
+    render_text = text != NULL && text[0] != '\0' ? text : fallback;
+#else
+    render_text = fallback != NULL ? fallback : text;
+#endif
+    if (render_text == NULL || render_text[0] == '\0') {
+        return;
+    }
+
 #if CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
     (void)fallback;
     (void)x_scale;
     (void)y_scale;
-    draw_utf8_text_wrapped(x, y, &font_puhui_16_4, text, color, max_width, max_lines);
+    draw_utf8_text_wrapped(x, y, &font_puhui_16_4, render_text, color, max_width, max_lines);
 #else
     draw_ascii_text_wrapped_xy(
         x,
         y,
-        fallback != NULL && fallback[0] != '\0' ? fallback : text,
+        render_text,
         color,
         max_width,
         max_lines,
@@ -1644,58 +1654,25 @@ static const char *xiaozhi_hud_main_ascii(xiaozhi_client_state_t state);
 static const char *xiaozhi_hud_user_hint(const xiaozhi_client_snapshot_t *snapshot)
 {
     if (snapshot == NULL) {
-#if CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
-        return "\xE6\x9A\x82\xE6\x97\xA0\xE8\xAF\xAD\xE9\x9F\xB3";
-#else
-        return "NO VOICE YET";
-#endif
+        return "";
     }
     if (snapshot->activation_pending) {
-        return snapshot->activation_code[0] != '\0' ? snapshot->activation_code :
-#if CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
-            "\xE7\xAD\x89\xE5\xBE\x85\xE7\xBB\x91\xE5\xAE\x9A";
-#else
-            "BIND PENDING";
-#endif
+        return snapshot->activation_code[0] != '\0' ? snapshot->activation_code : "";
     }
     if (snapshot->last_stt[0] != '\0') {
         return snapshot->last_stt;
     }
     switch (snapshot->state) {
-    case XIAOZHI_CLIENT_STATE_LISTENING:
-#if CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
-        return "\xE6\xAD\xA3\xE5\x9C\xA8\xE5\x90\xAC\xE4\xBD\xA0\xE8\xAF\xB4";
-#else
-        return "LISTENING NOW";
-#endif
-    case XIAOZHI_CLIENT_STATE_SPEAKING:
-#if CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
-        return "\xE5\xB7\xB2\xE6\x94\xB6\xE5\x88\xB0\xE8\xAF\xAD\xE9\x9F\xB3";
-#else
-        return "VOICE RECEIVED";
-#endif
-    case XIAOZHI_CLIENT_STATE_CONNECTING:
-#if CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
-        return "\xE6\xAD\xA3\xE5\x9C\xA8\xE8\xBF\x9E\xE6\x8E\xA5";
-#else
-        return "CONNECTING";
-#endif
     case XIAOZHI_CLIENT_STATE_ERROR:
     case XIAOZHI_CLIENT_STATE_CONFIG_MISSING:
-        return snapshot->last_error[0] != '\0' ? snapshot->last_error :
-#if CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
-            "\xE8\xAF\xB7\xE6\xA3\x80\xE6\x9F\xA5\xE9\x85\x8D\xE7\xBD\xAE";
-#else
-            "CHECK CONFIG";
-#endif
+        return snapshot->last_error[0] != '\0' ? snapshot->last_error : "";
+    case XIAOZHI_CLIENT_STATE_LISTENING:
+    case XIAOZHI_CLIENT_STATE_SPEAKING:
+    case XIAOZHI_CLIENT_STATE_CONNECTING:
     case XIAOZHI_CLIENT_STATE_IDLE:
     case XIAOZHI_CLIENT_STATE_DISABLED:
     default:
-#if CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
-        return "\xE6\x9A\x82\xE6\x97\xA0\xE8\xAF\xAD\xE9\x9F\xB3";
-#else
-        return "NO VOICE YET";
-#endif
+        return "";
     }
 }
 
@@ -1744,86 +1721,52 @@ static const char *xiaozhi_hud_main_ascii(xiaozhi_client_state_t state)
 static const char *xiaozhi_hud_assistant_hint(const xiaozhi_client_snapshot_t *snapshot, const char *tts_text)
 {
     if (snapshot == NULL) {
-#if CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
-        return "\xE6\x9A\x82\xE6\x97\xA0\xE5\x9B\x9E\xE5\xA4\x8D";
-#else
-        return "NO REPLY YET";
-#endif
+        return "";
     }
     if (snapshot->activation_pending) {
         return snapshot->activation_code[0] != '\0' ? snapshot->activation_code :
-#if CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
-            "\xE8\xAF\xB7\xE5\x85\x88\xE7\xBB\x91\xE5\xAE\x9A\xE8\xAE\xBE\xE5\xA4\x87";
-#else
-            "BIND PENDING";
-#endif
+            (snapshot->activation_message[0] != '\0' ? snapshot->activation_message : "");
     }
     if (snapshot->last_tts[0] != '\0') {
         return tts_text;
     }
     switch (snapshot->state) {
-    case XIAOZHI_CLIENT_STATE_LISTENING:
-#if CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
-        return "\xE6\xAD\xA3\xE5\x9C\xA8\xE6\x8E\xA5\xE6\x94\xB6\xE8\xAF\xAD\xE9\x9F\xB3\x2E\x2E\x2E";
-#else
-        return "RECEIVING VOICE";
-#endif
-    case XIAOZHI_CLIENT_STATE_SPEAKING:
-#if CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
-        return "\xE6\xAD\xA3\xE5\x9C\xA8\xE6\x92\xAD\xE6\x94\xBE\xE5\x9B\x9E\xE5\xA4\x8D";
-#else
-        return "PLAYING REPLY";
-#endif
-    case XIAOZHI_CLIENT_STATE_CONNECTING:
-#if CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
-        return "\xE7\xBD\x91\xE7\xBB\x9C\xE8\xBF\x9E\xE6\x8E\xA5\xE4\xB8\xAD";
-#else
-        return "WAITING CONNECTION";
-#endif
     case XIAOZHI_CLIENT_STATE_ERROR:
     case XIAOZHI_CLIENT_STATE_CONFIG_MISSING:
-        return snapshot->last_error[0] != '\0' ? snapshot->last_error :
-#if CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
-            "\xE9\x85\x8D\xE7\xBD\xAE\xE5\xBC\x82\xE5\xB8\xB8";
-#else
-            "CHECK CONFIG";
-#endif
+        return snapshot->last_error[0] != '\0' ? snapshot->last_error : "";
+    case XIAOZHI_CLIENT_STATE_LISTENING:
+    case XIAOZHI_CLIENT_STATE_SPEAKING:
+    case XIAOZHI_CLIENT_STATE_CONNECTING:
     case XIAOZHI_CLIENT_STATE_IDLE:
     case XIAOZHI_CLIENT_STATE_DISABLED:
     default:
-#if CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
-        return "\xE6\x9A\x82\xE6\x97\xA0\xE5\x9B\x9E\xE5\xA4\x8D";
-#else
-        return "NO REPLY YET";
-#endif
+        return "";
     }
 }
 
 static const char *xiaozhi_hud_assistant_ascii(const xiaozhi_client_snapshot_t *snapshot, const char *tts_text)
 {
     if (snapshot == NULL) {
-        return "NO REPLY YET";
+        return "";
     }
     if (snapshot->activation_pending) {
-        return snapshot->activation_code[0] != '\0' ? snapshot->activation_code : "BIND PENDING";
+        return snapshot->activation_code[0] != '\0' ? snapshot->activation_code :
+            (snapshot->activation_message[0] != '\0' ? snapshot->activation_message : "");
     }
     if (snapshot->last_tts[0] != '\0') {
         return tts_text;
     }
     switch (snapshot->state) {
-    case XIAOZHI_CLIENT_STATE_LISTENING:
-        return "RECEIVING VOICE";
-    case XIAOZHI_CLIENT_STATE_SPEAKING:
-        return "PLAYING REPLY";
-    case XIAOZHI_CLIENT_STATE_CONNECTING:
-        return "WAITING CONNECTION";
     case XIAOZHI_CLIENT_STATE_ERROR:
     case XIAOZHI_CLIENT_STATE_CONFIG_MISSING:
-        return snapshot->last_error[0] != '\0' ? snapshot->last_error : "CHECK CONFIG";
+        return snapshot->last_error[0] != '\0' ? snapshot->last_error : "";
+    case XIAOZHI_CLIENT_STATE_LISTENING:
+    case XIAOZHI_CLIENT_STATE_SPEAKING:
+    case XIAOZHI_CLIENT_STATE_CONNECTING:
     case XIAOZHI_CLIENT_STATE_IDLE:
     case XIAOZHI_CLIENT_STATE_DISABLED:
     default:
-        return "NO REPLY YET";
+        return "";
     }
 }
 
@@ -2514,8 +2457,14 @@ void display_core_render_xiaozhi(
     const char *main_ascii = completed ? "DONE" : xiaozhi_hud_main_ascii(snapshot->state);
     const char *assistant_text = xiaozhi_hud_assistant_hint(snapshot, tts_text);
     const char *assistant_ascii = xiaozhi_hud_assistant_ascii(snapshot, tts_text);
-    ascii_preview(stt_text, "NO VOICE YET", stt_preview, sizeof(stt_preview));
-    ascii_preview(assistant_ascii, "NO REPLY YET", assistant_preview, sizeof(assistant_preview));
+    bool stt_ascii_available = ascii_preview(stt_text, "", stt_preview, sizeof(stt_preview));
+    bool assistant_ascii_available = ascii_preview(assistant_ascii, "", assistant_preview, sizeof(assistant_preview));
+    if (!stt_ascii_available) {
+        stt_preview[0] = '\0';
+    }
+    if (!assistant_ascii_available) {
+        assistant_preview[0] = '\0';
+    }
 
     uint16_t state_color = HUD_HUD_CYAN;
     switch (snapshot->state) {
@@ -2575,7 +2524,9 @@ void display_core_render_xiaozhi(
         2,
         text_scale,
         text_scale);
-    draw_text_xy(query_x + query_w - ss(30), query_y + query_h - ss(18), "...", text_scale, text_scale, HUD_HUD_CYAN);
+    if (stt_text[0] != '\0') {
+        draw_text_xy(query_x + query_w - ss(30), query_y + query_h - ss(18), "...", text_scale, text_scale, HUD_HUD_CYAN);
+    }
 
     draw_hud_segmented_ring(ring_cx, ring_cy, ring_r, state_color);
     if (snapshot->state == XIAOZHI_CLIENT_STATE_LISTENING) {

@@ -387,7 +387,7 @@ int main(int argc, char **argv)
             XIAOZHI_CLIENT_STATE_LISTENING,
             true,
             true,
-            "Summarize current task?",
+            "LIVE USER CONTEXT",
             "",
             "") != 0) {
         return 1;
@@ -399,8 +399,8 @@ int main(int argc, char **argv)
             XIAOZHI_CLIENT_STATE_SPEAKING,
             true,
             true,
-            "Summarize current task?",
-            "Updated UI preview is ready.",
+            "LIVE USER CONTEXT",
+            "LIVE ASSISTANT CONTEXT",
             "") != 0) {
         return 1;
     }
@@ -435,8 +435,8 @@ int main(int argc, char **argv)
             XIAOZHI_CLIENT_STATE_IDLE,
             true,
             true,
-            "Summarize current task?",
-            "Context reply finished.",
+            "LIVE USER CONTEXT",
+            "LIVE ASSISTANT CONTEXT",
             "") != 0) {
         return 1;
     }

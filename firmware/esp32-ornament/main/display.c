@@ -64,10 +64,6 @@ static const char *const XIAOZHI_STATUS_ERROR_TEXT = "\xE5\xBC\x82\xE5\xB8\xB8";
 static const char *const XIAOZHI_STATUS_CONFIG_MISSING_TEXT = "\xE6\x9C\xAA\xE9\x85\x8D\xE7\xBD\xAE";
 static const char *const XIAOZHI_STATUS_IDLE_TEXT = "\xE5\xBE\x85\xE6\x9C\xBA";
 static const char *const XIAOZHI_STATUS_DISABLED_TEXT = "\xE5\x85\xB3\xE9\x97\xAD";
-static const char *const XIAOZHI_PROMPT_SPEAK_TEXT = "\xE8\xAF\xB7\xE8\xAF\xB4\xE8\xAF\x9D...";
-static const char *const XIAOZHI_WAIT_RESPONSE_TEXT = "\xE7\xAD\x89\xE5\xBE\x85\xE5\x9B\x9E\xE7\xAD\x94...";
-static const char *const XIAOZHI_WAIT_BIND_TEXT = "\xE7\xAD\x89\xE5\xBE\x85\xE7\xBB\x91\xE5\xAE\x9A...";
-static const char *const XIAOZHI_BIND_HINT_TEXT = "\xE8\xAF\xB7\xE7\xBB\x91\xE5\xAE\x9A\xE5\xAE\x98\xE6\x96\xB9\xE5\x90\x8E\xE5\x8F\xB0";
 static const char *const XIAOZHI_WAIT_CODE_TEXT = "\xE7\xAD\x89\xE5\xBE\x85\xE4\xB8\x8B\xE5\x8F\x91";
 static const char *const XIAOZHI_FOOTER_READY_TEXT = "\xE8\xAF\xAD\xE9\x9F\xB3\xE5\x8A\xA9\xE6\x89\x8B\xE5\xB7\xB2\xE5\x87\x86\xE5\xA4\x87";
 static const char *const XIAOZHI_FOOTER_ONLINE_TEXT = "\xE5\xB0\x8F\xE6\x99\xBA\xE5\xB7\xB2\xE8\xBF\x9E\xE6\x8E\xA5";
@@ -264,25 +260,6 @@ static const char *xiaozhi_status_cn(xiaozhi_client_state_t state)
     }
 }
 
-static const char *xiaozhi_default_user_text(const xiaozhi_client_snapshot_t *snapshot)
-{
-    if (snapshot != NULL && snapshot->activation_pending) {
-        return XIAOZHI_WAIT_BIND_TEXT;
-    }
-    return XIAOZHI_PROMPT_SPEAK_TEXT;
-}
-
-static const char *xiaozhi_default_ai_text(const xiaozhi_client_snapshot_t *snapshot)
-{
-    if (snapshot != NULL && snapshot->activation_pending) {
-        if (snapshot->activation_code[0] != '\0') {
-            return snapshot->activation_code;
-        }
-        return XIAOZHI_BIND_HINT_TEXT;
-    }
-    return XIAOZHI_WAIT_RESPONSE_TEXT;
-}
-
 static void lvgl_cleanup_failed_init(void)
 {
     if (lvgl_tick_timer != NULL) {
@@ -417,14 +394,14 @@ static esp_err_t lvgl_xiaozhi_overlay_init(void)
     lv_label_set_long_mode(lvgl_user_label, LV_LABEL_LONG_WRAP);
     lv_obj_set_size(lvgl_user_label, layout.label_w, layout.user_h - layout.pad_y * 2);
     lv_obj_set_pos(lvgl_user_label, layout.pad_x, layout.pad_y);
-    lv_label_set_text(lvgl_user_label, XIAOZHI_PROMPT_SPEAK_TEXT);
+    lv_label_set_text(lvgl_user_label, "");
 
     lvgl_ai_label = lv_label_create(lvgl_ai_card);
     lvgl_style_label(lvgl_ai_label, &font_puhui_16_4, lv_color_hex(0xf8fbff), LV_TEXT_ALIGN_LEFT);
     lv_label_set_long_mode(lvgl_ai_label, LV_LABEL_LONG_WRAP);
     lv_obj_set_size(lvgl_ai_label, layout.label_w, layout.ai_h - layout.pad_y * 2);
     lv_obj_set_pos(lvgl_ai_label, layout.pad_x, layout.pad_y);
-    lv_label_set_text(lvgl_ai_label, XIAOZHI_WAIT_RESPONSE_TEXT);
+    lv_label_set_text(lvgl_ai_label, "");
 
     lvgl_footer_label = lv_label_create(lvgl_root);
     lvgl_style_label(lvgl_footer_label, &font_puhui_16_4, lv_color_hex(0x94a3b8), LV_TEXT_ALIGN_CENTER);
@@ -452,12 +429,23 @@ static void lvgl_render_xiaozhi_overlay(const xiaozhi_client_snapshot_t *snapsho
 
     char state_text[32];
     const char *footer_text = XIAOZHI_FOOTER_READY_TEXT;
-    const char *user_text = snapshot->last_stt[0] != '\0' ? snapshot->last_stt : xiaozhi_default_user_text(snapshot);
-    const char *ai_text = snapshot->last_tts[0] != '\0' ? snapshot->last_tts : xiaozhi_default_ai_text(snapshot);
+    const char *user_text = snapshot->last_stt;
+    const char *ai_text = snapshot->last_tts;
 
     snprintf(state_text, sizeof(state_text), "%s", xiaozhi_status_cn(snapshot->state));
     if (snapshot->activation_pending) {
+        if (snapshot->activation_code[0] != '\0') {
+            user_text = snapshot->activation_code;
+            ai_text = snapshot->activation_code;
+        } else if (snapshot->activation_message[0] != '\0') {
+            ai_text = snapshot->activation_message;
+        }
         footer_text = snapshot->activation_code[0] != '\0' ? snapshot->activation_code : XIAOZHI_WAIT_CODE_TEXT;
+    } else if ((snapshot->state == XIAOZHI_CLIENT_STATE_ERROR ||
+                snapshot->state == XIAOZHI_CLIENT_STATE_CONFIG_MISSING) &&
+               snapshot->last_error[0] != '\0') {
+        user_text = snapshot->last_error;
+        ai_text = "";
     } else if (snapshot->connected) {
         footer_text = XIAOZHI_FOOTER_ONLINE_TEXT;
     } else if (snapshot->session_requested || snapshot->state == XIAOZHI_CLIENT_STATE_CONNECTING) {
