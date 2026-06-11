@@ -31,7 +31,6 @@ set(ORNAMENT_REQUIRES
   esp_driver_i2s
   esp-tls
   esp_http_client
-  esp_http_server
   esp_lcd
   esp_netif
   esp_timer
@@ -41,6 +40,10 @@ set(ORNAMENT_REQUIRES
   mbedtls
   nvs_flash
 )
+
+if(CONFIG_ORNAMENT_CONFIG_PORTAL_ENABLED OR CONFIG_ORNAMENT_WEB_CONSOLE_ENABLED)
+  list(APPEND ORNAMENT_REQUIRES esp_http_server)
+endif()
 
 if(CONFIG_ORNAMENT_MDNS_ENABLED)
   list(APPEND ORNAMENT_REQUIRES mdns)
