@@ -78,6 +78,8 @@ static const char *TAG = "ornament";
 #define VOICE_STATUS_TEXT_MAX 40
 #define ORNAMENT_MIN_VALID_EPOCH 1577836800LL
 #define BRIDGE_SINGLE_RETRY_DELAY_MS 1000
+#define PAGE_BUTTON_TASK_STACK 4096
+#define AI_BUTTON_TASK_STACK 8192
 #define UI_RENDER_TASK_STACK 24576
 #define UI_RENDER_LOW_STACK_WARN_BYTES 2048
 
@@ -1495,10 +1497,10 @@ void app_main(void)
 
     create_app_task(xiaozhi_session_task, "xiaozhi_ctl", 8192, 5);
 #if CONFIG_ORNAMENT_PAGE_BUTTON_ENABLED
-    create_app_task(page_button_task, "page_button", 3072, 5);
+    create_app_task(page_button_task, "page_button", PAGE_BUTTON_TASK_STACK, 5);
 #endif
 #if CONFIG_ORNAMENT_AI_BUTTON_ENABLED
-    create_app_task(ai_button_task, "ai_button", 4096, 5);
+    create_app_task(ai_button_task, "ai_button", AI_BUTTON_TASK_STACK, 5);
 #endif
     create_app_task(poll_task, "bridge_poll", 8192, 5);
     create_app_task_psram(ui_render_task, "ui_render", UI_RENDER_TASK_STACK, 4);
