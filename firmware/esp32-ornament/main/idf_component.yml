@@ -1,2 +1,3 @@
 dependencies:
   espressif/mdns: ^1.11.1
+  espressif/esp_lcd_st77916: ^2.0.2

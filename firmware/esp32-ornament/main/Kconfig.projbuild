@@ -243,80 +243,6 @@ config ORNAMENT_DONE_FLASH_MS
     default 5000
     range 0 600000
 
-menu "ASRPRO UART link"
-
-config ORNAMENT_ASRPRO_UART_ENABLED
-    bool "Enable ASRPRO UART link"
-    default y
-    help
-        Enables the shared UART used for ESP32-to-ASRPRO done reminders and
-        ASRPRO-to-ESP32 voice commands.
-
-config ORNAMENT_ASRPRO_DONE_NOTIFY
-    bool "Notify ASRPRO when task status becomes done"
-    depends on ORNAMENT_ASRPRO_UART_ENABLED
-    default y
-    help
-        When the bridge status enters done, send a UART trigger to ASRPRO.
-        Configure the ASRPRO project to receive the trigger string and play
-        the chosen audio file. Other task statuses are not announced.
-
-config ORNAMENT_ASRPRO_VOICE_COMMANDS
-    bool "Receive ASRPRO voice commands over UART"
-    depends on ORNAMENT_ASRPRO_UART_ENABLED
-    default y
-    help
-        When ASRPRO recognizes a local command, it sends an ASCII token over
-        UART. The ornament parses tokens such as show_clock and refresh_state
-        and performs the matching local action.
-
-config ORNAMENT_ASRPRO_UART_NUM
-    int "ASRPRO UART port"
-    depends on ORNAMENT_ASRPRO_UART_ENABLED
-    default 1
-    range 0 2
-
-config ORNAMENT_ASRPRO_UART_BAUD
-    int "ASRPRO UART baud rate"
-    depends on ORNAMENT_ASRPRO_UART_ENABLED
-    default 9600
-    range 1200 921600
-
-config ORNAMENT_ASRPRO_UART_TX_GPIO
-    int "ESP32 TX GPIO to ASRPRO RX"
-    depends on ORNAMENT_ASRPRO_UART_ENABLED
-    default 17
-
-config ORNAMENT_ASRPRO_UART_RX_GPIO
-    int "ESP32 RX GPIO from ASRPRO TX, or -1 when unused"
-    depends on ORNAMENT_ASRPRO_UART_ENABLED
-    default 18
-
-config ORNAMENT_ASRPRO_DONE_TRIGGER
-    string "ASRPRO done trigger string"
-    depends on ORNAMENT_ASRPRO_DONE_NOTIFY
-    default "codex_done"
-    help
-        ASRPRO should match this exact serial string and play the user's
-        selected audio file.
-
-config ORNAMENT_ASRPRO_DONE_SUFFIX
-    string "ASRPRO done trigger suffix"
-    depends on ORNAMENT_ASRPRO_DONE_NOTIFY
-    default ""
-    help
-        Optional suffix sent after the trigger. Leave empty for exact-string
-        matching in ASRPRO. Use a line ending only if the ASRPRO project also
-        matches that line ending.
-
-config ORNAMENT_ASRPRO_TX_WAIT_MS
-    int "ASRPRO UART TX wait in milliseconds"
-    depends on ORNAMENT_ASRPRO_DONE_NOTIFY
-    default 100
-    range 10 2000
-
-endmenu
-
 config ORNAMENT_AUDIO_ENABLED
     bool "Enable I2S audio hardware"
     default y
@@ -332,7 +258,7 @@ config ORNAMENT_TASK_DONE_AUDIO_CLIP_ENABLED
     help
         Embeds assets/task_done.pcm and plays it once when a new bridge done
         event is observed. Keep this disabled in the bridge-first firmware to
-        save flash; use ASRPRO done notification and the display flash instead.
+        save flash; the display still flashes on done events.
 
 config ORNAMENT_AUDIO_PIN_BCLK
     int "MAX98357A I2S BCLK GPIO"
@@ -531,8 +457,17 @@ config ORNAMENT_DISPLAY_DRIVER
     string "Display driver variant"
     default "st7789_spi"
     help
-        Display module driver. The current target is a 1.54 inch 240x240
-        ST7789 SPI square TFT module.
+        Display module driver. The stock target is a 1.54 inch 240x240
+        ST7789 SPI square TFT module. Use st77916_spi or st77916_qspi only
+        when ORNAMENT_ST77916_DISPLAY_ENABLED is enabled.
+
+config ORNAMENT_ST77916_DISPLAY_ENABLED
+    bool "Build optional ST77916 LCD driver support"
+    default n
+    help
+        Adds support for ST77916 SPI/QSPI panels and the Truly initialization
+        sequence used during LCD bring-up. Leave disabled for the stock ST7789
+        ornament to avoid extra component dependencies and flash usage.
 
 config ORNAMENT_LCD_SPI_HOST
     int "LCD SPI host"
@@ -589,5 +524,44 @@ config ORNAMENT_LCD_PIN_RST
 config ORNAMENT_LCD_PIN_BL
     int "LCD backlight control GPIO"
     default 7
+
+config ORNAMENT_LCD_BL_ACTIVE_LEVEL
+    int "LCD backlight active GPIO level"
+    default 1
+    range 0 1
+    help
+        Set 1 for active-high backlight enable. Set 0 only for adapter boards
+        with active-low backlight enable.
+
+config ORNAMENT_LCD_BOOT_TEST_MS
+    int "LCD boot test pattern duration in milliseconds"
+    default 0
+    range 0 10000
+    help
+        Shows full-screen color test frames after LCD initialization. Set 0
+        for normal production boot.
+
+config ORNAMENT_LCD_SWAP_COLOR_BYTES
+    bool "Swap RGB565 color bytes before LCD transfer"
+    default y
+    help
+        Most ESP LCD SPI paths expect high byte first for RGB565 transfers.
+        Disable only if colors are incorrect on the selected panel driver.
+
+config ORNAMENT_LCD_SWAP_XY
+    bool "Swap LCD X/Y address scan direction"
+    depends on ORNAMENT_ST77916_DISPLAY_ENABLED
+    default y
+    help
+        Enable when an ST77916 panel consumes row chunks as column chunks.
+
+config ORNAMENT_LCD_REFERENCE_TEST_ONLY
+    bool "Hold LCD reference test chart"
+    depends on ORNAMENT_ST77916_DISPLAY_ENABLED
+    default n
+    help
+        Draw a fixed reference chart and keep it on screen for panel bring-up.
+        This intentionally blocks the application and should stay disabled in
+        production firmware.
 
 endmenu

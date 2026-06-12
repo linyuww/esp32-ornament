@@ -714,12 +714,6 @@ const char *xiaozhi_client_state_name(xiaozhi_client_state_t state)
 esp_err_t xiaozhi_client_init(void)
 {
     if (s_initialized) {
-        ornament_settings_t settings;
-        if (settings_load(&settings) == ESP_OK && s_mutex != NULL &&
-            xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-            load_local_config_locked(&settings);
-            xSemaphoreGive(s_mutex);
-        }
         return ESP_OK;
     }
 
@@ -825,7 +819,7 @@ void xiaozhi_client_status_snapshot(xiaozhi_client_snapshot_t *snapshot)
     memset(snapshot, 0, sizeof(*snapshot));
     snapshot->state = XIAOZHI_CLIENT_STATE_DISABLED;
 
-    if (xiaozhi_client_init() != ESP_OK || s_mutex == NULL) {
+    if (!s_initialized || s_mutex == NULL) {
         return;
     }
 

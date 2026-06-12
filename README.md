@@ -4,7 +4,7 @@
 
 1. Windows/Tauri 桌面额度组件。
 2. PC 端 `codex-ornament-bridge` 网桥服务。
-3. ESP32-S3 桌面摆件固件，驱动 240x240 ST7789 屏幕、Web 控制台和任务完成语音提醒。
+3. ESP32-S3 桌面摆件固件，驱动 240x240 ST7789 屏幕、桥接状态页和本地 I2S 任务完成提示音。
 
 Codex 登录凭据只保存在 PC 上。ESP32 只读取局域网内的展示 JSON，不保存 token。
 
@@ -15,11 +15,15 @@ Codex 登录凭据只保存在 PC 上。ESP32 只读取局域网内的展示 JSO
 - ESP 硬件屏幕保持合并任务视图，不区分 Codex/Claude。
 - 网桥每 1 分钟检查额度缓存，网络异常时保留旧数据，不用 `--` 覆盖有效数据。
 - ESP 支持 UDP 自动发现网桥，PC IP 变化后可自动保存新的 `/state` 地址。
-- ESP 支持 mDNS Web 控制台，例如 `http://codex-ornament-4ad4.local/`。
+- ESP 默认通过 UDP 自动发现 PC 网桥；板端 Web 控制台和 mDNS 默认关闭，需要调试时可在 Kconfig 中开启。
 - 空闲 1 分钟进入待机时钟页，显示壁纸、时间、日期、天气、Wi-Fi 信号和 reset 时间。
 - 所有任务完成时闪烁 done 5 秒；若仍有任务运行，保持 running 且不播放完成语音。
 - 连续桥接失败达到阈值后才显示 `Bridge offline`，短暂失败继续显示上一帧有效状态。
-- 任务完成语音音量可在 ESP Web 控制台调节。
+- 任务完成提示默认使用屏幕 done 闪烁；启用 Web 控制台后可调节本地 I2S 提示音音量。
+- 小智页面显示实时 STT/TTS、激活码和错误状态，不再使用固定示例对话占位。
+- ESP32 固件默认采用 bridge-first 瘦身配置，关闭板端 Web 控制台、配网页和本地天气客户端以降低 flash/RAM 压力，需要时可在 Kconfig 中重新开启。
+- 固件保留可选 ST77916 SPI/QSPI 点屏诊断支持，默认关闭，默认硬件仍是 ST7789 SPI。
+- 页面切换和小智启停由 GPIO 按键、Web/bridge 控制完成；外部 UART 语音模块不再随固件构建。
 
 ## 架构
 
@@ -34,8 +38,8 @@ flowchart LR
   ESP["ESP32-S3"] -->|"UDP discover"| Bridge
   ESP -->|"GET /state"| Bridge
   ESP --> Display["ST7789 hardware panel"]
-  ESP --> Web["ESP Web console"]
-  ESP --> Audio["I2S / ASRPRO done reminder"]
+  ESP -. "optional local console" .-> Web["ESP Web console"]
+  ESP --> Audio["I2S done reminder"]
 ```
 
 ## 目录
@@ -259,9 +263,11 @@ https://chatgpt.com/backend-api/wham/usage
 ```text
 主控：ESP32-S3-N16R8
 屏幕：1.54 寸 ST7789 SPI，240x240
-音频：MAX98357A I2S，或 ASRPRO UART 触发
+音频：MAX98357A I2S 本地提示音
 数据源：GET http://<PC-LAN-IP>:8787/state
 ```
+
+固件不再包含外部 UART 语音模块工程、任务完成 UART 触发或 UART 语音命令入口。
 
 构建和烧录：
 
@@ -295,6 +301,10 @@ ORNAMENT_POLL_INTERVAL_MS
 ORNAMENT_DONE_FLASH_MS
 ORNAMENT_STANDBY_CLOCK_MS
 ORNAMENT_AUDIO_VOLUME_PERCENT
+ORNAMENT_XIAOZHI_TRANSPORT_BRIDGE
+ORNAMENT_ST77916_DISPLAY_ENABLED
+ORNAMENT_LCD_BOOT_TEST_MS
+ORNAMENT_LCD_REFERENCE_TEST_ONLY
 ```
 
 默认屏幕接线：
@@ -340,7 +350,9 @@ firmware/esp32-ornament/main/standby_wallpaper.h
 
 ## ESP Web 控制台
 
-连接 Wi-Fi 后，控制台地址形如：
+默认 bridge-first 固件关闭板端 Web 控制台。需要本地调试时，在 `menuconfig` 中开启
+`CONFIG_ORNAMENT_WEB_CONSOLE_ENABLED`，如需 `.local` 访问再开启 `CONFIG_ORNAMENT_MDNS_ENABLED`。
+开启后控制台地址形如：
 
 ```text
 http://codex-ornament-4ad4.local/
@@ -380,16 +392,17 @@ GET /status
 
 ## 手机热点配网
 
-固件支持手机手动配网，不需要先把 Wi-Fi 写死在固件里。
+默认 bridge-first 固件关闭 SoftAP 配网页。需要手机手动配网时，在 `menuconfig` 中开启
+`CONFIG_ORNAMENT_CONFIG_PORTAL_ENABLED`；否则请通过 `menuconfig`、NVS 或已有配置提供 Wi-Fi 和 Bridge URL。
 
-启动逻辑：
+启用配网页后的启动逻辑：
 
 1. ESP32 从 NVS 读取已保存的 Wi-Fi 和 bridge URL。
 2. 如果没有保存 Wi-Fi，启动配网热点。
 3. 如果保存的 Wi-Fi 连接失败，也会启动配网热点。
 4. 手机提交配置后，ESP32 保存到 NVS 并自动重启。
 
-默认配网热点：
+启用配网页后的默认热点：
 
 ```text
 SSID：Codex-Ornament-xxxx

@@ -23,6 +23,26 @@ static void set_text(char *dst, size_t dst_size, const char *src)
     snprintf(dst, dst_size, "%s", src);
 }
 
+typedef struct {
+    const char *last_stt;
+    const char *last_tts;
+} preview_xiaozhi_context_t;
+
+static preview_xiaozhi_context_t preview_xiaozhi_context(void)
+{
+    preview_xiaozhi_context_t context = {
+        .last_stt = getenv("ORNAMENT_PREVIEW_XIAOZHI_STT"),
+        .last_tts = getenv("ORNAMENT_PREVIEW_XIAOZHI_TTS"),
+    };
+    if (context.last_stt == NULL) {
+        context.last_stt = "";
+    }
+    if (context.last_tts == NULL) {
+        context.last_tts = "";
+    }
+    return context;
+}
+
 static uint8_t expand_5_to_8(uint16_t value)
 {
     return (uint8_t)((value << 3) | (value >> 2));
@@ -368,6 +388,7 @@ int main(int argc, char **argv)
     if (render_music(output_dir, &normal) != 0) {
         return 1;
     }
+    const preview_xiaozhi_context_t xiaozhi_context = preview_xiaozhi_context();
     if (render_xiaozhi(
             output_dir,
             &normal,
@@ -387,7 +408,7 @@ int main(int argc, char **argv)
             XIAOZHI_CLIENT_STATE_LISTENING,
             true,
             true,
-            "\xE6\x98\x8E\xE5\xA4\xA9\xE5\xA4\xA9\xE6\xB0\x94\xE6\x80\x8E\xE4\xB9\x88\xE6\xA0\xB7\xEF\xBC\x9F",
+            xiaozhi_context.last_stt,
             "",
             "") != 0) {
         return 1;
@@ -399,8 +420,8 @@ int main(int argc, char **argv)
             XIAOZHI_CLIENT_STATE_SPEAKING,
             true,
             true,
-            "\xE6\x98\x8E\xE5\xA4\xA9\xE5\xA4\xA9\xE6\xB0\x94\xE6\x80\x8E\xE4\xB9\x88\xE6\xA0\xB7\xEF\xBC\x9F",
-            "\xE6\x98\x8E\xE5\xA4\xA9\xE5\xA4\x9A\xE4\xBA\x91\xE6\x9C\x89\xE5\xB0\x8F\xE9\x9B\xA8",
+            xiaozhi_context.last_stt,
+            xiaozhi_context.last_tts,
             "") != 0) {
         return 1;
     }
@@ -435,8 +456,8 @@ int main(int argc, char **argv)
             XIAOZHI_CLIENT_STATE_IDLE,
             true,
             true,
-            "\xE6\x98\x8E\xE5\xA4\xA9\xE5\xA4\xA9\xE6\xB0\x94\xE6\x80\x8E\xE4\xB9\x88\xE6\xA0\xB7\xEF\xBC\x9F",
-            "\xE5\xAF\xB9\xE8\xAF\x9D\xE5\xB7\xB2\xE5\xAE\x8C\xE6\x88\x90",
+            xiaozhi_context.last_stt,
+            xiaozhi_context.last_tts,
             "") != 0) {
         return 1;
     }

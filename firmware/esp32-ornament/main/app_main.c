@@ -1,4 +1,3 @@
-#include "asrpro_link.h"
 #include "bridge_client.h"
 #include "config_portal.h"
 #include "display.h"
@@ -105,10 +104,7 @@ typedef enum {
 typedef struct {
     voice_view_t view;
     TickType_t hold_until_tick;
-    TickType_t refresh_requested_tick;
-    TickType_t bridge_match_requested_tick;
     bool manual_view;
-    bool quiet_mode;
     char last_command[VOICE_STATUS_TEXT_MAX];
     char last_result[VOICE_STATUS_TEXT_MAX];
 } voice_control_state_t;
@@ -129,7 +125,6 @@ static SemaphoreHandle_t shared_state_mutex;
 static ornament_shared_state_t shared_state;
 static SemaphoreHandle_t voice_control_mutex;
 static voice_control_state_t voice_control;
-static QueueHandle_t voice_command_queue;
 static QueueHandle_t xiaozhi_session_queue;
 static music_player_snapshot_t ui_music_snapshot;
 
@@ -764,98 +759,6 @@ static void voice_control_cycle_page(TickType_t now)
     }
 }
 
-static void voice_control_set_result(const char *result)
-{
-    if (voice_control_mutex == NULL || result == NULL) {
-        return;
-    }
-    if (xSemaphoreTake(voice_control_mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
-        return;
-    }
-    strlcpy(voice_control.last_result, result, sizeof(voice_control.last_result));
-    xSemaphoreGive(voice_control_mutex);
-}
-
-static void voice_control_request_refresh(TickType_t now)
-{
-    if (voice_control_mutex == NULL) {
-        return;
-    }
-    if (xSemaphoreTake(voice_control_mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
-        return;
-    }
-    voice_control.refresh_requested_tick = now;
-    xSemaphoreGive(voice_control_mutex);
-}
-
-static void voice_control_request_bridge_match(TickType_t now)
-{
-    if (voice_control_mutex == NULL) {
-        return;
-    }
-    if (xSemaphoreTake(voice_control_mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
-        return;
-    }
-    voice_control.bridge_match_requested_tick = now;
-    xSemaphoreGive(voice_control_mutex);
-}
-
-static bool voice_control_take_refresh(TickType_t *request_tick)
-{
-    if (voice_control_mutex == NULL || request_tick == NULL) {
-        return false;
-    }
-    if (xSemaphoreTake(voice_control_mutex, pdMS_TO_TICKS(20)) != pdTRUE) {
-        return false;
-    }
-    bool requested = voice_control.refresh_requested_tick != 0;
-    *request_tick = voice_control.refresh_requested_tick;
-    voice_control.refresh_requested_tick = 0;
-    xSemaphoreGive(voice_control_mutex);
-    return requested;
-}
-
-static bool voice_control_take_bridge_match(TickType_t *request_tick)
-{
-    if (voice_control_mutex == NULL || request_tick == NULL) {
-        return false;
-    }
-    if (xSemaphoreTake(voice_control_mutex, pdMS_TO_TICKS(20)) != pdTRUE) {
-        return false;
-    }
-    bool requested = voice_control.bridge_match_requested_tick != 0;
-    *request_tick = voice_control.bridge_match_requested_tick;
-    voice_control.bridge_match_requested_tick = 0;
-    xSemaphoreGive(voice_control_mutex);
-    return requested;
-}
-
-static bool voice_control_quiet_mode(void)
-{
-    if (voice_control_mutex == NULL) {
-        return false;
-    }
-    if (xSemaphoreTake(voice_control_mutex, pdMS_TO_TICKS(20)) != pdTRUE) {
-        return false;
-    }
-    bool quiet = voice_control.quiet_mode;
-    xSemaphoreGive(voice_control_mutex);
-    return quiet;
-}
-
-static void voice_control_set_quiet(bool enabled)
-{
-    if (voice_control_mutex == NULL) {
-        return;
-    }
-    if (xSemaphoreTake(voice_control_mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
-        return;
-    }
-    voice_control.quiet_mode = enabled;
-    strlcpy(voice_control.last_result, enabled ? "QUIET ON" : "QUIET OFF", sizeof(voice_control.last_result));
-    xSemaphoreGive(voice_control_mutex);
-}
-
 static bool xiaozhi_text_changed(const char *current, const char *previous)
 {
     const char *current_text = current != NULL ? current : "";
@@ -1075,117 +978,6 @@ static bool auto_match_bridge(bool verify_current, const char *reason)
     return false;
 }
 
-static void asrpro_voice_command_received(asrpro_voice_command_t command, void *context)
-{
-    (void)context;
-    if (voice_command_queue == NULL) {
-        ESP_LOGW(TAG, "voice command dropped before queue ready: %s", asrpro_voice_command_name(command));
-        return;
-    }
-    if (xQueueSend(voice_command_queue, &command, 0) != pdTRUE) {
-        asrpro_voice_command_t dropped;
-        if (xQueueReceive(voice_command_queue, &dropped, 0) == pdTRUE) {
-            ESP_LOGW(
-                TAG,
-                "voice command queue full, dropped oldest: %s",
-                asrpro_voice_command_name(dropped));
-            (void)xQueueSend(voice_command_queue, &command, 0);
-        } else {
-            ESP_LOGW(TAG, "voice command dropped: %s", asrpro_voice_command_name(command));
-        }
-    }
-}
-
-static void handle_voice_command(asrpro_voice_command_t command)
-{
-    TickType_t now = xTaskGetTickCount();
-    voice_view_t active_view = VOICE_VIEW_AUTO;
-    bool manual_active = false;
-    bool manual_xiaozhi_page = voice_control_active_view(now, &active_view, &manual_active) &&
-                               manual_active &&
-                               active_view == VOICE_VIEW_XIAOZHI;
-    ESP_LOGI(TAG, "handling voice command: %s", asrpro_voice_command_name(command));
-    switch (command) {
-    case ASRPRO_VOICE_COMMAND_STATUS:
-        if (manual_xiaozhi_page) {
-            (void)xiaozhi_stop_session_if_needed("voice status left Xiaozhi page");
-        }
-        voice_control_set_view(VOICE_VIEW_STATUS, now, "VOICE STATUS", "STATUS READY");
-        break;
-    case ASRPRO_VOICE_COMMAND_SHOW_QUOTA:
-        if (manual_xiaozhi_page) {
-            (void)xiaozhi_stop_session_if_needed("voice quota left Xiaozhi page");
-        }
-        voice_control_set_view(VOICE_VIEW_QUOTA, now, "SHOW QUOTA", "QUOTA PAGE");
-        break;
-    case ASRPRO_VOICE_COMMAND_SHOW_TASKS:
-        if (manual_xiaozhi_page) {
-            (void)xiaozhi_stop_session_if_needed("voice tasks left Xiaozhi page");
-        }
-        voice_control_set_view(VOICE_VIEW_TASKS, now, "SHOW TASKS", "TASK PAGE");
-        break;
-    case ASRPRO_VOICE_COMMAND_SHOW_CLOCK:
-        if (manual_xiaozhi_page) {
-            (void)xiaozhi_stop_session_if_needed("voice clock left Xiaozhi page");
-        }
-        voice_control_set_view(VOICE_VIEW_CLOCK, now, "SHOW CLOCK", "CLOCK PAGE");
-        break;
-    case ASRPRO_VOICE_COMMAND_REFRESH_STATE:
-        if (manual_xiaozhi_page) {
-            (void)xiaozhi_stop_session_if_needed("voice refresh left Xiaozhi page");
-        }
-        voice_control_request_refresh(now);
-        voice_control_set_view(VOICE_VIEW_STATUS, now, "REFRESH STATE", "REFRESHING");
-        break;
-    case ASRPRO_VOICE_COMMAND_BRIDGE_MATCH:
-        if (manual_xiaozhi_page) {
-            (void)xiaozhi_stop_session_if_needed("voice bridge match left Xiaozhi page");
-        }
-        voice_control_request_bridge_match(now);
-        voice_control_set_view(VOICE_VIEW_STATUS, now, "BRIDGE MATCH", "MATCHING");
-        break;
-    case ASRPRO_VOICE_COMMAND_QUIET_ON:
-        if (manual_xiaozhi_page) {
-            (void)xiaozhi_stop_session_if_needed("voice quiet on left Xiaozhi page");
-        }
-        voice_control_set_quiet(true);
-        voice_control_set_view(VOICE_VIEW_STATUS, now, "QUIET ON", "QUIET ON");
-        break;
-    case ASRPRO_VOICE_COMMAND_QUIET_OFF:
-        if (manual_xiaozhi_page) {
-            (void)xiaozhi_stop_session_if_needed("voice quiet off left Xiaozhi page");
-        }
-        voice_control_set_quiet(false);
-        voice_control_set_view(VOICE_VIEW_STATUS, now, "QUIET OFF", "QUIET OFF");
-        break;
-    case ASRPRO_VOICE_COMMAND_XIAOZHI_START: {
-        esp_err_t err = xiaozhi_start_session_after_music_stop("voice Xiaozhi start");
-        voice_control_set_view(
-            VOICE_VIEW_STATUS,
-            now,
-            "XIAOZHI START",
-            err == ESP_OK ? "AI LISTEN" : esp_err_to_name(err));
-        break;
-    }
-    case ASRPRO_VOICE_COMMAND_XIAOZHI_STOP: {
-        esp_err_t err = xiaozhi_client_stop_session();
-        voice_control_set_view(
-            VOICE_VIEW_STATUS,
-            now,
-            "XIAOZHI STOP",
-            err == ESP_OK ? "AI STOP" : esp_err_to_name(err));
-        break;
-    }
-    case ASRPRO_VOICE_COMMAND_UNKNOWN:
-    default:
-        if (manual_xiaozhi_page) {
-            (void)xiaozhi_stop_session_if_needed("unknown voice command left Xiaozhi page");
-        }
-        voice_control_set_view(VOICE_VIEW_STATUS, now, "UNKNOWN", "UNKNOWN CMD");
-        break;
-    }
-}
-
 static bool voice_manual_xiaozhi_page_active(const voice_control_state_t *voice_state, TickType_t now)
 {
     return voice_state != NULL &&
@@ -1357,17 +1149,6 @@ static void xiaozhi_session_task(void *arg)
     }
 }
 
-static void voice_command_task(void *arg)
-{
-    (void)arg;
-    asrpro_voice_command_t command;
-    while (true) {
-        if (xQueueReceive(voice_command_queue, &command, portMAX_DELAY) == pdTRUE) {
-            handle_voice_command(command);
-        }
-    }
-}
-
 static void create_app_task(
     TaskFunction_t task_fn,
     const char *name,
@@ -1423,23 +1204,6 @@ static void poll_task(void *arg)
 
     while (true) {
         TickType_t now = xTaskGetTickCount();
-        TickType_t request_tick = 0;
-
-        if (voice_control_take_bridge_match(&request_tick)) {
-            (void)request_tick;
-            voice_control_set_result("MATCHING");
-            if (auto_match_bridge(true, "voice command")) {
-                voice_control_set_result("BRIDGE MATCHED");
-                next_bridge_poll = now;
-            } else {
-                voice_control_set_result("MATCH FAILED");
-            }
-        }
-
-        bool refresh_requested = voice_control_take_refresh(&request_tick);
-        if (refresh_requested) {
-            voice_control_set_result("REFRESHING");
-        }
 
         if (!quota_refresh_pending && quota_reset_refresh_needed(&fetched_state)) {
             quota_refresh_pending = true;
@@ -1447,7 +1211,7 @@ static void poll_task(void *arg)
         }
 
         bool recovery_due = next_bridge_recovery != 0 && now >= next_bridge_recovery;
-        if (refresh_requested || recovery_due || now >= next_bridge_poll) {
+        if (recovery_due || now >= next_bridge_poll) {
             bool was_refresh_pending = quota_refresh_pending;
             bool retrying_bridge = single_retry_pending;
             bool recovering_bridge = recovery_due;
@@ -1484,9 +1248,6 @@ static void poll_task(void *arg)
                 consecutive_fetch_failures = 0;
                 debug.consecutive_fetch_failures = 0;
                 debug.last_success_ms = ticks_to_ms(now);
-                if (refresh_requested) {
-                    voice_control_set_result("REFRESH OK");
-                }
                 if (fetched_state.done_seq < last_done_seq) {
                     last_done_seq = fetched_state.done_seq;
                 }
@@ -1497,10 +1258,7 @@ static void poll_task(void *arg)
                         previous_active_task_count)) {
                     last_done_tick = now;
                     have_last_done_tick = true;
-                    if (!voice_control_quiet_mode()) {
-                        asrpro_link_notify_done();
-                        task_audio_play_done();
-                    }
+                    task_audio_play_done();
                 }
                 if (fetched_state.done_seq > last_done_seq) {
                     last_done_seq = fetched_state.done_seq;
@@ -1514,9 +1272,6 @@ static void poll_task(void *arg)
                 consecutive_fetch_failures++;
                 debug.consecutive_fetch_failures = consecutive_fetch_failures;
                 debug.last_failure_ms = ticks_to_ms(now);
-                if (refresh_requested) {
-                    voice_control_set_result("REFRESH FAIL");
-                }
                 ESP_LOGW(
                     TAG,
                     "failed to fetch bridge state (%d/%d): %s",
@@ -1686,15 +1441,9 @@ void app_main(void)
     display_render_status("Wi-Fi connected");
     log_heap_status("after_wifi");
     voice_control_init();
-    voice_command_queue = xQueueCreate(4, sizeof(asrpro_voice_command_t));
-    ESP_ERROR_CHECK(voice_command_queue == NULL ? ESP_ERR_NO_MEM : ESP_OK);
     xiaozhi_session_queue = xQueueCreate(4, sizeof(xiaozhi_session_request_t));
     ESP_ERROR_CHECK(xiaozhi_session_queue == NULL ? ESP_ERR_NO_MEM : ESP_OK);
 
-    esp_err_t asrpro_err = asrpro_link_init(asrpro_voice_command_received, NULL);
-    if (asrpro_err != ESP_OK) {
-        ESP_LOGW(TAG, "ASRPRO UART link unavailable: %s", esp_err_to_name(asrpro_err));
-    }
     esp_err_t xiaozhi_err = xiaozhi_client_init();
     if (xiaozhi_err != ESP_OK) {
         ESP_LOGW(TAG, "Xiaozhi client unavailable: %s", esp_err_to_name(xiaozhi_err));
@@ -1716,7 +1465,6 @@ void app_main(void)
     shared_state.fetch_error = ESP_ERR_INVALID_STATE;
     shared_state.have_state = true;
 
-    create_app_task(voice_command_task, "voice_cmd", 4096, 5);
     create_app_task(xiaozhi_session_task, "xiaozhi_ctl", 8192, 5);
 #if CONFIG_ORNAMENT_PAGE_BUTTON_ENABLED
     create_app_task(page_button_task, "page_button", 3072, 5);

@@ -899,144 +899,6 @@ static void draw_ascii_text_wrapped_xy(
     }
 }
 
-typedef struct {
-    uint32_t codepoint;
-    uint16_t rows[16];
-} hud_cn_glyph_t;
-
-static const hud_cn_glyph_t HUD_CN_GLYPHS[] = {
-    {0x660E, {0x7CFE, 0x64C6, 0x6486, 0x6486, 0x64FE, 0x7C86, 0x6486, 0x6486, 0x64FE, 0x6586, 0x7D86, 0x6106, 0x0306, 0x063E, 0x0408, 0x0000}},
-    {0x5929, {0x0000, 0x7FFE, 0x0180, 0x0180, 0x0180, 0x0180, 0xFFFF, 0x0180, 0x03C0, 0x03C0, 0x0660, 0x0C30, 0x1818, 0x700E, 0xE006, 0x0000}},
-    {0x6C14, {0x0000, 0x1800, 0x1FFE, 0x3000, 0x2000, 0x7FFC, 0x4000, 0xC000, 0xBFF8, 0x0018, 0x0008, 0x000B, 0x000F, 0x000F, 0x0006, 0x0000}},
-    {0x600E, {0x0800, 0x1800, 0x3FFE, 0x3600, 0x67FC, 0xC600, 0x0600, 0x07FC, 0x0600, 0x2184, 0x6C9E, 0x4C16, 0xCC33, 0x0FF0, 0x0000, 0x0000}},
-    {0x4E48, {0x0100, 0x0300, 0x0300, 0x0630, 0x0C70, 0x1860, 0x30C0, 0x6180, 0xC190, 0x0318, 0x0618, 0x0C0C, 0x181C, 0x3FFE, 0x3002, 0x0002}},
-    {0x6837, {0x118C, 0x118C, 0x10D8, 0xFFFE, 0x3020, 0x3020, 0x3BFE, 0x7C20, 0x5420, 0xD020, 0x97FF, 0x1020, 0x1020, 0x1020, 0x1020, 0x0000}},
-    {0xFF1F, {0x0000, 0x0000, 0x3C00, 0x7E00, 0x0300, 0x0300, 0x0600, 0x0E00, 0x1C00, 0x1800, 0x1800, 0x0000, 0x1800, 0x1800, 0x0000, 0x0000}},
-    {0x591A, {0x0300, 0x0600, 0x0FFC, 0x181C, 0x3430, 0x67E0, 0x0780, 0x3CC0, 0x71FE, 0x070E, 0x1D1C, 0x31F0, 0x01C0, 0x1F00, 0x7800, 0x0000}},
-    {0x4E91, {0x3FFC, 0x0000, 0x0000, 0x0000, 0x0000, 0xFFFF, 0x0700, 0x0600, 0x0C20, 0x0C30, 0x1818, 0x3018, 0x7FFC, 0x2006, 0x0006, 0x0000}},
-    {0xFF0C, {0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x1800, 0x1800, 0x1000, 0x3000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000}},
-    {0x6709, {0x0200, 0x0600, 0xFFFF, 0x0C00, 0x0C00, 0x1FFC, 0x380C, 0x7FFC, 0xD80C, 0x180C, 0x1FFC, 0x180C, 0x180C, 0x187C, 0x0000, 0x0000}},
-    {0x5C0F, {0x0180, 0x0180, 0x0180, 0x0180, 0x1990, 0x1998, 0x1188, 0x318C, 0x3186, 0x6186, 0x6183, 0xC183, 0x0180, 0x0180, 0x0F80, 0x0600}},
-    {0x96E8, {0x0000, 0xFFFF, 0x0180, 0x0180, 0x7FFE, 0x6186, 0x79E6, 0x6DB6, 0x679E, 0x79E6, 0x6DB6, 0x659E, 0x6186, 0x61BE, 0x0000, 0x0000}},
-    {0x3002, {0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x3000, 0x7800, 0x7800, 0x7800, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000}},
-    {0x5BF9, {0x000C, 0x000C, 0xFE0C, 0x060C, 0x47FF, 0x640C, 0x348C, 0x1CCC, 0x186C, 0x1C6C, 0x3E0C, 0x360C, 0x620C, 0xC07C, 0x0020, 0x0000}},
-    {0x8BDD, {0x607E, 0x77F8, 0x1060, 0x0060, 0x0FFF, 0xF060, 0x3060, 0x33FE, 0x3306, 0x3206, 0x3206, 0x3206, 0x3E06, 0x3BFE, 0x3306, 0x0000}},
-    {0x5DF2, {0x0000, 0x7FFC, 0x000C, 0x000C, 0x200C, 0x200C, 0x3FFC, 0x200C, 0x2000, 0x2003, 0x2003, 0x2003, 0x3006, 0x3FFE, 0x0000, 0x0000}},
-    {0x5B8C, {0x0100, 0x0180, 0x7FFE, 0x4002, 0x0000, 0x3FFC, 0x0000, 0x0000, 0x7FFF, 0x0460, 0x0460, 0x0C63, 0x1863, 0x307E, 0xE000, 0x0000}},
-    {0x6210, {0x0058, 0x004C, 0x0040, 0x3FFF, 0x2060, 0x2060, 0x3F66, 0x236C, 0x236C, 0x6378, 0x6333, 0x7E73, 0xC0FF, 0x818E, 0x0000, 0x0000}},
-};
-
-static uint32_t utf8_next_basic(const char *text, uint32_t *offset)
-{
-    const unsigned char *bytes = (const unsigned char *)text;
-    unsigned char ch = bytes[*offset];
-    if (ch == '\0') {
-        return 0;
-    }
-    if (ch < 0x80) {
-        (*offset)++;
-        return ch;
-    }
-    if ((ch & 0xE0) == 0xC0 && bytes[*offset + 1] != '\0') {
-        uint32_t cp = ((uint32_t)(ch & 0x1F) << 6) | (uint32_t)(bytes[*offset + 1] & 0x3F);
-        *offset += 2;
-        return cp;
-    }
-    if ((ch & 0xF0) == 0xE0 && bytes[*offset + 1] != '\0' && bytes[*offset + 2] != '\0') {
-        uint32_t cp =
-            ((uint32_t)(ch & 0x0F) << 12) |
-            ((uint32_t)(bytes[*offset + 1] & 0x3F) << 6) |
-            (uint32_t)(bytes[*offset + 2] & 0x3F);
-        *offset += 3;
-        return cp;
-    }
-    (*offset)++;
-    return 0;
-}
-
-static const hud_cn_glyph_t *hud_cn_glyph(uint32_t codepoint)
-{
-    for (size_t i = 0; i < sizeof(HUD_CN_GLYPHS) / sizeof(HUD_CN_GLYPHS[0]); i++) {
-        if (HUD_CN_GLYPHS[i].codepoint == codepoint) {
-            return &HUD_CN_GLYPHS[i];
-        }
-    }
-    return NULL;
-}
-
-static bool draw_hud_builtin_cn_wrapped_text(
-    int x,
-    int y,
-    const char *text,
-    uint16_t color,
-    int max_width,
-    int max_lines)
-{
-    if (text == NULL || text[0] == '\0' || max_lines <= 0) {
-        return false;
-    }
-
-    uint32_t validate_offset = 0;
-    while (text[validate_offset] != '\0') {
-        uint32_t codepoint = utf8_next_basic(text, &validate_offset);
-        if (codepoint == '\r' || codepoint == '\n' || codepoint == ' ') {
-            continue;
-        }
-        if (hud_cn_glyph(codepoint) == NULL) {
-            return false;
-        }
-    }
-
-    const int scale = 1;
-    const int glyph_w = 16 * scale;
-    const int line_h = 18 * scale;
-    int cursor_x = x;
-    int cursor_y = y;
-    int line_no = 0;
-    uint32_t offset = 0;
-    while (text[offset] != '\0' && line_no < max_lines) {
-        uint32_t codepoint = utf8_next_basic(text, &offset);
-        if (codepoint == '\r' || codepoint == '\n') {
-            cursor_x = x;
-            cursor_y += line_h;
-            line_no++;
-            continue;
-        }
-        if (codepoint == ' ') {
-            if (cursor_x + glyph_w > x + max_width) {
-                cursor_x = x;
-                cursor_y += line_h;
-                line_no++;
-            } else {
-                cursor_x += glyph_w / 2;
-            }
-            continue;
-        }
-        const hud_cn_glyph_t *glyph = hud_cn_glyph(codepoint);
-        if (glyph == NULL) {
-            return false;
-        }
-        if (cursor_x > x && max_width > 0 && cursor_x + glyph_w > x + max_width) {
-            cursor_x = x;
-            cursor_y += line_h;
-            line_no++;
-            if (line_no >= max_lines) {
-                break;
-            }
-        }
-        for (int row = 0; row < 16; row++) {
-            uint16_t bits = glyph->rows[row];
-            for (int col = 0; col < 16; col++) {
-                if ((bits & (uint16_t)(1U << (15 - col))) != 0) {
-                    draw_pixel(cursor_x + col * scale, cursor_y + row * scale, color);
-                }
-            }
-        }
-        cursor_x += glyph_w;
-    }
-    return true;
-}
-
 static void draw_hud_wrapped_text(
     int x,
     int y,
@@ -1048,19 +910,26 @@ static void draw_hud_wrapped_text(
     int x_scale,
     int y_scale)
 {
+    const char *render_text;
+#if CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
+    render_text = text != NULL && text[0] != '\0' ? text : fallback;
+#else
+    render_text = fallback != NULL ? fallback : text;
+#endif
+    if (render_text == NULL || render_text[0] == '\0') {
+        return;
+    }
+
 #if CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
     (void)fallback;
     (void)x_scale;
     (void)y_scale;
-    draw_utf8_text_wrapped(x, y, &font_puhui_16_4, text, color, max_width, max_lines);
+    draw_utf8_text_wrapped(x, y, &font_puhui_16_4, render_text, color, max_width, max_lines);
 #else
-    if (draw_hud_builtin_cn_wrapped_text(x, y, text, color, max_width, max_lines)) {
-        return;
-    }
     draw_ascii_text_wrapped_xy(
         x,
         y,
-        fallback != NULL && fallback[0] != '\0' ? fallback : text,
+        render_text,
         color,
         max_width,
         max_lines,
@@ -1782,14 +1651,29 @@ static void draw_hud_panel_marks(int x, int y, int w, int h, uint16_t color)
 
 static const char *xiaozhi_hud_main_ascii(xiaozhi_client_state_t state);
 
-static const char *xiaozhi_hud_default_user_text(void)
+static const char *xiaozhi_hud_user_hint(const xiaozhi_client_snapshot_t *snapshot)
 {
-    return "\xE6\x98\x8E\xE5\xA4\xA9\xE5\xA4\xA9\xE6\xB0\x94\xE6\x80\x8E\xE4\xB9\x88\xE6\xA0\xB7\xEF\xBC\x9F";
-}
-
-static const char *xiaozhi_hud_default_assistant_text(void)
-{
-    return "\xE6\x98\x8E\xE5\xA4\xA9\xE5\xA4\x9A\xE4\xBA\x91\xE6\x9C\x89\xE5\xB0\x8F\xE9\x9B\xA8";
+    if (snapshot == NULL) {
+        return "";
+    }
+    if (snapshot->activation_pending) {
+        return snapshot->activation_code[0] != '\0' ? snapshot->activation_code : "";
+    }
+    if (snapshot->last_stt[0] != '\0') {
+        return snapshot->last_stt;
+    }
+    switch (snapshot->state) {
+    case XIAOZHI_CLIENT_STATE_ERROR:
+    case XIAOZHI_CLIENT_STATE_CONFIG_MISSING:
+        return snapshot->last_error[0] != '\0' ? snapshot->last_error : "";
+    case XIAOZHI_CLIENT_STATE_LISTENING:
+    case XIAOZHI_CLIENT_STATE_SPEAKING:
+    case XIAOZHI_CLIENT_STATE_CONNECTING:
+    case XIAOZHI_CLIENT_STATE_IDLE:
+    case XIAOZHI_CLIENT_STATE_DISABLED:
+    default:
+        return "";
+    }
 }
 
 static const char *xiaozhi_hud_main_text(xiaozhi_client_state_t state)
@@ -1837,78 +1721,52 @@ static const char *xiaozhi_hud_main_ascii(xiaozhi_client_state_t state)
 static const char *xiaozhi_hud_assistant_hint(const xiaozhi_client_snapshot_t *snapshot, const char *tts_text)
 {
     if (snapshot == NULL) {
-        return xiaozhi_hud_default_assistant_text();
+        return "";
     }
     if (snapshot->activation_pending) {
         return snapshot->activation_code[0] != '\0' ? snapshot->activation_code :
-#if CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
-            "\xE8\xAF\xB7\xE5\x85\x88\xE7\xBB\x91\xE5\xAE\x9A\xE8\xAE\xBE\xE5\xA4\x87";
-#else
-            "BIND PENDING";
-#endif
+            (snapshot->activation_message[0] != '\0' ? snapshot->activation_message : "");
     }
     if (snapshot->last_tts[0] != '\0') {
         return tts_text;
     }
     switch (snapshot->state) {
-    case XIAOZHI_CLIENT_STATE_LISTENING:
-#if CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
-        return "\xE6\xAD\xA3\xE5\x9C\xA8\xE6\x8E\xA5\xE6\x94\xB6\xE8\xAF\xAD\xE9\x9F\xB3\x2E\x2E\x2E";
-#else
-        return "RECEIVING VOICE";
-#endif
-    case XIAOZHI_CLIENT_STATE_SPEAKING:
-#if CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
-        return "\xE6\xAD\xA3\xE5\x9C\xA8\xE6\x92\xAD\xE6\x94\xBE\xE5\x9B\x9E\xE5\xA4\x8D";
-#else
-        return "PLAYING REPLY";
-#endif
-    case XIAOZHI_CLIENT_STATE_CONNECTING:
-#if CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
-        return "\xE7\xBD\x91\xE7\xBB\x9C\xE8\xBF\x9E\xE6\x8E\xA5\xE4\xB8\xAD";
-#else
-        return "WAITING CONNECTION";
-#endif
     case XIAOZHI_CLIENT_STATE_ERROR:
     case XIAOZHI_CLIENT_STATE_CONFIG_MISSING:
-        return snapshot->last_error[0] != '\0' ? snapshot->last_error :
-#if CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
-            "\xE9\x85\x8D\xE7\xBD\xAE\xE5\xBC\x82\xE5\xB8\xB8";
-#else
-            "CHECK CONFIG";
-#endif
+        return snapshot->last_error[0] != '\0' ? snapshot->last_error : "";
+    case XIAOZHI_CLIENT_STATE_LISTENING:
+    case XIAOZHI_CLIENT_STATE_SPEAKING:
+    case XIAOZHI_CLIENT_STATE_CONNECTING:
     case XIAOZHI_CLIENT_STATE_IDLE:
     case XIAOZHI_CLIENT_STATE_DISABLED:
     default:
-        return xiaozhi_hud_default_assistant_text();
+        return "";
     }
 }
 
 static const char *xiaozhi_hud_assistant_ascii(const xiaozhi_client_snapshot_t *snapshot, const char *tts_text)
 {
     if (snapshot == NULL) {
-        return "DUOYUN XIAOYU";
+        return "";
     }
     if (snapshot->activation_pending) {
-        return snapshot->activation_code[0] != '\0' ? snapshot->activation_code : "BIND PENDING";
+        return snapshot->activation_code[0] != '\0' ? snapshot->activation_code :
+            (snapshot->activation_message[0] != '\0' ? snapshot->activation_message : "");
     }
     if (snapshot->last_tts[0] != '\0') {
         return tts_text;
     }
     switch (snapshot->state) {
-    case XIAOZHI_CLIENT_STATE_LISTENING:
-        return "RECEIVING VOICE";
-    case XIAOZHI_CLIENT_STATE_SPEAKING:
-        return "PLAYING REPLY";
-    case XIAOZHI_CLIENT_STATE_CONNECTING:
-        return "WAITING CONNECTION";
     case XIAOZHI_CLIENT_STATE_ERROR:
     case XIAOZHI_CLIENT_STATE_CONFIG_MISSING:
-        return snapshot->last_error[0] != '\0' ? snapshot->last_error : "CHECK CONFIG";
+        return snapshot->last_error[0] != '\0' ? snapshot->last_error : "";
+    case XIAOZHI_CLIENT_STATE_LISTENING:
+    case XIAOZHI_CLIENT_STATE_SPEAKING:
+    case XIAOZHI_CLIENT_STATE_CONNECTING:
     case XIAOZHI_CLIENT_STATE_IDLE:
     case XIAOZHI_CLIENT_STATE_DISABLED:
     default:
-        return "DUOYUN XIAOYU";
+        return "";
     }
 }
 
@@ -2589,21 +2447,24 @@ void display_core_render_xiaozhi(
 
     char stt_preview[96];
     char assistant_preview[96];
-    const char *stt_text = snapshot->last_stt[0] != '\0' ? snapshot->last_stt :
-        (snapshot->activation_pending ? "BIND PENDING" :
-            xiaozhi_hud_default_user_text()
-        );
+    const char *stt_text = xiaozhi_hud_user_hint(snapshot);
     const char *tts_text = snapshot->last_tts[0] != '\0' ? snapshot->last_tts :
         (snapshot->activation_pending ?
             (snapshot->activation_code[0] != '\0' ? snapshot->activation_code : "BIND DEVICE") :
-            xiaozhi_hud_default_assistant_text());
+            "");
     const bool completed = snapshot->state == XIAOZHI_CLIENT_STATE_IDLE && snapshot->last_tts[0] != '\0';
     const char *main_text = completed ? xiaozhi_hud_done_text() : xiaozhi_hud_main_text(snapshot->state);
     const char *main_ascii = completed ? "DONE" : xiaozhi_hud_main_ascii(snapshot->state);
     const char *assistant_text = xiaozhi_hud_assistant_hint(snapshot, tts_text);
     const char *assistant_ascii = xiaozhi_hud_assistant_ascii(snapshot, tts_text);
-    ascii_preview(stt_text, "MINGTIAN TIANQI?", stt_preview, sizeof(stt_preview));
-    ascii_preview(assistant_ascii, "DUOYUN XIAOYU", assistant_preview, sizeof(assistant_preview));
+    bool stt_ascii_available = ascii_preview(stt_text, "", stt_preview, sizeof(stt_preview));
+    bool assistant_ascii_available = ascii_preview(assistant_ascii, "", assistant_preview, sizeof(assistant_preview));
+    if (!stt_ascii_available) {
+        stt_preview[0] = '\0';
+    }
+    if (!assistant_ascii_available) {
+        assistant_preview[0] = '\0';
+    }
 
     uint16_t state_color = HUD_HUD_CYAN;
     switch (snapshot->state) {
@@ -2663,7 +2524,9 @@ void display_core_render_xiaozhi(
         2,
         text_scale,
         text_scale);
-    draw_text_xy(query_x + query_w - ss(30), query_y + query_h - ss(18), "...", text_scale, text_scale, HUD_HUD_CYAN);
+    if (stt_text[0] != '\0') {
+        draw_text_xy(query_x + query_w - ss(30), query_y + query_h - ss(18), "...", text_scale, text_scale, HUD_HUD_CYAN);
+    }
 
     draw_hud_segmented_ring(ring_cx, ring_cy, ring_r, state_color);
     if (snapshot->state == XIAOZHI_CLIENT_STATE_LISTENING) {

@@ -12,10 +12,11 @@
 | 显示屏 | 1.54 inch ST7789 SPI, 240x240 |
 | 逻辑电平 | 3.3 V |
 | 数据源 | `http://<PC-LAN-IP>:8787/state` |
-| 配网方式 | ESP32 SoftAP + 手机浏览器 |
-| 小智 AI | 可选 WebSocket + Opus，默认不自动启动 |
+| 配网方式 | 默认关闭板端 SoftAP 配网页；需要时开启 `CONFIG_ORNAMENT_CONFIG_PORTAL_ENABLED` |
+| 小智 AI | 默认通过 PC bridge 代理，直连 WebSocket + Opus 仅作备用 |
 | 页面按键 | GPIO15 短按切换 `Standby -> Quota -> Xiaozhi` |
 | AI 启停按键 | GPIO16，仅在 Xiaozhi 页生效 |
+| 任务完成提示 | 边框闪烁；可选 MAX98357A I2S 本地 PCM 提示音 |
 
 默认引脚：
 
@@ -30,18 +31,22 @@
 
 ## 功能
 
-- 开机后连接已保存 Wi-Fi；没有配置时进入 SoftAP 配网。
+- 开机后连接已保存 Wi-Fi；默认 bridge-first 构建不启动 SoftAP 配网页，需要手机配网时开启 `CONFIG_ORNAMENT_CONFIG_PORTAL_ENABLED`。
 - 自动发现 PC 网桥，并保存可用的 `/state` URL。
 - 每 `CONFIG_ORNAMENT_POLL_INTERVAL_MS` 轮询一次网桥，默认 3000 ms。
 - 连续 `CONFIG_ORNAMENT_BRIDGE_OFFLINE_FAILURES` 次拉取失败后才显示 `Bridge offline`，默认 3 次。
 - 空闲 `CONFIG_ORNAMENT_STANDBY_CLOCK_MS` 后进入待机时钟页，默认 60000 ms。
 - GPIO15 页面按键可短按循环 `Standby` / `Quota` / `Xiaozhi` 三个手动页。
 - GPIO16 AI 按键仅在手动 Xiaozhi 页生效，用于启动或停止小智会话。
-- 网页 `Start AI` 会启动小智后台监听并立即切到 AI 页面；进入监听待机后，屏幕默认回到额度/待机页。
+- 开启本地 Web 控制台后，网页 `Start AI` 会启动小智后台监听并立即切到 AI 页面；进入监听待机后，屏幕默认回到额度/待机页。
 - 小智检测到唤醒词或新的对话活动后，屏幕会自动切回小智页面显示 STT/TTS。
-- 网页 `Stop AI` 会彻底关闭小智会话；关闭后仅喊唤醒词不会重新启动 AI。
+- 开启本地 Web 控制台后，网页 `Stop AI` 会彻底关闭小智会话；关闭后仅喊唤醒词不会重新启动 AI。
 - 任务完成后边框闪烁 `CONFIG_ORNAMENT_DONE_FLASH_MS`，默认 5000 ms。
-- 本地 Web 控制台提供状态查看、Bridge URL 测试、重启、清空配置和语音音量设置。
+- 小智页面显示 bridge/会话返回的实时 STT、TTS、激活码和错误状态，不再显示固定示例对话。
+- 默认 bridge-first 瘦身构建会关闭板端 Web 控制台、SoftAP 配网页和本地天气客户端；需要本地调试时可在 Kconfig 中重新开启。
+- 可选 `CONFIG_ORNAMENT_ST77916_DISPLAY_ENABLED` 支持 ST77916 SPI/QSPI 点屏诊断、启动色块测试和固定参考图，默认关闭。
+- 本地 Web 控制台开启后提供状态查看、Bridge URL 测试、重启、清空配置和语音音量设置。
+- 外部 UART 语音模块工程已移除；固件不会发送任务完成 UART 触发，也不会接收 UART 语音命令。
 
 ## 构建
 
@@ -59,12 +64,24 @@ idf.py build
 idf.py set-target esp32s3
 ```
 
+默认配置优先控制固件体积和内部 RAM 压力：`CONFIG_ORNAMENT_XIAOZHI_TRANSPORT_BRIDGE=y`，
+`CONFIG_ORNAMENT_WEB_CONSOLE_ENABLED=n`，`CONFIG_ORNAMENT_CONFIG_PORTAL_ENABLED=n`，
+`CONFIG_ORNAMENT_LOCAL_WEATHER_ENABLED=n`，`CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED=n`。
+如果启用直连小智、Web 控制台、LVGL 中文富显示或 ST77916 支持，请重新运行 `idf.py build` 和
+`idf.py size` 检查 app 分区、IRAM/DRAM 余量。
+
 ## 烧录
 
 把 `COMx` 换成设备管理器中的实际串口，例如 `COM5`：
 
 ```cmd
 idf.py -p COM5 flash
+```
+
+烧录后建议继续监视启动日志：
+
+```cmd
+idf.py -p COM5 monitor
 ```
 
 如需查看串口：
@@ -105,7 +122,8 @@ ESP32 访问的是 PC 的局域网 IP，不是 `127.0.0.1`。`/discover` 会返�
 
 ## 首次配网
 
-没有保存 Wi-Fi 时，ESP32 会启动配置热点：
+默认 bridge-first 固件关闭 SoftAP 配网页。需要首次手机配网时，先开启
+`CONFIG_ORNAMENT_CONFIG_PORTAL_ENABLED`；没有保存 Wi-Fi 时，ESP32 才会启动配置热点：
 
 ```text
 SSID: Codex-Ornament-xxxx
@@ -122,7 +140,9 @@ URL: http://192.168.4.1
 
 ## 本地 Web 控制台
 
-联网后可访问：
+默认 bridge-first 固件关闭本地 Web 控制台。需要本地调试时，开启
+`CONFIG_ORNAMENT_WEB_CONSOLE_ENABLED`；如需 `.local` 地址，再开启
+`CONFIG_ORNAMENT_MDNS_ENABLED`。联网后可访问：
 
 ```text
 http://codex-ornament-4ad4.local/
@@ -145,8 +165,8 @@ http://<ESP32-IP>/
 
 小智配置入口：
 
-- 首次配网页可填写 Xiaozhi WebSocket URL 和 token。
-- 联网后 Web 控制台的 `Xiaozhi AI` 区域可保存 URL/token、启动/停止会话、查看 STT/TTS 文本和上下行帧计数。
+- 默认通过 PC bridge 代理小智会话，ESP32 不需要保存 Xiaozhi WebSocket URL/token。
+- 启用直连小智和本地控制台后，首次配网页或 Web 控制台的 `Xiaozhi AI` 区域可保存 URL/token、启动/停止会话、查看 STT/TTS 文本和上下行帧计数。
 - `Start AI` 用于开启后台监听。启动瞬间屏幕会进入小智页；连接成功后如果没有人说话，屏幕会恢复为额度/待机页。
 - 保持 `Start AI` 开启时，官方小智后台的唤醒词 `你好小智` 仍然有效。识别到新的语音对话或 TTS 播放时，屏幕会自动切回小智页。
 - `Stop AI` 会终止当前小智会话并关闭唤醒监听。停止后就算喊 `你好小智`，设备也不会重新进入 AI。
