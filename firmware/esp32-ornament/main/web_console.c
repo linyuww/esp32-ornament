@@ -1058,11 +1058,11 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         html,
         html_size,
         &used,
-        "<section class=\"ops\"><form method=\"post\" action=\"/save-audio\"><label class=\"k\">Voice Volume</label>"
+        "<section class=\"ops\"><form method=\"post\" action=\"/save-audio\"><label class=\"k\">AI Assistant Volume</label>"
         "<input type=\"range\" name=\"audio_volume\" min=\"0\" max=\"100\" step=\"5\" value=\"%d\" oninput=\"audioVol.value=this.value\">"
         "<div class=\"v\"><output id=\"audioVol\">%d</output>%%</div>"
         "<div class=\"actions\"><button type=\"submit\">Save Volume</button>"
-        "<button class=\"warn\" type=\"submit\" formaction=\"/test-audio\">Test Voice</button>"
+        "<button class=\"warn\" type=\"submit\" formaction=\"/test-audio\">Test Volume</button>"
         "<button class=\"warn\" type=\"submit\" formaction=\"/test-mic\">Test Mic</button></div></form></section>",
         audio_volume_percent,
         audio_volume_percent);
@@ -1407,9 +1407,9 @@ static esp_err_t send_audio_saved_page(httpd_req_t *req, int volume_percent, boo
         sizeof(html),
         "<!doctype html><html><head><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
         "<style>body{font-family:system-ui;margin:24px;background:#0b1116;color:#edf7fb}a{color:#49d3c8}</style>"
-        "</head><body><h1>Voice Volume</h1><p>Volume: %d%%</p><p>%s</p><p><a href=\"/\">Back</a></p></body></html>",
+        "</head><body><h1>AI Assistant Volume</h1><p>Volume: %d%%</p><p>%s</p><p><a href=\"/\">Back</a></p></body></html>",
         volume_percent,
-        played ? "Test voice queued." : "Saved for the next voice reminder.");
+        played ? "Test audio queued with this volume." : "Saved and applied to AI assistant speech.");
 
     httpd_resp_set_type(req, "text/html; charset=utf-8");
     return httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);

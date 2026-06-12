@@ -530,7 +530,7 @@ static void bridge_audio_downlink_task(void *arg)
             continue;
         }
         if (!output_acquired) {
-            err = task_audio_output_acquire_with_volume(&settings);
+            err = task_audio_output_acquire_with_volume(NULL);
             if (err != ESP_OK) {
                 ESP_LOGW(TAG, "downlink output acquire failed: %s", esp_err_to_name(err));
                 mark_audio_error("speaker unavailable");

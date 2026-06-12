@@ -1,4 +1,4 @@
-set(ORNAMENT_SRCS
+﻿set(ORNAMENT_SRCS
   "app_main.c"
   "bridge_client.c"
   "device_identity.c"

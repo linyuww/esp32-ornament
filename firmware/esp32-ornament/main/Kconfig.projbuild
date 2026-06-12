@@ -275,7 +275,7 @@ config ORNAMENT_AUDIO_PIN_DIN
     depends on ORNAMENT_AUDIO_ENABLED
 
 config ORNAMENT_AUDIO_VOLUME_PERCENT
-    int "Task done voice volume percent"
+    int "Speaker output volume percent"
     default 70
     range 0 100
 
