@@ -1797,7 +1797,8 @@ static void draw_standby_text_masks(void)
 {
     const int margin = sx(18);
     const int width = active_canvas->width - margin * 2;
-    blend_rect(margin, sy(24), width, sy(332), HUD_BLACK, 108);
+    blend_rect(margin, sy(24), width, sy(128), HUD_BLACK, 108);
+    blend_rect(margin, sy(218), width, sy(138), HUD_BLACK, 108);
 }
 
 static void draw_standby_header(const char *time_text, const char *date_text, const char *reset_text)
