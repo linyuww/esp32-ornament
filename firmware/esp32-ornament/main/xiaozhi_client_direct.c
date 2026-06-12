@@ -499,7 +499,7 @@ static esp_err_t build_ota_request_body(
         "\"uuid\":\"%s\","
         "\"chip_model_name\":\"" CONFIG_IDF_TARGET "\","
         "\"chip_info\":{\"model\":9,\"cores\":2,\"revision\":0,\"features\":0},"
-        "\"application\":{\"name\":\"esp32-ornament\",\"version\":\"0.1.0\",\"compile_time\":\"%sT%sZ\",\"idf_version\":\"%s\",\"elf_sha256\":\"\"},"
+        "\"application\":{\"name\":\"esp32-ornament\",\"version\":\"v2.0.0\",\"compile_time\":\"%sT%sZ\",\"idf_version\":\"%s\",\"elf_sha256\":\"\"},"
         "\"partition_table\":[{\"label\":\"factory\",\"type\":0,\"subtype\":0,\"address\":65536,\"size\":4194304}],"
         "\"ota\":{\"label\":\"factory\"},"
         "\"display\":{\"monochrome\":false,\"width\":%d,\"height\":%d},"
@@ -1176,10 +1176,7 @@ static esp_err_t ensure_tts_output_locked(void)
         return ESP_OK;
     }
 
-    ornament_settings_t settings = {0};
-    esp_err_t acquire_err = copy_active_settings(&settings) ?
-        task_audio_output_acquire_with_volume(&settings) :
-        task_audio_output_acquire();
+    esp_err_t acquire_err = task_audio_output_acquire_with_volume(NULL);
     if (acquire_err == ESP_OK) {
         s_tts_output_active = true;
     }
