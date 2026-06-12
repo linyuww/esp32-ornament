@@ -6,9 +6,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     borrow::Cow,
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{hash_map::DefaultHasher, HashMap, HashSet, VecDeque},
     env,
     fs::{self, File, OpenOptions},
+    hash::{Hash, Hasher},
     io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket},
     path::{Path, PathBuf},
@@ -2769,17 +2770,9 @@ fn handle_music_cover(
 
     let query = request_query(request);
     let resolved = match query
-        .get("picture")
-        .filter(|value| !value.trim().is_empty())
-        .map(|picture| ResolvedSong {
-            source: "request",
-            title: music_request.song.clone(),
-            artist: music_request.artist.clone().unwrap_or_default(),
-            album: String::new(),
-            picture: picture.clone(),
-            url: String::new(),
-            lyrics: None,
-        }) {
+        .get("coverKey")
+        .and_then(|cover_key| cached_music_resolve_by_cover_key(state, cover_key))
+    {
         Some(song) => song,
         None => match resolve_song_cached(state, config, &music_request) {
             Ok(song) => song,
@@ -3347,7 +3340,7 @@ fn music_resolve_response(
         title: song.title.clone(),
         album: song.album.clone(),
         picture: song.picture.clone(),
-        cover_url: music_cover_url(config, peer, request, Some(&song.picture)),
+        cover_url: music_cover_url(config, peer, request, Some(song)),
         url: music_stream_url(config, peer, request),
         lyrics: song.lyrics.clone(),
     }
@@ -3430,6 +3423,22 @@ fn cached_music_resolve(state: &SharedBridgeState, request: &MusicRequest) -> Op
         .map(|cached| cached.song.clone())
 }
 
+fn cached_music_resolve_by_cover_key(
+    state: &SharedBridgeState,
+    cover_key: &str,
+) -> Option<ResolvedSong> {
+    let Ok(mut state) = state.lock() else {
+        return None;
+    };
+
+    prune_music_resolve_cache(&mut state);
+    state
+        .music_resolves
+        .values()
+        .find(|cached| music_cover_key(&cached.song) == cover_key)
+        .map(|cached| cached.song.clone())
+}
+
 fn cache_music_resolve(state: &SharedBridgeState, request: &MusicRequest, song: &ResolvedSong) {
     let cache_key = music_request_cache_key(request);
     let Ok(mut state) = state.lock() else {
@@ -3469,6 +3478,16 @@ fn music_request_cache_key(request: &MusicRequest) -> String {
         request.artist.as_deref().unwrap_or("").trim(),
         request.index
     )
+}
+
+fn music_cover_key(song: &ResolvedSong) -> String {
+    let mut hasher = DefaultHasher::new();
+    song.source.hash(&mut hasher);
+    song.title.hash(&mut hasher);
+    song.artist.hash(&mut hasher);
+    song.album.hash(&mut hasher);
+    song.picture.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
 }
 
 fn parse_music_request(request: &HttpRequest) -> io::Result<MusicRequest> {
@@ -3528,7 +3547,7 @@ fn music_cover_url(
     config: &BridgeConfig,
     peer: Option<SocketAddr>,
     request: &MusicRequest,
-    picture: Option<&str>,
+    song: Option<&ResolvedSong>,
 ) -> String {
     let base = music_public_base_url(config, peer);
     let mut url = format!("{}/v1/music/cover?song=", base.trim_end_matches('/'));
@@ -3539,9 +3558,9 @@ fn music_cover_url(
     }
     url.push_str("&index=");
     url.push_str(&request.index.to_string());
-    if let Some(picture) = picture.filter(|value| !value.trim().is_empty()) {
-        url.push_str("&picture=");
-        url.push_str(&form_urlencode(picture));
+    if let Some(song) = song.filter(|song| !song.picture.trim().is_empty()) {
+        url.push_str("&coverKey=");
+        url.push_str(&music_cover_key(song));
     }
     url
 }
@@ -6809,15 +6828,21 @@ mod tests {
             music_cover_url(&config, None, &request, None),
             "http://192.168.1.102:8787/v1/music/cover?song=lucky+song&artist=zu+hai&index=2"
         );
-        assert_eq!(
-            music_cover_url(
-                &config,
-                None,
-                &request,
-                Some("https://example.test/cover art.jpg")
-            ),
-            "http://192.168.1.102:8787/v1/music/cover?song=lucky+song&artist=zu+hai&index=2&picture=https%3A%2F%2Fexample.test%2Fcover+art.jpg"
-        );
+        let resolved = ResolvedSong {
+            source: "yaohud",
+            title: "lucky song".to_string(),
+            artist: "zu hai".to_string(),
+            album: "lucky album".to_string(),
+            picture: "https://example.test/cover art.jpg".to_string(),
+            url: "https://example.test/play.mp3".to_string(),
+            lyrics: None,
+        };
+        let cover_url = music_cover_url(&config, None, &request, Some(&resolved));
+        assert!(cover_url.starts_with(
+            "http://192.168.1.102:8787/v1/music/cover?song=lucky+song&artist=zu+hai&index=2&coverKey="
+        ));
+        assert!(!cover_url.contains("cover%20art"));
+        assert!(cover_url.len() < 140);
     }
 
     #[test]
