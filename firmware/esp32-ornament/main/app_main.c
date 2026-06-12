@@ -717,6 +717,17 @@ static esp_err_t xiaozhi_stop_session_if_needed(const char *reason)
     return err;
 }
 
+static bool xiaozhi_snapshot_active(const xiaozhi_client_snapshot_t *snapshot)
+{
+    if (snapshot == NULL) {
+        return false;
+    }
+    return snapshot->session_requested ||
+           snapshot->state == XIAOZHI_CLIENT_STATE_CONNECTING ||
+           snapshot->state == XIAOZHI_CLIENT_STATE_LISTENING ||
+           snapshot->state == XIAOZHI_CLIENT_STATE_SPEAKING;
+}
+
 static void voice_control_cycle_page(TickType_t now)
 {
     xiaozhi_session_action_t xiaozhi_action = XIAOZHI_SESSION_ACTION_NONE;
@@ -1073,6 +1084,18 @@ static void ai_button_task(void *arg)
         if (sample_pressed != stable_pressed && (now - changed_tick) >= debounce_ticks) {
             stable_pressed = sample_pressed;
             if (stable_pressed) {
+                xiaozhi_client_snapshot_t xiaozhi_snapshot = {0};
+                xiaozhi_client_status_snapshot(&xiaozhi_snapshot);
+                if (xiaozhi_snapshot_active(&xiaozhi_snapshot)) {
+                    ESP_LOGI(
+                        TAG,
+                        "AI button interrupting Xiaozhi conversation: state=%s requested=%d",
+                        xiaozhi_client_state_name(xiaozhi_snapshot.state),
+                        xiaozhi_snapshot.session_requested);
+                    queue_xiaozhi_session_action(XIAOZHI_SESSION_ACTION_STOP, "AI button interrupt");
+                    continue;
+                }
+
                 voice_view_t active_view = VOICE_VIEW_AUTO;
                 bool manual_active = false;
                 if (!voice_control_active_view(now, &active_view, &manual_active) ||

@@ -838,6 +838,7 @@ static bool ascii_preview(const char *text, const char *fallback, char *out, siz
     return copied;
 }
 
+#if !CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
 static void draw_ascii_text_wrapped_xy(
     int x,
     int y,
@@ -899,6 +900,7 @@ static void draw_ascii_text_wrapped_xy(
         }
     }
 }
+#endif
 
 static void draw_hud_wrapped_text(
     int x,

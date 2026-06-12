@@ -110,11 +110,10 @@ config ORNAMENT_UI_FRAME_MS
 
 config ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
     bool "Enable rich Xiaozhi display overlay"
-    default n
+    default y
     help
-        Builds the LVGL Xiaozhi chat overlay and bundled Chinese fonts. Keep
-        this disabled in the bridge-first firmware to save substantial flash.
-        The lightweight canvas Xiaozhi status page remains available.
+        Builds bundled Chinese fonts and enables UTF-8 rendering on the
+        Xiaozhi assistant page. This is required for Chinese STT/TTS text.
 
 menu "Page button"
 
@@ -154,8 +153,8 @@ config ORNAMENT_AI_BUTTON_ENABLED
     bool "Enable hardware AI start/stop button"
     default y
     help
-        Enables a dedicated button that toggles the Xiaozhi session only while
-        the current manual page is the Xiaozhi assistant page.
+        Enables a dedicated button that stops an active Xiaozhi conversation
+        immediately, or toggles the session while the assistant page is active.
 
 config ORNAMENT_AI_BUTTON_GPIO
     int "AI start/stop button GPIO"
