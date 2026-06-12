@@ -2394,11 +2394,11 @@ fn handle_music_resolve(
         }
     };
 
-    match resolve_song_cached(state, config, &music_request) {
-        Ok(song) => write_json(
+    match resolve_ready_music_stream(state, config, &music_request) {
+        Ok((resolved_request, song, _pcm_stream)) => write_json(
             stream,
             200,
-            &music_resolve_response(config, peer, &music_request, &song),
+            &music_resolve_response(config, peer, &resolved_request, &song),
         ),
         Err(error) => {
             eprintln!("music resolve failed: {error}");
@@ -5953,6 +5953,34 @@ mod tests {
             }
         )
         .is_none());
+    }
+
+    #[test]
+    fn stream_fallback_caches_selected_song_for_original_request() {
+        let state = Arc::new(Mutex::new(BridgeState::default()));
+        let request = MusicRequest {
+            song: "lucky song".to_string(),
+            artist: None,
+            index: 1,
+        };
+        let fallback_request = MusicRequest {
+            index: 2,
+            ..request.clone()
+        };
+        let fallback_song = ResolvedSong {
+            source: "yaohud",
+            title: "playable fallback".to_string(),
+            artist: "test artist".to_string(),
+            album: "fallback album".to_string(),
+            picture: "https://example.test/fallback.jpg".to_string(),
+            url: "https://example.test/fallback.mp3".to_string(),
+            lyrics: Some("[00:01.00]fallback".to_string()),
+        };
+
+        cache_music_resolve(&state, &fallback_request, &fallback_song);
+        cache_music_resolve(&state, &request, &fallback_song);
+
+        assert_eq!(cached_music_resolve(&state, &request), Some(fallback_song));
     }
 
     #[test]
