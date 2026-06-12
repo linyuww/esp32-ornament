@@ -349,7 +349,7 @@ static void lvgl_release_xiaozhi_overlay(void)
     ESP_LOGI(TAG, "LVGL overlay released");
 }
 
-static esp_err_t lvgl_xiaozhi_overlay_init(void)
+static esp_err_t __attribute__((unused)) lvgl_xiaozhi_overlay_init(void)
 {
     if (lvgl_ready) {
         return ESP_OK;
@@ -471,7 +471,7 @@ static esp_err_t lvgl_xiaozhi_overlay_init(void)
     return ESP_OK;
 }
 
-static void lvgl_render_xiaozhi_overlay(const xiaozhi_client_snapshot_t *snapshot)
+static void __attribute__((unused)) lvgl_render_xiaozhi_overlay(const xiaozhi_client_snapshot_t *snapshot)
 {
     xiaozhi_client_snapshot_t fallback = {0};
     if (!lvgl_ready || lvgl_root == NULL) {

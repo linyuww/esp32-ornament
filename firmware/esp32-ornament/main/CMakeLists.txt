@@ -115,7 +115,3 @@ endif()
 if(CONFIG_ORNAMENT_ST77916_DISPLAY_ENABLED)
   target_link_libraries(${COMPONENT_LIB} PRIVATE idf::esp_lcd_st77916)
 endif()
-
-if(CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED)
-  target_link_libraries(${COMPONENT_LIB} PRIVATE idf::lvgl idf::78__xiaozhi-fonts)
-endif()
