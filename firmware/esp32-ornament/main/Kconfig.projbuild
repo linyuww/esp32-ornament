@@ -254,11 +254,11 @@ config ORNAMENT_AUDIO_ENABLED
 config ORNAMENT_TASK_DONE_AUDIO_CLIP_ENABLED
     bool "Embed and play local task done PCM clip"
     depends on ORNAMENT_AUDIO_ENABLED
-    default n
+    default y
     help
         Embeds assets/task_done.pcm and plays it once when a new bridge done
-        event is observed. Keep this disabled in the bridge-first firmware to
-        save flash; the display still flashes on done events.
+        event is observed. Disable only for builds that intentionally rely on
+        an external ASRPRO voice prompt or need the flash savings.
 
 config ORNAMENT_AUDIO_PIN_BCLK
     int "MAX98357A I2S BCLK GPIO"
