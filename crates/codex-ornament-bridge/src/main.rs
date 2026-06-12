@@ -2767,16 +2767,31 @@ fn handle_music_cover(
         }
     };
 
-    let resolved = match resolve_song_cached(state, config, &music_request) {
-        Ok(song) => song,
-        Err(error) => {
-            eprintln!("music cover resolve failed: {error}");
-            return write_json(
-                stream,
-                map_music_status(&error),
-                &json!({"ok": false, "error": error.to_string()}),
-            );
-        }
+    let query = request_query(request);
+    let resolved = match query
+        .get("picture")
+        .filter(|value| !value.trim().is_empty())
+        .map(|picture| ResolvedSong {
+            source: "request",
+            title: music_request.song.clone(),
+            artist: music_request.artist.clone().unwrap_or_default(),
+            album: String::new(),
+            picture: picture.clone(),
+            url: String::new(),
+            lyrics: None,
+        }) {
+        Some(song) => song,
+        None => match resolve_song_cached(state, config, &music_request) {
+            Ok(song) => song,
+            Err(error) => {
+                eprintln!("music cover resolve failed: {error}");
+                return write_json(
+                    stream,
+                    map_music_status(&error),
+                    &json!({"ok": false, "error": error.to_string()}),
+                );
+            }
+        },
     };
     if resolved.picture.trim().is_empty() {
         return write_json(
@@ -3332,7 +3347,7 @@ fn music_resolve_response(
         title: song.title.clone(),
         album: song.album.clone(),
         picture: song.picture.clone(),
-        cover_url: music_cover_url(config, peer, request),
+        cover_url: music_cover_url(config, peer, request, Some(&song.picture)),
         url: music_stream_url(config, peer, request),
         lyrics: song.lyrics.clone(),
     }
@@ -3513,6 +3528,7 @@ fn music_cover_url(
     config: &BridgeConfig,
     peer: Option<SocketAddr>,
     request: &MusicRequest,
+    picture: Option<&str>,
 ) -> String {
     let base = music_public_base_url(config, peer);
     let mut url = format!("{}/v1/music/cover?song=", base.trim_end_matches('/'));
@@ -3523,6 +3539,10 @@ fn music_cover_url(
     }
     url.push_str("&index=");
     url.push_str(&request.index.to_string());
+    if let Some(picture) = picture.filter(|value| !value.trim().is_empty()) {
+        url.push_str("&picture=");
+        url.push_str(&form_urlencode(picture));
+    }
     url
 }
 
@@ -6786,8 +6806,17 @@ mod tests {
             "http://192.168.1.102:8787/v1/music/stream?song=lucky+song&artist=zu+hai&index=2"
         );
         assert_eq!(
-            music_cover_url(&config, None, &request),
+            music_cover_url(&config, None, &request, None),
             "http://192.168.1.102:8787/v1/music/cover?song=lucky+song&artist=zu+hai&index=2"
+        );
+        assert_eq!(
+            music_cover_url(
+                &config,
+                None,
+                &request,
+                Some("https://example.test/cover art.jpg")
+            ),
+            "http://192.168.1.102:8787/v1/music/cover?song=lucky+song&artist=zu+hai&index=2&picture=https%3A%2F%2Fexample.test%2Fcover+art.jpg"
         );
     }
 
