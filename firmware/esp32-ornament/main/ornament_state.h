@@ -5,6 +5,9 @@
 
 #define ORNAMENT_TEXT_MAX 192
 #define ORNAMENT_TIME_MAX 48
+#define ORNAMENT_WALLPAPER_ID_MAX 64
+#define ORNAMENT_WALLPAPER_NAME_MAX 128
+#define ORNAMENT_WALLPAPER_URL_MAX 256
 
 typedef enum {
     ORNAMENT_STATUS_IDLE,
@@ -38,6 +41,10 @@ typedef struct {
     char weather_summary[32];
     char weather_icon[16];
     char weather_observed_at[ORNAMENT_TIME_MAX];
+    char standby_wallpaper_id[ORNAMENT_WALLPAPER_ID_MAX];
+    char standby_wallpaper_name[ORNAMENT_WALLPAPER_NAME_MAX];
+    char standby_wallpaper_mode[16];
+    char standby_wallpaper_url[ORNAMENT_WALLPAPER_URL_MAX];
     int primary_remaining_percent;
     int secondary_remaining_percent;
     int weather_temperature_c;
@@ -49,6 +56,8 @@ typedef struct {
     int claude_active_task_count;
     int codex_done_seq;
     int claude_done_seq;
+    int standby_wallpaper_index;
+    int standby_wallpaper_total;
     char primary_resets_at[ORNAMENT_TIME_MAX];
     char secondary_resets_at[ORNAMENT_TIME_MAX];
     char bridge_observed_at[ORNAMENT_TIME_MAX];
@@ -63,6 +72,7 @@ typedef struct {
     bool has_codex_task;
     bool has_claude_task;
     bool has_quota;
+    bool has_standby_wallpaper;
     bool time_synced;
     bool wifi_connected;
     bool bridge_offline;

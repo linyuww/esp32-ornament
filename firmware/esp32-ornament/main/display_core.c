@@ -1,4 +1,5 @@
 #include "display_core.h"
+#include "standby_wallpaper_client.h"
 
 #ifndef CONFIG_ORNAMENT_STANDBY_WALLPAPER_ENABLED
 #define CONFIG_ORNAMENT_STANDBY_WALLPAPER_ENABLED 0
@@ -1168,6 +1169,11 @@ static const char *status_text_from_enum(ornament_status_t status)
 
 static void draw_standby_wallpaper(void)
 {
+    if (standby_wallpaper_client_copy_frame(
+            active_canvas->pixels,
+            (size_t)active_canvas->width * active_canvas->height)) {
+        return;
+    }
 #if CONFIG_ORNAMENT_STANDBY_WALLPAPER_ENABLED
     if (active_canvas->width != STANDBY_WALLPAPER_WIDTH || active_canvas->height != STANDBY_WALLPAPER_HEIGHT) {
         clear_canvas(HUD_BLACK);

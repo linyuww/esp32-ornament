@@ -41,7 +41,12 @@ static esp_err_t last_fetch_error = ESP_ERR_INVALID_STATE;
 static int64_t last_state_us;
 static ornament_settings_t console_settings;
 static web_console_bridge_debug_t bridge_debug;
-static music_player_snapshot_t console_music_snapshot;
+
+static void log_handler_stack_headroom(const char *handler_name)
+{
+    UBaseType_t words = uxTaskGetStackHighWaterMark(NULL);
+    ESP_LOGI(TAG, "%s stack headroom=%u bytes", handler_name, (unsigned int)(words * sizeof(StackType_t)));
+}
 
 static void refresh_console_settings(void)
 {
@@ -51,9 +56,9 @@ static void refresh_console_settings(void)
     }
 }
 
-static char *alloc_response_buffer(size_t size)
+static void *alloc_console_buffer(size_t size)
 {
-    char *buffer = heap_caps_calloc(1, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    void *buffer = heap_caps_calloc(1, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (buffer != NULL) {
         return buffer;
     }
@@ -65,6 +70,11 @@ static char *alloc_response_buffer(size_t size)
         (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT),
         (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
     return heap_caps_calloc(1, size, MALLOC_CAP_8BIT);
+}
+
+static char *alloc_response_buffer(size_t size)
+{
+    return (char *)alloc_console_buffer(size);
 }
 
 static void append(char *text, size_t text_size, size_t *used, const char *chunk)
@@ -367,8 +377,22 @@ void web_console_set_bridge_debug(const web_console_bridge_debug_t *debug)
     }
 }
 
+static void snapshot_bridge_debug(web_console_bridge_debug_t *snapshot)
+{
+    if (snapshot == NULL) {
+        return;
+    }
+    memset(snapshot, 0, sizeof(*snapshot));
+    if (state_mutex != NULL && xSemaphoreTake(state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        *snapshot = bridge_debug;
+        xSemaphoreGive(state_mutex);
+    }
+}
+
 static esp_err_t status_get_handler(httpd_req_t *req)
 {
+    log_handler_stack_headroom("/status");
+
     ornament_state_t state;
     wifi_debug_snapshot_t wifi_debug;
     esp_err_t fetch_error = ESP_OK;
@@ -384,6 +408,10 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     char weather_summary[80];
     char weather_icon[40];
     char weather_observed_at[ORNAMENT_TIME_MAX * 2];
+    char standby_wallpaper_id[ORNAMENT_WALLPAPER_ID_MAX * 2];
+    char standby_wallpaper_name[ORNAMENT_WALLPAPER_NAME_MAX * 2];
+    char standby_wallpaper_mode[32];
+    char standby_wallpaper_url[ORNAMENT_WALLPAPER_URL_MAX * 2];
     char weather_config_label[ORNAMENT_WEATHER_LABEL_MAX * 2];
     char bridge_url[ORNAMENT_BRIDGE_URL_MAX * 2];
     char xiaozhi_ws_url[ORNAMENT_XIAOZHI_WS_URL_MAX * 2];
@@ -402,10 +430,18 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     char music_album[ORNAMENT_TEXT_MAX * 2];
     char music_picture[ORNAMENT_BRIDGE_URL_MAX * 2];
     char music_cover_url[ORNAMENT_BRIDGE_URL_MAX * 2];
-    xiaozhi_client_snapshot_t xiaozhi = {0};
-    music_player_snapshot_t *music = &console_music_snapshot;
+    xiaozhi_client_snapshot_t *xiaozhi = alloc_console_buffer(sizeof(*xiaozhi));
+    music_player_snapshot_t *music = alloc_console_buffer(sizeof(*music));
     web_console_bridge_debug_t bridge_diag = {0};
-    system_diagnostics_snapshot_t diag = {0};
+    system_diagnostics_snapshot_t *diag = alloc_console_buffer(sizeof(*diag));
+
+    if (xiaozhi == NULL || music == NULL || diag == NULL) {
+        free(xiaozhi);
+        free(music);
+        free(diag);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
+        return ESP_FAIL;
+    }
 
     ornament_state_init(&state);
     state_snapshot(&state, &fetch_error, &age_ms);
@@ -421,42 +457,46 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     json_escape(state.weather_summary, weather_summary, sizeof(weather_summary));
     json_escape(state.weather_icon, weather_icon, sizeof(weather_icon));
     json_escape(state.weather_observed_at, weather_observed_at, sizeof(weather_observed_at));
+    json_escape(state.standby_wallpaper_id, standby_wallpaper_id, sizeof(standby_wallpaper_id));
+    json_escape(state.standby_wallpaper_name, standby_wallpaper_name, sizeof(standby_wallpaper_name));
+    json_escape(state.standby_wallpaper_mode, standby_wallpaper_mode, sizeof(standby_wallpaper_mode));
+    json_escape(state.standby_wallpaper_url, standby_wallpaper_url, sizeof(standby_wallpaper_url));
     json_escape(settings_weather_label_or_default(&console_settings), weather_config_label, sizeof(weather_config_label));
 
     json_escape(settings_bridge_url_or_default(&console_settings), bridge_url, sizeof(bridge_url));
-    xiaozhi_client_status_snapshot(&xiaozhi);
-    system_diagnostics_snapshot(&diag);
-    json_escape(xiaozhi.ws_url, xiaozhi_ws_url, sizeof(xiaozhi_ws_url));
-    json_escape(xiaozhi.saved_ws_url, xiaozhi_saved_ws_url, sizeof(xiaozhi_saved_ws_url));
-    json_escape(xiaozhi.runtime_ws_url, xiaozhi_runtime_ws_url, sizeof(xiaozhi_runtime_ws_url));
-    json_escape(xiaozhi.active_ws_url, xiaozhi_active_ws_url, sizeof(xiaozhi_active_ws_url));
-    json_escape(xiaozhi.client_id, xiaozhi_client_id, sizeof(xiaozhi_client_id));
-    json_escape(xiaozhi.session_id, xiaozhi_session_id, sizeof(xiaozhi_session_id));
-    json_escape(xiaozhi.activation_code, xiaozhi_activation_code, sizeof(xiaozhi_activation_code));
-    json_escape(xiaozhi.activation_message, xiaozhi_activation_message, sizeof(xiaozhi_activation_message));
-    json_escape(xiaozhi.last_error, xiaozhi_last_error, sizeof(xiaozhi_last_error));
-    json_escape(xiaozhi.last_stt, xiaozhi_last_stt, sizeof(xiaozhi_last_stt));
-    json_escape(xiaozhi.last_tts, xiaozhi_last_tts, sizeof(xiaozhi_last_tts));
+    xiaozhi_client_status_snapshot(xiaozhi);
+    system_diagnostics_snapshot(diag);
+    json_escape(xiaozhi->ws_url, xiaozhi_ws_url, sizeof(xiaozhi_ws_url));
+    json_escape(xiaozhi->saved_ws_url, xiaozhi_saved_ws_url, sizeof(xiaozhi_saved_ws_url));
+    json_escape(xiaozhi->runtime_ws_url, xiaozhi_runtime_ws_url, sizeof(xiaozhi_runtime_ws_url));
+    json_escape(xiaozhi->active_ws_url, xiaozhi_active_ws_url, sizeof(xiaozhi_active_ws_url));
+    json_escape(xiaozhi->client_id, xiaozhi_client_id, sizeof(xiaozhi_client_id));
+    json_escape(xiaozhi->session_id, xiaozhi_session_id, sizeof(xiaozhi_session_id));
+    json_escape(xiaozhi->activation_code, xiaozhi_activation_code, sizeof(xiaozhi_activation_code));
+    json_escape(xiaozhi->activation_message, xiaozhi_activation_message, sizeof(xiaozhi_activation_message));
+    json_escape(xiaozhi->last_error, xiaozhi_last_error, sizeof(xiaozhi_last_error));
+    json_escape(xiaozhi->last_stt, xiaozhi_last_stt, sizeof(xiaozhi_last_stt));
+    json_escape(xiaozhi->last_tts, xiaozhi_last_tts, sizeof(xiaozhi_last_tts));
     music_player_status_snapshot(music);
     json_escape(music->title, music_title, sizeof(music_title));
     json_escape(music->artist_name, music_artist, sizeof(music_artist));
     json_escape(music->album, music_album, sizeof(music_album));
     json_escape(music->picture, music_picture, sizeof(music_picture));
     json_escape(music->cover_url, music_cover_url, sizeof(music_cover_url));
-    if (state_mutex != NULL && xSemaphoreTake(state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        bridge_diag = bridge_debug;
-        xSemaphoreGive(state_mutex);
-    }
+    snapshot_bridge_debug(&bridge_diag);
 
     const size_t json_size = 12288;
     char *json = alloc_response_buffer(json_size);
     if (json == NULL) {
+        free(xiaozhi);
+        free(music);
+        free(diag);
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
         return ESP_FAIL;
     }
     size_t used = 0;
     append(json, json_size, &used, "{");
-    append_diagnostics_json(json, json_size, &used, &diag);
+    append_diagnostics_json(json, json_size, &used, diag);
     appendf(json, json_size, &used, "\"uptime_ms\":%lld,", (long long)(esp_timer_get_time() / 1000));
     appendf(json, json_size, &used, "\"last_state_age_ms\":%lld,", (long long)age_ms);
     appendf(json, json_size, &used, "\"fetch_error\":\"%s\",", esp_err_to_name(fetch_error));
@@ -511,6 +551,18 @@ static esp_err_t status_get_handler(httpd_req_t *req)
         json,
         json_size,
         &used,
+        "\"standby_wallpaper\":{\"has\":%s,\"id\":\"%s\",\"name\":\"%s\",\"mode\":\"%s\",\"url\":\"%s\",\"index\":%d,\"total\":%d},",
+        state.has_standby_wallpaper ? "true" : "false",
+        standby_wallpaper_id,
+        standby_wallpaper_name,
+        standby_wallpaper_mode,
+        standby_wallpaper_url,
+        state.standby_wallpaper_index,
+        state.standby_wallpaper_total);
+    appendf(
+        json,
+        json_size,
+        &used,
         "\"quota\":{\"has\":%s,\"status\":\"%s\",\"primary\":%d,\"weekly\":%d},",
         state.has_quota ? "true" : "false",
         quota_status,
@@ -550,15 +602,15 @@ static esp_err_t status_get_handler(httpd_req_t *req)
         json_size,
         &used,
         "\"xiaozhi\":{\"enabled\":%s,\"configured\":%s,\"connected\":%s,\"ai_enabled\":%s,\"session_requested\":%s,\"state\":\"%s\",\"protocol_version\":%d,\"activation_pending\":%s,\"official_runtime_config\":%s,\"ws_url\":\"%s\",\"saved_ws_url\":\"%s\",\"runtime_ws_url\":\"%s\",\"active_ws_url\":\"%s\",\"client_id\":\"%s\",\"session_id\":\"%s\",\"activation_code\":\"%s\",\"activation_message\":\"%s\",\"last_error\":\"%s\",\"last_stt\":\"%s\",\"last_tts\":\"%s\",\"uplink_frames\":%u,\"downlink_frames\":%u},",
-        xiaozhi.enabled ? "true" : "false",
-        xiaozhi.configured ? "true" : "false",
-        xiaozhi.connected ? "true" : "false",
-        xiaozhi.session_requested ? "true" : "false",
-        xiaozhi.session_requested ? "true" : "false",
-        xiaozhi_client_state_name(xiaozhi.state),
-        xiaozhi.protocol_version,
-        xiaozhi.activation_pending ? "true" : "false",
-        xiaozhi.official_runtime_config ? "true" : "false",
+        xiaozhi->enabled ? "true" : "false",
+        xiaozhi->configured ? "true" : "false",
+        xiaozhi->connected ? "true" : "false",
+        xiaozhi->session_requested ? "true" : "false",
+        xiaozhi->session_requested ? "true" : "false",
+        xiaozhi_client_state_name(xiaozhi->state),
+        xiaozhi->protocol_version,
+        xiaozhi->activation_pending ? "true" : "false",
+        xiaozhi->official_runtime_config ? "true" : "false",
         xiaozhi_ws_url,
         xiaozhi_saved_ws_url,
         xiaozhi_runtime_ws_url,
@@ -570,8 +622,8 @@ static esp_err_t status_get_handler(httpd_req_t *req)
         xiaozhi_last_error,
         xiaozhi_last_stt,
         xiaozhi_last_tts,
-        (unsigned int)xiaozhi.uplink_frames,
-        (unsigned int)xiaozhi.downlink_frames);
+        (unsigned int)xiaozhi->uplink_frames,
+        (unsigned int)xiaozhi->downlink_frames);
     appendf(
         json,
         json_size,
@@ -589,19 +641,24 @@ static esp_err_t status_get_handler(httpd_req_t *req)
         json_size,
         &used,
         "\"heap\":{\"free\":%u,\"min_free\":%u,\"largest_free_block\":%u,\"largest_internal_block\":%u}}",
-        (unsigned int)diag.free_heap,
-        (unsigned int)diag.minimum_free_heap,
-        (unsigned int)diag.largest_8bit_block,
-        (unsigned int)diag.largest_internal_block);
+        (unsigned int)diag->free_heap,
+        (unsigned int)diag->minimum_free_heap,
+        (unsigned int)diag->largest_8bit_block,
+        (unsigned int)diag->largest_internal_block);
 
     httpd_resp_set_type(req, "application/json");
     esp_err_t err = httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
     free(json);
+    free(xiaozhi);
+    free(music);
+    free(diag);
     return err;
 }
 
 static esp_err_t root_get_handler(httpd_req_t *req)
 {
+    log_handler_stack_headroom("/");
+
     ornament_state_t state;
     wifi_debug_snapshot_t wifi_debug;
     esp_err_t fetch_error = ESP_OK;
@@ -630,19 +687,27 @@ static esp_err_t root_get_handler(httpd_req_t *req)
     char xiaozhi_last_error[XIAOZHI_STATUS_TEXT_MAX * 2];
     char xiaozhi_last_stt[XIAOZHI_STATUS_TEXT_MAX * 2];
     char xiaozhi_last_tts[XIAOZHI_STATUS_TEXT_MAX * 2];
-    xiaozhi_client_snapshot_t xiaozhi = {0};
+    xiaozhi_client_snapshot_t *xiaozhi = alloc_console_buffer(sizeof(*xiaozhi));
     char music_title[ORNAMENT_TEXT_MAX * 2];
     char music_artist[ORNAMENT_TEXT_MAX * 2];
     char music_album[ORNAMENT_TEXT_MAX * 2];
     char music_error[ORNAMENT_TEXT_MAX * 2];
-    music_player_snapshot_t music = {0};
+    music_player_snapshot_t *music = alloc_console_buffer(sizeof(*music));
     char settings_weather_label[ORNAMENT_WEATHER_LABEL_MAX * 2];
     const char *settings_weather_source = settings_weather_source_or_default(&console_settings);
     char weather_lat_text[24];
     char weather_lon_text[24];
     web_console_bridge_debug_t bridge_diag = {0};
-    system_diagnostics_snapshot_t diag = {0};
+    system_diagnostics_snapshot_t *diag = alloc_console_buffer(sizeof(*diag));
     int audio_volume_percent = settings_audio_volume_percent_or_default(&console_settings);
+
+    if (xiaozhi == NULL || music == NULL || diag == NULL) {
+        free(xiaozhi);
+        free(music);
+        free(diag);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
+        return ESP_FAIL;
+    }
 
     ornament_state_init(&state);
     state_snapshot(&state, &fetch_error, &age_ms);
@@ -650,23 +715,23 @@ static esp_err_t root_get_handler(httpd_req_t *req)
     int codex_active_count = state.has_codex_summary ? state.codex_active_task_count : state.active_task_count;
     int codex_done_seq = state.has_codex_summary ? state.codex_done_seq : state.done_seq;
     html_escape(settings_bridge_url_or_default(&console_settings), bridge_url, sizeof(bridge_url));
-    xiaozhi_client_status_snapshot(&xiaozhi);
-    system_diagnostics_snapshot(&diag);
+    xiaozhi_client_status_snapshot(xiaozhi);
+    system_diagnostics_snapshot(diag);
     html_escape(settings_xiaozhi_ws_url_or_default(&console_settings), xiaozhi_ws_url, sizeof(xiaozhi_ws_url));
-    html_escape(xiaozhi.saved_ws_url, xiaozhi_saved_ws_url, sizeof(xiaozhi_saved_ws_url));
-    html_escape(xiaozhi.runtime_ws_url, xiaozhi_runtime_ws_url, sizeof(xiaozhi_runtime_ws_url));
-    html_escape(xiaozhi.active_ws_url, xiaozhi_active_ws_url, sizeof(xiaozhi_active_ws_url));
-    html_escape(xiaozhi.client_id, xiaozhi_client_id, sizeof(xiaozhi_client_id));
-    html_escape(xiaozhi.activation_code, xiaozhi_activation_code, sizeof(xiaozhi_activation_code));
-    html_escape(xiaozhi.activation_message, xiaozhi_activation_message, sizeof(xiaozhi_activation_message));
-    html_escape(xiaozhi.last_error, xiaozhi_last_error, sizeof(xiaozhi_last_error));
-    html_escape(xiaozhi.last_stt, xiaozhi_last_stt, sizeof(xiaozhi_last_stt));
-    html_escape(xiaozhi.last_tts, xiaozhi_last_tts, sizeof(xiaozhi_last_tts));
-    music_player_status_snapshot(&music);
-    html_escape(music.title[0] != '\0' ? music.title : music.song_name, music_title, sizeof(music_title));
-    html_escape(music.artist_name, music_artist, sizeof(music_artist));
-    html_escape(music.album, music_album, sizeof(music_album));
-    html_escape(music.last_error, music_error, sizeof(music_error));
+    html_escape(xiaozhi->saved_ws_url, xiaozhi_saved_ws_url, sizeof(xiaozhi_saved_ws_url));
+    html_escape(xiaozhi->runtime_ws_url, xiaozhi_runtime_ws_url, sizeof(xiaozhi_runtime_ws_url));
+    html_escape(xiaozhi->active_ws_url, xiaozhi_active_ws_url, sizeof(xiaozhi_active_ws_url));
+    html_escape(xiaozhi->client_id, xiaozhi_client_id, sizeof(xiaozhi_client_id));
+    html_escape(xiaozhi->activation_code, xiaozhi_activation_code, sizeof(xiaozhi_activation_code));
+    html_escape(xiaozhi->activation_message, xiaozhi_activation_message, sizeof(xiaozhi_activation_message));
+    html_escape(xiaozhi->last_error, xiaozhi_last_error, sizeof(xiaozhi_last_error));
+    html_escape(xiaozhi->last_stt, xiaozhi_last_stt, sizeof(xiaozhi_last_stt));
+    html_escape(xiaozhi->last_tts, xiaozhi_last_tts, sizeof(xiaozhi_last_tts));
+    music_player_status_snapshot(music);
+    html_escape(music->title[0] != '\0' ? music->title : music->song_name, music_title, sizeof(music_title));
+    html_escape(music->artist_name, music_artist, sizeof(music_artist));
+    html_escape(music->album, music_album, sizeof(music_album));
+    html_escape(music->last_error, music_error, sizeof(music_error));
     html_escape(state.wifi_ssid, wifi_ssid, sizeof(wifi_ssid));
     html_escape(state.weather_label, weather_label, sizeof(weather_label));
     html_escape(state.weather_source, weather_source, sizeof(weather_source));
@@ -687,10 +752,7 @@ static esp_err_t root_get_handler(httpd_req_t *req)
     html_escape(state.claude_task_turn_id, claude_turn_id, sizeof(claude_turn_id));
     task_panel_status_label(state.has_codex_summary ? state.codex_task_status : state.status, codex_active_count, codex_status, sizeof(codex_status));
     task_panel_status_label(state.claude_task_status, state.claude_active_task_count, claude_status, sizeof(claude_status));
-    if (state_mutex != NULL && xSemaphoreTake(state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        bridge_diag = bridge_debug;
-        xSemaphoreGive(state_mutex);
-    }
+    snapshot_bridge_debug(&bridge_diag);
     if (state.has_weather && state.weather_temperature_c != INT32_MIN) {
         snprintf(weather_value, sizeof(weather_value), "%dC %s", state.weather_temperature_c, weather_summary);
     } else {
@@ -712,6 +774,9 @@ static esp_err_t root_get_handler(httpd_req_t *req)
     const size_t html_size = 20480;
     char *html = alloc_response_buffer(html_size);
     if (html == NULL) {
+        free(xiaozhi);
+        free(music);
+        free(diag);
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
         return ESP_FAIL;
     }
@@ -790,13 +855,13 @@ static esp_err_t root_get_handler(httpd_req_t *req)
     appendf(html, html_size, &used, "<div class=\"card\"><div class=\"k\">Auto Match</div><div class=\"v\">%s</div><div class=\"k\">%s / %s</div></div>", bridge_diag.last_auto_match_ok ? "ok" : "failed", esp_err_to_name(bridge_diag.last_auto_match_error), bridge_diag.last_auto_match_reason[0] != '\0' ? bridge_diag.last_auto_match_reason : "--");
     append(html, html_size, &used, "</section>");
     append(html, html_size, &used, "<h2>System</h2><section class=\"grid\">");
-    appendf(html, html_size, &used, "<div class=\"card\"><div class=\"k\">Reset</div><div class=\"v\">%s</div><div class=\"k\">code %d</div></div>", system_diagnostics_reset_reason_name(diag.reset_reason), (int)diag.reset_reason);
-    appendf(html, html_size, &used, "<div class=\"card\"><div class=\"k\">Heap Free</div><div class=\"v\">%u KB</div><div class=\"k\">min %u KB</div></div>", (unsigned int)(diag.free_heap / 1024), (unsigned int)(diag.minimum_free_heap / 1024));
-    appendf(html, html_size, &used, "<div class=\"card\"><div class=\"k\">Internal RAM</div><div class=\"v\">%u KB</div><div class=\"k\">largest block %u KB</div></div>", (unsigned int)(diag.internal_free / 1024), (unsigned int)(diag.largest_internal_block / 1024));
-    appendf(html, html_size, &used, "<div class=\"card\"><div class=\"k\">PSRAM</div><div class=\"v\">%u KB</div><div class=\"k\">largest block %u KB</div></div>", (unsigned int)(diag.spiram_free / 1024), (unsigned int)(diag.largest_spiram_block / 1024));
+    appendf(html, html_size, &used, "<div class=\"card\"><div class=\"k\">Reset</div><div class=\"v\">%s</div><div class=\"k\">code %d</div></div>", system_diagnostics_reset_reason_name(diag->reset_reason), (int)diag->reset_reason);
+    appendf(html, html_size, &used, "<div class=\"card\"><div class=\"k\">Heap Free</div><div class=\"v\">%u KB</div><div class=\"k\">min %u KB</div></div>", (unsigned int)(diag->free_heap / 1024), (unsigned int)(diag->minimum_free_heap / 1024));
+    appendf(html, html_size, &used, "<div class=\"card\"><div class=\"k\">Internal RAM</div><div class=\"v\">%u KB</div><div class=\"k\">largest block %u KB</div></div>", (unsigned int)(diag->internal_free / 1024), (unsigned int)(diag->largest_internal_block / 1024));
+    appendf(html, html_size, &used, "<div class=\"card\"><div class=\"k\">PSRAM</div><div class=\"v\">%u KB</div><div class=\"k\">largest block %u KB</div></div>", (unsigned int)(diag->spiram_free / 1024), (unsigned int)(diag->largest_spiram_block / 1024));
     append(html, html_size, &used, "</section><section class=\"grid\">");
-    for (size_t i = 0; i < diag.task_count; i++) {
-        const system_diagnostics_task_t *task = &diag.tasks[i];
+    for (size_t i = 0; i < diag->task_count; i++) {
+        const system_diagnostics_task_t *task = &diag->tasks[i];
         if (!task->valid) {
             continue;
         }
@@ -818,28 +883,28 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         html_size,
         &used,
         "<div class=\"card\"><div class=\"k\">State</div><div class=\"v\">%s</div><div class=\"k\">configured %s</div></div>",
-        xiaozhi_client_state_name(xiaozhi.state),
-        xiaozhi.configured ? "yes" : "no");
+        xiaozhi_client_state_name(xiaozhi->state),
+        xiaozhi->configured ? "yes" : "no");
     appendf(
         html,
         html_size,
         &used,
         "<div class=\"card\"><div class=\"k\">AI Enabled</div><div class=\"v\">%s</div><div class=\"k\">stop ai disables wake</div></div>",
-        xiaozhi.session_requested ? "yes" : "no");
+        xiaozhi->session_requested ? "yes" : "no");
     appendf(
         html,
         html_size,
         &used,
         "<div class=\"card\"><div class=\"k\">Client ID</div><div class=\"v\">%s</div><div class=\"k\">proto v%d</div></div>",
         xiaozhi_client_id[0] != '\0' ? xiaozhi_client_id : "--",
-        xiaozhi.protocol_version);
+        xiaozhi->protocol_version);
     appendf(
         html,
         html_size,
         &used,
         "<div class=\"card\"><div class=\"k\">Activation Code</div><div class=\"v\">%s</div><div class=\"k\">%s</div></div>",
         xiaozhi_activation_code[0] != '\0' ? xiaozhi_activation_code : "--",
-        xiaozhi.activation_pending ?
+        xiaozhi->activation_pending ?
             (xiaozhi_activation_message[0] != '\0' ? xiaozhi_activation_message : "pending bind on xiaozhi.me") :
             "not pending");
     appendf(
@@ -847,8 +912,8 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         html_size,
         &used,
         "<div class=\"card\"><div class=\"k\">Frames</div><div class=\"v\">%u / %u</div><div class=\"k\">uplink / downlink</div></div>",
-        (unsigned int)xiaozhi.uplink_frames,
-        (unsigned int)xiaozhi.downlink_frames);
+        (unsigned int)xiaozhi->uplink_frames,
+        (unsigned int)xiaozhi->downlink_frames);
     appendf(
         html,
         html_size,
@@ -874,14 +939,14 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         &used,
         "<div class=\"card\"><div class=\"k\">Runtime WS</div><div class=\"v\" style=\"font-size:12px;word-break:break-all\">%s</div><div class=\"k\">official %s</div></div>",
         xiaozhi_runtime_ws_url[0] != '\0' ? xiaozhi_runtime_ws_url : "--",
-        xiaozhi.official_runtime_config ? "yes" : "no");
+        xiaozhi->official_runtime_config ? "yes" : "no");
     appendf(
         html,
         html_size,
         &used,
         "<div class=\"card\"><div class=\"k\">Active WS</div><div class=\"v\" style=\"font-size:12px;word-break:break-all\">%s</div><div class=\"k\">connected %s</div></div>",
         xiaozhi_active_ws_url[0] != '\0' ? xiaozhi_active_ws_url : "--",
-        xiaozhi.connected ? "yes" : "no");
+        xiaozhi->connected ? "yes" : "no");
     append(html, html_size, &used, "</section>");
     append(
         html,
@@ -907,9 +972,9 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         html_size,
         &used,
         "<div class=\"card\"><div class=\"k\">State</div><div class=\"v\">%s</div><div class=\"k\">active %s stop %s</div></div>",
-        music_player_state_name(music.state),
-        music.active ? "yes" : "no",
-        music.stop_requested ? "yes" : "no");
+        music_player_state_name(music->state),
+        music->active ? "yes" : "no",
+        music->stop_requested ? "yes" : "no");
     appendf(
         html,
         html_size,
@@ -923,14 +988,14 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         &used,
         "<div class=\"card\"><div class=\"k\">Album</div><div class=\"v\">%s</div><div class=\"k\">cover %s lyrics %u B</div></div>",
         music_album[0] != '\0' ? music_album : "--",
-        music.has_cover ? "yes" : "no",
-        (unsigned int)strlen(music.lyrics));
+        music->has_cover ? "yes" : "no",
+        (unsigned int)strlen(music->lyrics));
     appendf(
         html,
         html_size,
         &used,
         "<div class=\"card\"><div class=\"k\">Playback</div><div class=\"v\">%u ms</div><div class=\"k\">%s</div></div>",
-        (unsigned int)music.playback_ms,
+        (unsigned int)music->playback_ms,
         music_error[0] != '\0' ? music_error : "no error");
     append(
         html,
@@ -1001,6 +1066,9 @@ static esp_err_t root_get_handler(httpd_req_t *req)
     httpd_resp_set_type(req, "text/html; charset=utf-8");
     esp_err_t err = httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
     free(html);
+    free(xiaozhi);
+    free(music);
+    free(diag);
     return err;
 }
 
@@ -1819,7 +1887,7 @@ esp_err_t web_console_start(void)
     config.server_port = 80;
     config.lru_purge_enable = true;
     config.max_uri_handlers = 22;
-    config.stack_size = 16384;
+    config.stack_size = 32768;
 
     esp_err_t err = httpd_start(&server, &config);
     if (err != ESP_OK) {

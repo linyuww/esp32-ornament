@@ -1,4 +1,4 @@
-use chrono::{DateTime, FixedOffset, Local, Timelike};
+use chrono::{DateTime, FixedOffset, Local, NaiveDate, Timelike};
 use quota_core::{
     get_quota_snapshot, read_state, state_path, write_state, QuotaSnapshot, SnapshotStatus,
 };
@@ -54,12 +54,17 @@ const DEFAULT_WEATHER_LATITUDE: f64 = 39.99540087499999;
 const DEFAULT_WEATHER_LONGITUDE: f64 = 116.34162524999999;
 const DEFAULT_WEATHER_LABEL: &str = "HAIDIAN";
 const DEFAULT_WEATHER_PROVIDER: WeatherProvider = WeatherProvider::Auto;
+const DEFAULT_STANDBY_WALLPAPER_DIR: &str = r"D:\AssaultLilyViewer_v0.5";
+const DEFAULT_STANDBY_WALLPAPER_WIDTH: u32 = 240;
+const DEFAULT_STANDBY_WALLPAPER_HEIGHT: u32 = 240;
+const DEFAULT_STANDBY_WALLPAPER_MAX_DIMENSION: u32 = 512;
 const RECONCILED_DONE_NOTIFY_WINDOW: Duration = Duration::from_secs(120);
 const COMBINED_DONE_SOURCE_WINDOW: Duration = Duration::from_secs(5);
 const RECOVER_UNSCOPED_ACTIVE_TASK_WINDOW: Duration = Duration::from_secs(10 * 60);
 const RECOVER_ACTIVE_SESSION_SCAN_LIMIT: usize = 24;
 const SESSION_TASK_SCAN_TAIL_BYTES: u64 = 2 * 1024 * 1024;
 const ACTIVE_SESSION_FILE_MISSING_GRACE: Duration = Duration::from_secs(30);
+const ACTIVE_SESSION_IDLE_STALE_GRACE: Duration = Duration::from_secs(2 * 60 * 60);
 const SESSION_FORK_CHAIN_LIMIT: usize = 8;
 const DISCOVERY_MAGIC: &str = "codex-ornament-discover-v1";
 
@@ -118,6 +123,8 @@ struct BridgeConfig {
     qweather_host: Option<String>,
     qweather_token: Option<String>,
     caiyun_token: Option<String>,
+    standby_wallpaper_dir: PathBuf,
+    standby_wallpaper_fixed: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -171,7 +178,33 @@ struct OrnamentState {
     unmatched_stop_count: usize,
     quota: QuotaSnapshot,
     weather: WeatherSnapshot,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    standby_wallpaper: Option<StandbyWallpaperInfo>,
     bridge: BridgeInfo,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct StandbyWallpaperInfo {
+    mode: String,
+    id: String,
+    name: String,
+    index: usize,
+    total: usize,
+    width: u32,
+    height: u32,
+    url: String,
+    selected_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ResolvedStandbyWallpaper {
+    mode: &'static str,
+    id: String,
+    name: String,
+    path: PathBuf,
+    index: usize,
+    total: usize,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
@@ -550,6 +583,10 @@ fn run() -> io::Result<()> {
             .or_else(|| env_text("CODEX_ORNAMENT_QWEATHER_KEY")),
         caiyun_token: env_text("CODEX_ORNAMENT_CAIYUN_TOKEN")
             .or_else(|| env_text("CODEX_ORNAMENT_CAIYUN_KEY")),
+        standby_wallpaper_dir: env_text("CODEX_ORNAMENT_STANDBY_WALLPAPER_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_STANDBY_WALLPAPER_DIR)),
+        standby_wallpaper_fixed: env_text("CODEX_ORNAMENT_STANDBY_WALLPAPER_FIXED"),
     };
     let listener = TcpListener::bind(&config.bind)?;
     let restored_state = restore_bridge_state_from_event_log(config.event_log_path.as_deref());
@@ -636,9 +673,13 @@ fn handle_connection(
                 unmatched_stop_count: snapshot.unmatched_stop_count,
                 quota: cached_or_refresh_quota_background(&state),
                 weather: cached_or_refresh_weather(&state, &config),
+                standby_wallpaper: standby_wallpaper_info(&config, peer),
                 bridge: bridge_info(&config),
             };
             write_json(&mut stream, 200, &response)
+        }
+        ("GET", "/v1/standby-wallpaper") => {
+            handle_standby_wallpaper(&mut stream, peer, &request, &config)
         }
         ("GET", "/v1/music/resolve") | ("GET", "/stream_pcm") => {
             handle_music_resolve(&mut stream, peer, &request, &state, &config)
@@ -1739,7 +1780,7 @@ fn reconcile_active_tasks(state: &mut BridgeState, config: &BridgeConfig) {
         }
 
         let Some(terminal) = terminal_turn_for_event(&config.codex_home, &event) else {
-            if active_task_is_stale_against_session_log(&config.codex_home, &event) {
+            if active_task_is_stale_against_logs(&config.codex_home, &event) {
                 clear_active_task(state, &key);
             }
             continue;
@@ -3025,6 +3066,57 @@ fn render_music_cover_rgb565(url: &str) -> io::Result<Vec<u8>> {
     Ok(output.stdout)
 }
 
+fn render_standby_wallpaper_rgb565(path: &Path) -> io::Result<Vec<u8>> {
+    let vf = format!(
+        "scale={max}:{max}:force_original_aspect_ratio=decrease,pad={max}:{max}:(ow-iw)/2:(oh-ih)/2:black,scale={w}:{h}:flags=lanczos,format=rgb565le",
+        max = DEFAULT_STANDBY_WALLPAPER_MAX_DIMENSION,
+        w = DEFAULT_STANDBY_WALLPAPER_WIDTH,
+        h = DEFAULT_STANDBY_WALLPAPER_HEIGHT
+    );
+    let path_text = path
+        .to_str()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "wallpaper path is not valid UTF-8"))?;
+    let expected_bytes =
+        DEFAULT_STANDBY_WALLPAPER_WIDTH as usize * DEFAULT_STANDBY_WALLPAPER_HEIGHT as usize * 2;
+    let output = Command::new("ffmpeg")
+        .args([
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            path_text,
+            "-frames:v",
+            "1",
+            "-vf",
+            &vf,
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb565le",
+            "pipe:1",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(io_other)?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(ffmpeg_stream_error(output.status, &stderr));
+    }
+    if output.stdout.len() != expected_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "ffmpeg wallpaper output has {} bytes, expected {}",
+                output.stdout.len(),
+                expected_bytes
+            ),
+        ));
+    }
+    Ok(output.stdout)
+}
+
 fn spawn_ffmpeg_pcm_stream(url: &str) -> io::Result<Child> {
     Command::new("ffmpeg")
         .args([
@@ -3219,8 +3311,8 @@ fn path_looks_like_claude_transcript(path: &str) -> bool {
 }
 
 fn event_turn_id(payload: &Value, source: Option<&str>) -> Option<String> {
-    event_text_field(payload, &["turn_id", "turnId", "turn-id"])
-        .or_else(|| derived_claude_turn_id(payload, source))
+    derived_claude_turn_id(payload, source)
+        .or_else(|| event_text_field(payload, &["turn_id", "turnId", "turn-id"]))
 }
 
 fn derived_claude_turn_id(payload: &Value, source: Option<&str>) -> Option<String> {
@@ -3240,7 +3332,11 @@ fn derived_claude_turn_id(payload: &Value, source: Option<&str>) -> Option<Strin
 }
 
 fn normalize_path_for_identity(path: &str) -> String {
-    path.replace('/', "\\").to_ascii_lowercase()
+    let normalized = path.replace('/', "\\");
+    normalized
+        .strip_prefix("\\\\?\\")
+        .unwrap_or(&normalized)
+        .to_ascii_lowercase()
 }
 
 fn stable_text_hash(text: &str) -> u64 {
@@ -3363,11 +3459,15 @@ fn terminal_turn_for_event(codex_home: &Path, event: &TaskEvent) -> Option<Termi
     terminal_turn_in_file(&session_file, turn_id).ok().flatten()
 }
 
-fn active_task_is_stale_against_session_log(codex_home: &Path, event: &TaskEvent) -> bool {
-    if done_source(event) != DoneSource::Codex {
-        return false;
+fn active_task_is_stale_against_logs(codex_home: &Path, event: &TaskEvent) -> bool {
+    match done_source(event) {
+        DoneSource::Codex => active_task_is_stale_against_session_log(codex_home, event),
+        DoneSource::Claude => active_task_is_stale_against_claude_transcript(codex_home, event),
+        DoneSource::Other => false,
     }
+}
 
+fn active_task_is_stale_against_session_log(codex_home: &Path, event: &TaskEvent) -> bool {
     let Some(session_id) = event.session_id.as_deref() else {
         return false;
     };
@@ -3379,6 +3479,13 @@ fn active_task_is_stale_against_session_log(codex_home: &Path, event: &TaskEvent
         return timestamp_is_older_than(&event.received_at, ACTIVE_SESSION_FILE_MISSING_GRACE);
     };
 
+    if turn_is_terminal_in_session_file(&session_file, turn_id)
+        .ok()
+        .unwrap_or(false)
+    {
+        return true;
+    }
+
     if active_task_has_newer_turn_in_session_file(&session_file, event)
         .ok()
         .unwrap_or(false)
@@ -3386,14 +3493,417 @@ fn active_task_is_stale_against_session_log(codex_home: &Path, event: &TaskEvent
         return true;
     }
 
-    match active_task_in_session_file(&session_file, session_id) {
-        Ok(Some(active)) => {
-            active.turn_id.as_deref() != Some(turn_id)
+    match active_tasks_in_session_file(&session_file, session_id) {
+        Ok(active_tasks) => {
+            let session_idle_stale = session_file_last_timestamp(&session_file)
+                .ok()
+                .flatten()
+                .is_some_and(|timestamp| {
+                    timestamp_is_older_than(&timestamp, ACTIVE_SESSION_IDLE_STALE_GRACE)
+                        && timestamp_is_older_than(
+                            &event.received_at,
+                            ACTIVE_SESSION_IDLE_STALE_GRACE,
+                        )
+                });
+
+            if active_tasks
+                .iter()
+                .any(|active| active.turn_id.as_deref() == Some(turn_id))
+            {
+                return session_idle_stale;
+            }
+
+            let same_cwd_newer_active = event.cwd.as_deref().and_then(|cwd| {
+                active_tasks
+                    .iter()
+                    .filter(|active| active.cwd.as_deref() == Some(cwd))
+                    .filter_map(|active| active.turn_id.as_deref())
+                    .find(|candidate_turn_id| *candidate_turn_id != turn_id)
+            });
+            if same_cwd_newer_active.is_some() {
+                return true;
+            }
+
+            if session_idle_stale {
+                return true;
+            }
+
+            active_tasks.is_empty()
                 && timestamp_is_older_than(&event.received_at, ACTIVE_SESSION_FILE_MISSING_GRACE)
         }
-        Ok(None) => timestamp_is_older_than(&event.received_at, ACTIVE_SESSION_FILE_MISSING_GRACE),
         Err(_) => false,
     }
+}
+
+fn active_task_is_stale_against_claude_transcript(codex_home: &Path, event: &TaskEvent) -> bool {
+    let Some(session_id) = event.session_id.as_deref() else {
+        return false;
+    };
+
+    let Some(transcript_file) = find_claude_transcript_file(codex_home, session_id) else {
+        return timestamp_is_older_than(&event.received_at, ACTIVE_SESSION_FILE_MISSING_GRACE);
+    };
+
+    let Ok(status) = claude_transcript_status(&transcript_file) else {
+        return false;
+    };
+
+    if status
+        .last_stop_hook_summary_timestamp
+        .as_deref()
+        .is_some_and(|timestamp| !timestamp_is_before(timestamp, &event.received_at))
+    {
+        return true;
+    }
+
+    status.last_timestamp.as_deref().is_some_and(|timestamp| {
+        timestamp_is_older_than(timestamp, ACTIVE_SESSION_IDLE_STALE_GRACE)
+            && timestamp_is_older_than(&event.received_at, ACTIVE_SESSION_IDLE_STALE_GRACE)
+    })
+}
+
+fn standby_wallpaper_info(
+    config: &BridgeConfig,
+    peer: Option<SocketAddr>,
+) -> Option<StandbyWallpaperInfo> {
+    let resolved = resolve_standby_wallpaper(config).ok()?;
+    Some(standby_wallpaper_response(config, peer, &resolved))
+}
+
+fn standby_wallpaper_response(
+    config: &BridgeConfig,
+    peer: Option<SocketAddr>,
+    wallpaper: &ResolvedStandbyWallpaper,
+) -> StandbyWallpaperInfo {
+    StandbyWallpaperInfo {
+        mode: wallpaper.mode.to_string(),
+        id: wallpaper.id.clone(),
+        name: wallpaper.name.clone(),
+        index: wallpaper.index,
+        total: wallpaper.total,
+        width: DEFAULT_STANDBY_WALLPAPER_WIDTH,
+        height: DEFAULT_STANDBY_WALLPAPER_HEIGHT,
+        url: standby_wallpaper_url(config, peer, wallpaper),
+        selected_at: now_local(),
+    }
+}
+
+fn handle_standby_wallpaper(
+    stream: &mut TcpStream,
+    peer: Option<SocketAddr>,
+    request: &HttpRequest,
+    config: &BridgeConfig,
+) -> io::Result<()> {
+    if !music_get_allowed(peer) {
+        return write_json(stream, 403, &json!({"ok": false, "error": "forbidden"}));
+    }
+
+    let requested_id = request
+        .raw_path
+        .split_once('?')
+        .map(|(_, query)| parse_query_params(query))
+        .and_then(|query| query.get("id").cloned())
+        .filter(|value| !value.trim().is_empty());
+
+    let wallpaper = match resolve_standby_wallpaper_by_id(config, requested_id.as_deref()) {
+        Ok(wallpaper) => wallpaper,
+        Err(error) => {
+            eprintln!("standby wallpaper resolve failed: {error}");
+            return write_json(
+                stream,
+                map_music_status(&error),
+                &json!({"ok": false, "error": error.to_string()}),
+            );
+        }
+    };
+
+    match render_standby_wallpaper_rgb565(&wallpaper.path) {
+        Ok(bitmap) => {
+            let headers = [
+                ("X-Ornament-Wallpaper-Id", sanitize_header_value(&wallpaper.id)),
+                (
+                    "X-Ornament-Wallpaper-Name",
+                    sanitize_header_value(&wallpaper.name),
+                ),
+                (
+                    "X-Ornament-Wallpaper-Mode",
+                    wallpaper.mode.to_string(),
+                ),
+                ("X-Ornament-Wallpaper-Index", wallpaper.index.to_string()),
+                ("X-Ornament-Wallpaper-Total", wallpaper.total.to_string()),
+                (
+                    "X-Ornament-Wallpaper-Width",
+                    DEFAULT_STANDBY_WALLPAPER_WIDTH.to_string(),
+                ),
+                (
+                    "X-Ornament-Wallpaper-Height",
+                    DEFAULT_STANDBY_WALLPAPER_HEIGHT.to_string(),
+                ),
+            ];
+            write_response_with_headers(
+                stream,
+                200,
+                "application/octet-stream",
+                &headers,
+                &bitmap,
+            )
+        }
+        Err(error) => {
+            eprintln!("standby wallpaper render failed: {error}");
+            write_json(
+                stream,
+                map_music_status(&error),
+                &json!({"ok": false, "error": error.to_string()}),
+            )
+        }
+    }
+}
+
+fn resolve_standby_wallpaper(config: &BridgeConfig) -> io::Result<ResolvedStandbyWallpaper> {
+    let entries = standby_wallpaper_entries(&config.standby_wallpaper_dir)?;
+    if entries.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "no jpg wallpapers found in {}",
+                config.standby_wallpaper_dir.display()
+            ),
+        ));
+    }
+
+    let total = entries.len();
+    if let Some(fixed) = config
+        .standby_wallpaper_fixed
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        if let Some((index, path)) = entries
+            .iter()
+            .enumerate()
+            .find(|(_, path)| standby_wallpaper_matches(path, fixed))
+        {
+            return Ok(ResolvedStandbyWallpaper {
+                mode: "fixed",
+                id: standby_wallpaper_id(path),
+                name: standby_wallpaper_name(path),
+                path: path.clone(),
+                index,
+                total,
+            });
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "fixed wallpaper '{}' not found in {}",
+                fixed,
+                config.standby_wallpaper_dir.display()
+            ),
+        ));
+    }
+
+    let today = Local::now().date_naive();
+    let epoch = NaiveDate::from_ymd_opt(1970, 1, 1)
+        .ok_or_else(|| io::Error::other("failed to construct wallpaper epoch date"))?;
+    let day_index = today.signed_duration_since(epoch).num_days().rem_euclid(total as i64) as usize;
+    let path = entries
+        .get(day_index)
+        .cloned()
+        .ok_or_else(|| io::Error::other("wallpaper day index out of range"))?;
+
+    Ok(ResolvedStandbyWallpaper {
+        mode: "daily",
+        id: standby_wallpaper_id(&path),
+        name: standby_wallpaper_name(&path),
+        path,
+        index: day_index,
+        total,
+    })
+}
+
+fn resolve_standby_wallpaper_by_id(
+    config: &BridgeConfig,
+    requested_id: Option<&str>,
+) -> io::Result<ResolvedStandbyWallpaper> {
+    if requested_id.is_none() {
+        return resolve_standby_wallpaper(config);
+    }
+
+    let entries = standby_wallpaper_entries(&config.standby_wallpaper_dir)?;
+    if entries.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "no jpg wallpapers found in {}",
+                config.standby_wallpaper_dir.display()
+            ),
+        ));
+    }
+
+    let total = entries.len();
+    let requested_id = requested_id.unwrap_or_default();
+    let (index, path) = entries
+        .iter()
+        .enumerate()
+        .find(|(_, path)| standby_wallpaper_id(path).eq_ignore_ascii_case(requested_id))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "wallpaper id '{}' not found in {}",
+                    requested_id,
+                    config.standby_wallpaper_dir.display()
+                ),
+            )
+        })?;
+
+    Ok(ResolvedStandbyWallpaper {
+        mode: "requested",
+        id: standby_wallpaper_id(path),
+        name: standby_wallpaper_name(path),
+        path: path.clone(),
+        index,
+        total,
+    })
+}
+
+fn standby_wallpaper_entries(dir: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut entries = fs::read_dir(dir)?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .map(|ext| matches!(ext.to_ascii_lowercase().as_str(), "jpg" | "jpeg"))
+                    .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+
+    entries.sort_by_cached_key(|path| {
+        path.file_name()
+            .map(|name| name.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default()
+    });
+    Ok(entries)
+}
+
+fn standby_wallpaper_matches(path: &Path, fixed: &str) -> bool {
+    let fixed = fixed.trim();
+    !fixed.is_empty()
+        && (path
+            .file_name()
+            .map(|name| name.to_string_lossy().eq_ignore_ascii_case(fixed))
+            .unwrap_or(false)
+            || standby_wallpaper_id(path).eq_ignore_ascii_case(fixed))
+}
+
+fn standby_wallpaper_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+fn standby_wallpaper_id(path: &Path) -> String {
+    let stem = path
+        .file_stem()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| standby_wallpaper_name(path));
+    sanitize_wallpaper_token(&stem)
+}
+
+fn sanitize_wallpaper_token(value: &str) -> String {
+    let mut token = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            token.push(ch.to_ascii_lowercase());
+        } else if matches!(ch, '-' | '_' | '.') {
+            token.push(ch);
+        }
+    }
+    if token.is_empty() {
+        "wallpaper".to_string()
+    } else {
+        token
+    }
+}
+
+fn standby_wallpaper_url(
+    config: &BridgeConfig,
+    peer: Option<SocketAddr>,
+    wallpaper: &ResolvedStandbyWallpaper,
+) -> String {
+    let base = music_public_base_url(config, peer);
+    format!(
+        "{}/v1/standby-wallpaper?id={}",
+        base.trim_end_matches('/'),
+        form_urlencode(&wallpaper.id)
+    )
+}
+
+fn find_claude_transcript_file(codex_home: &Path, session_id: &str) -> Option<PathBuf> {
+    let home_dir = codex_home.parent()?;
+    let claude_projects = home_dir.join(".claude").join("projects");
+    find_file_name_containing(&claude_projects, session_id)
+}
+
+fn turn_is_terminal_in_session_file(path: &Path, turn_id: &str) -> io::Result<bool> {
+    Ok(terminal_turn_in_file(path, turn_id)?.is_some())
+}
+
+#[derive(Default)]
+struct ClaudeTranscriptStatus {
+    last_stop_hook_summary_timestamp: Option<String>,
+    last_timestamp: Option<String>,
+}
+
+fn claude_transcript_status(path: &Path) -> io::Result<ClaudeTranscriptStatus> {
+    let file = open_shared_tail_read(path, SESSION_TASK_SCAN_TAIL_BYTES)?;
+    let reader = BufReader::new(file);
+    let mut status = ClaudeTranscriptStatus::default();
+
+    for line in reader.lines() {
+        let line = line?;
+        let Ok(record) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+
+        status.last_timestamp = record
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or(status.last_timestamp);
+
+        if record.get("type").and_then(Value::as_str) == Some("system")
+            && record.get("subtype").and_then(Value::as_str) == Some("stop_hook_summary")
+        {
+            status.last_stop_hook_summary_timestamp = record
+                .get("timestamp")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or(status.last_stop_hook_summary_timestamp);
+        }
+    }
+
+    Ok(status)
+}
+
+fn session_file_last_timestamp(path: &Path) -> io::Result<Option<String>> {
+    let file = open_shared_tail_read(path, SESSION_TASK_SCAN_TAIL_BYTES)?;
+    let reader = BufReader::new(file);
+    let mut last_timestamp = None;
+
+    for line in reader.lines() {
+        let line = line?;
+        let Ok(record) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if let Some(timestamp) = record.get("timestamp").and_then(Value::as_str) {
+            last_timestamp = Some(timestamp.to_string());
+        }
+    }
+
+    Ok(last_timestamp)
 }
 
 fn find_session_file(codex_home: &Path, session_id: &str) -> Option<PathBuf> {
@@ -3419,10 +3929,12 @@ fn active_tasks_in_recent_session_files(codex_home: &Path) -> Vec<TaskEvent> {
             let has_newer_turn = active_task_has_newer_turn_in_session_file(&path, &active)
                 .ok()
                 .unwrap_or(false);
-            (!has_newer_turn).then_some(active)
-        })
-        .filter(|active| {
-            timestamp_is_recent(&active.received_at, RECOVER_UNSCOPED_ACTIVE_TASK_WINDOW)
+            if has_newer_turn
+                || !timestamp_is_recent(&active.received_at, RECOVER_UNSCOPED_ACTIVE_TASK_WINDOW)
+            {
+                return None;
+            }
+            Some(active)
         })
         .collect()
 }
@@ -4917,6 +5429,8 @@ mod tests {
             qweather_host: None,
             qweather_token: None,
             caiyun_token: None,
+            standby_wallpaper_dir: PathBuf::from(DEFAULT_STANDBY_WALLPAPER_DIR),
+            standby_wallpaper_fixed: None,
         }
     }
 
@@ -4939,6 +5453,8 @@ mod tests {
             qweather_host: None,
             qweather_token: None,
             caiyun_token: None,
+            standby_wallpaper_dir: PathBuf::from(DEFAULT_STANDBY_WALLPAPER_DIR),
+            standby_wallpaper_fixed: None,
         }
     }
 
@@ -6232,6 +6748,33 @@ mod tests {
                 .as_ref()
                 .and_then(|event| event.turn_id.as_deref()),
             Some(derived_turn_id.as_str())
+        );
+    }
+
+    #[test]
+    fn claude_transcript_identity_overrides_mismatched_raw_turn_id() {
+        let start = normalize_event(&json!({
+            "hook_event_name": "UserPromptSubmit",
+            "source": "Claude",
+            "session_id": "claude-session",
+            "transcript_path": "C:\\Users\\86147\\.claude\\projects\\demo\\session.jsonl",
+            "turn_id": "raw-running-turn"
+        }));
+        let stop = normalize_event(&json!({
+            "hook_event_name": "Stop",
+            "source": "Claude",
+            "session_id": "claude-session",
+            "transcript_path": "\\\\?\\C:\\Users\\86147\\.claude\\projects\\demo\\session.jsonl",
+            "turn_id": "raw-stop-turn"
+        }));
+
+        assert_eq!(start.turn_id, stop.turn_id);
+        assert!(
+            start
+                .turn_id
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("claude-transcript-")
         );
     }
 
@@ -8056,9 +8599,24 @@ mod tests {
         fs::create_dir_all(&session_dir).unwrap();
         fs::write(
             session_dir.join("rollout-2026-05-25T13-36-13-session-1.jsonl"),
-            concat!(
-                "{\"timestamp\":\"2026-05-25T12:00:00+08:00\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"turn-1\"}}\n",
-                "{\"timestamp\":\"2026-05-25T12:00:01+08:00\",\"payload\":{\"type\":\"turn_context\",\"turn_id\":\"turn-1\",\"cwd\":\"D:\\\\Desktop\\\\codex\",\"model\":\"gpt-5.5\"}}\n"
+            format!(
+                "{}\n{}\n",
+                json!({
+                    "timestamp": recent_timestamp(2),
+                    "payload": {
+                        "type": "task_started",
+                        "turn_id": "turn-1"
+                    }
+                }),
+                json!({
+                    "timestamp": recent_timestamp(1),
+                    "payload": {
+                        "type": "turn_context",
+                        "turn_id": "turn-1",
+                        "cwd": "D:\\Desktop\\codex",
+                        "model": "gpt-5.5"
+                    }
+                })
             ),
         )
         .unwrap();
@@ -8131,6 +8689,294 @@ mod tests {
         assert_eq!(task.turn_id.as_deref(), Some("turn-1"));
         assert_eq!(task.cwd.as_deref(), Some("D:\\Desktop\\codex"));
         assert_eq!(task.model.as_deref(), Some("gpt-5.5"));
+    }
+
+    #[test]
+    fn recovers_multiple_recent_turns_without_tracked_session() {
+        let codex_home = env::temp_dir().join(format!(
+            "codex-ornament-recover-multi-recent-{}",
+            std::process::id()
+        ));
+        let older_dir = codex_home
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("30");
+        let newer_dir = codex_home
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("31");
+        fs::create_dir_all(&older_dir).unwrap();
+        fs::create_dir_all(&newer_dir).unwrap();
+
+        let older_session_id = "11111111-1111-1111-1111-111111111111";
+        let newer_session_id = "22222222-2222-2222-2222-222222222222";
+        let older_path =
+            older_dir.join(format!("rollout-2026-05-30T11-43-03-{older_session_id}.jsonl"));
+        let newer_path =
+            newer_dir.join(format!("rollout-2026-05-31T11-43-03-{newer_session_id}.jsonl"));
+        fs::write(
+            &older_path,
+            format!(
+                "{}\n{}\n",
+                json!({
+                    "timestamp": recent_timestamp(4),
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "task_started",
+                        "turn_id": "turn-old"
+                    }
+                }),
+                json!({
+                    "timestamp": recent_timestamp(4),
+                    "type": "turn_context",
+                    "payload": {
+                        "turn_id": "turn-old",
+                        "cwd": "D:\\Desktop\\codex\\old",
+                        "model": "gpt-5.5"
+                    }
+                })
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &newer_path,
+            format!(
+                "{}\n{}\n",
+                json!({
+                    "timestamp": recent_timestamp(1),
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "task_started",
+                        "turn_id": "turn-new"
+                    }
+                }),
+                json!({
+                    "timestamp": recent_timestamp(1),
+                    "type": "turn_context",
+                    "payload": {
+                        "turn_id": "turn-new",
+                        "cwd": "D:\\Desktop\\codex\\new",
+                        "model": "gpt-5.5"
+                    }
+                })
+            ),
+        )
+        .unwrap();
+
+        let active = active_tasks_in_recent_session_files(&codex_home);
+        let _ = fs::remove_dir_all(&codex_home);
+
+        let recovered: HashSet<(Option<String>, Option<String>)> = active
+            .into_iter()
+            .map(|event| (event.session_id, event.turn_id))
+            .collect();
+
+        assert_eq!(recovered.len(), 2, "{recovered:?}");
+        assert!(recovered.contains(&(
+            Some(older_session_id.to_string()),
+            Some("turn-old".to_string())
+        )));
+        assert!(recovered.contains(&(
+            Some(newer_session_id.to_string()),
+            Some("turn-new".to_string())
+        )));
+    }
+
+    #[test]
+    fn snapshot_drops_claude_task_after_stop_hook_summary() {
+        let codex_home = env::temp_dir().join(format!(
+            "codex-ornament-claude-stop-hook-{}",
+            std::process::id()
+        ));
+        let claude_dir = codex_home
+            .parent()
+            .unwrap()
+            .join(".claude")
+            .join("projects")
+            .join("D--Desktop");
+        fs::create_dir_all(&claude_dir).unwrap();
+
+        let session_id = "claude-session-1";
+        let running_at = recent_timestamp(3);
+        let stopped_at = recent_timestamp(2);
+        fs::write(
+            claude_dir.join(format!("{session_id}.jsonl")),
+            format!(
+                "{}\n{}\n",
+                json!({
+                    "timestamp": running_at,
+                    "type": "assistant",
+                    "message": { "role": "assistant" }
+                }),
+                json!({
+                    "timestamp": stopped_at,
+                    "type": "system",
+                    "subtype": "stop_hook_summary"
+                })
+            ),
+        )
+        .unwrap();
+
+        let state = Arc::new(Mutex::new(BridgeState::default()));
+        {
+            let mut state = state.lock().unwrap();
+            let mut event = normalize_event(&json!({
+                "hook_event_name": "UserPromptSubmit",
+                "source": "claude",
+                "session_id": session_id,
+                "transcript_path": format!("C:\\Users\\tester\\.claude\\projects\\D--Desktop\\{session_id}.jsonl"),
+            }));
+            event.received_at = running_at;
+            apply_task_event(&mut state, event);
+        }
+
+        let mut config = test_config(None);
+        config.codex_home = codex_home.clone();
+        let snapshot = task_snapshot(&state, &config);
+        let _ = fs::remove_dir_all(codex_home.parent().unwrap().join(".claude"));
+        let _ = fs::remove_dir_all(&codex_home);
+
+        assert_eq!(snapshot.active_task_count, 0);
+        assert_eq!(snapshot.status, "done");
+    }
+
+    #[test]
+    fn snapshot_keeps_claude_task_when_stop_hook_summary_is_older_than_running_event() {
+        let codex_home = env::temp_dir().join(format!(
+            "codex-ornament-claude-resume-after-stop-{}",
+            std::process::id()
+        ));
+        let claude_dir = codex_home
+            .parent()
+            .unwrap()
+            .join(".claude")
+            .join("projects")
+            .join("D--Desktop");
+        fs::create_dir_all(&claude_dir).unwrap();
+
+        let session_id = "claude-session-resumed";
+        let initial_reply_at = recent_timestamp(4);
+        let stopped_at = recent_timestamp(3);
+        let resumed_at = recent_timestamp(1);
+        fs::write(
+            claude_dir.join(format!("{session_id}.jsonl")),
+            format!(
+                "{}\n{}\n{}\n{}\n",
+                json!({
+                    "timestamp": initial_reply_at,
+                    "type": "assistant",
+                    "message": { "role": "assistant" }
+                }),
+                json!({
+                    "timestamp": stopped_at,
+                    "type": "system",
+                    "subtype": "stop_hook_summary"
+                }),
+                json!({
+                    "timestamp": resumed_at,
+                    "type": "system",
+                    "subtype": "local_command",
+                    "content": "<command-name>/resume</command-name>"
+                }),
+                json!({
+                    "timestamp": resumed_at,
+                    "type": "user",
+                    "message": { "role": "user", "content": "resume" }
+                })
+            ),
+        )
+        .unwrap();
+
+        let state = Arc::new(Mutex::new(BridgeState::default()));
+        {
+            let mut state = state.lock().unwrap();
+            let mut event = normalize_event(&json!({
+                "hook_event_name": "UserPromptSubmit",
+                "source": "claude",
+                "session_id": session_id,
+                "transcript_path": format!("C:\\Users\\tester\\.claude\\projects\\D--Desktop\\{session_id}.jsonl"),
+            }));
+            event.received_at = resumed_at;
+            apply_task_event(&mut state, event);
+        }
+
+        let mut config = test_config(None);
+        config.codex_home = codex_home.clone();
+        let snapshot = task_snapshot(&state, &config);
+        let _ = fs::remove_dir_all(codex_home.parent().unwrap().join(".claude"));
+        let _ = fs::remove_dir_all(&codex_home);
+
+        assert_eq!(snapshot.active_task_count, 1);
+        assert_eq!(snapshot.status, "running");
+        assert_eq!(snapshot.source_tasks.claude.active_count, 1);
+        assert_eq!(snapshot.source_tasks.claude.status, "running");
+    }
+
+    #[test]
+    fn snapshot_drops_idle_codex_started_only_turn() {
+        let codex_home = env::temp_dir().join(format!(
+            "codex-ornament-idle-started-only-{}",
+            std::process::id()
+        ));
+        let session_dir = codex_home
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("31");
+        fs::create_dir_all(&session_dir).unwrap();
+
+        let old_timestamp = past_timestamp((ACTIVE_SESSION_IDLE_STALE_GRACE.as_secs() as i64) + 60);
+        fs::write(
+            session_dir.join("rollout-2026-05-31T16-59-09-session-1.jsonl"),
+            format!(
+                "{}\n{}\n",
+                json!({
+                    "timestamp": old_timestamp,
+                    "payload": {
+                        "type": "task_started",
+                        "turn_id": "turn-1"
+                    }
+                }),
+                json!({
+                    "timestamp": old_timestamp,
+                    "payload": {
+                        "type": "turn_context",
+                        "turn_id": "turn-1",
+                        "cwd": "D:\\Desktop\\codex\\firmware",
+                        "model": "gpt-5.5"
+                    }
+                })
+            ),
+        )
+        .unwrap();
+
+        let state = Arc::new(Mutex::new(BridgeState::default()));
+        {
+            let mut state = state.lock().unwrap();
+            apply_task_event(
+                &mut state,
+                TaskEvent {
+                    kind: "UserPromptSubmit".to_string(),
+                    status: "running".to_string(),
+                    title: "Codex running".to_string(),
+                    message: "Codex running".to_string(),
+                    received_at: old_timestamp.clone(),
+                    source: None,
+                    session_id: Some("session-1".to_string()),
+                    turn_id: Some("turn-1".to_string()),
+                    cwd: Some("D:\\Desktop\\codex\\firmware".to_string()),
+                    model: Some("gpt-5.5".to_string()),
+                },
+            );
+        }
+
+        let snapshot = task_snapshot(&state, &scoped_test_config("session-1", &codex_home));
+        let _ = fs::remove_dir_all(&codex_home);
+
+        assert_eq!(snapshot.active_task_count, 0);
+        assert_eq!(snapshot.status, "done");
     }
 
     #[test]
