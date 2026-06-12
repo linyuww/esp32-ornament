@@ -39,6 +39,7 @@ const MUSIC_COVER_SIZE: u32 = 96;
 const MUSIC_COVER_BYTES: usize = MUSIC_COVER_SIZE as usize * MUSIC_COVER_SIZE as usize * 2;
 const YAOHUD_RESOLVE_ATTEMPTS: usize = 3;
 const YAOHUD_RESOLVE_RETRY_DELAY: Duration = Duration::from_millis(300);
+const YAOHUD_MUSIC_TYPE: &str = "wy";
 const MUSIC_STREAM_FALLBACK_ATTEMPTS: u32 = 6;
 const XIAOZHI_PCM_CHUNK_BYTES: usize = 3200;
 const XIAOZHI_UPLINK_BUFFER_MAX_BYTES: usize = 16000 * 2 * 5;
@@ -53,6 +54,7 @@ const CAIYUN_NIGHT_REFRESH_SECONDS: u64 = 30 * 60;
 const CAIYUN_NIGHT_CALL_BUDGET: u32 = (CAIYUN_NIGHT_SECONDS / CAIYUN_NIGHT_REFRESH_SECONDS) as u32;
 const CAIYUN_DAY_CALL_BUDGET: u32 = CAIYUN_DAILY_CALL_BUDGET - CAIYUN_NIGHT_CALL_BUDGET;
 const CAIYUN_NIGHT_REFRESH_INTERVAL: Duration = Duration::from_secs(CAIYUN_NIGHT_REFRESH_SECONDS);
+const CAIYUN_RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(30 * 60);
 const WEATHER_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 const ACTIVE_RECOVERY_SCAN_TTL: Duration = Duration::from_secs(5);
 const DEFAULT_WEATHER_LATITUDE: f64 = 39.99540087499999;
@@ -62,10 +64,10 @@ const DEFAULT_WEATHER_PROVIDER: WeatherProvider = WeatherProvider::Auto;
 const DEFAULT_STANDBY_WALLPAPER_DIR: &str = r"D:\AssaultLilyViewer_v0.5";
 const DEFAULT_STANDBY_WALLPAPER_WIDTH: u32 = 240;
 const DEFAULT_STANDBY_WALLPAPER_HEIGHT: u32 = 240;
-const DEFAULT_STANDBY_WALLPAPER_MAX_DIMENSION: u32 = 512;
 const RECONCILED_DONE_NOTIFY_WINDOW: Duration = Duration::from_secs(120);
 const COMBINED_DONE_SOURCE_WINDOW: Duration = Duration::from_secs(5);
 const RECOVER_UNSCOPED_ACTIVE_TASK_WINDOW: Duration = Duration::from_secs(10 * 60);
+const ACTIVE_SESSION_UNCONFIRMED_STALE_GRACE: Duration = Duration::from_secs(10 * 60);
 const RECOVER_ACTIVE_SESSION_SCAN_LIMIT: usize = 24;
 const SESSION_TASK_SCAN_TAIL_BYTES: u64 = 2 * 1024 * 1024;
 const ACTIVE_SESSION_FILE_MISSING_GRACE: Duration = Duration::from_secs(30);
@@ -93,6 +95,7 @@ struct BridgeState {
     weather: Option<CachedWeather>,
     weather_refreshing: bool,
     weather_last_attempt: Option<Instant>,
+    weather_caiyun_backoff_until: Option<Instant>,
     active_recovery: Option<CachedActiveRecovery>,
     music_resolves: HashMap<String, CachedMusicResolve>,
     xiaozhi: XiaozhiProxySession,
@@ -576,6 +579,14 @@ struct YaohudMusicResponse {
 #[derive(Debug, Default, Deserialize)]
 struct YaohudMusicData {
     #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    mid: Option<String>,
+    #[serde(default)]
+    songmid: Option<String>,
+    #[serde(default)]
+    hash: Option<String>,
+    #[serde(default)]
     name: Option<String>,
     #[serde(default)]
     songname: Option<String>,
@@ -595,6 +606,18 @@ struct YaohudMusicData {
     picture: Option<String>,
     #[serde(default)]
     pic: Option<String>,
+    #[serde(default)]
+    cover: Option<String>,
+    #[serde(default)]
+    img: Option<String>,
+    #[serde(default)]
+    image: Option<String>,
+    #[serde(default)]
+    picurl: Option<String>,
+    #[serde(default)]
+    pic_url: Option<String>,
+    #[serde(default)]
+    album_pic: Option<String>,
     #[serde(default)]
     musicurl: Option<String>,
     #[serde(default)]
@@ -888,6 +911,17 @@ fn handle_connection(
                     &json!({"ok": false, "error": "task consumer unavailable", "event": event}),
                 ),
             }
+        }
+        ("POST", "/restart") => {
+            if !private_post_allowed(peer, &request, &config) {
+                return write_json(
+                    &mut stream,
+                    403,
+                    &json!({"ok": false, "error": "forbidden"}),
+                );
+            }
+            schedule_bridge_restart();
+            write_json(&mut stream, 202, &json!({"ok": true, "restarting": true}))
         }
         _ => write_json(
             &mut stream,
@@ -1773,6 +1807,7 @@ fn event_has_task_identity(event: &TaskEvent) -> bool {
 
 fn active_task_key_for_start(state: &mut BridgeState, event: &TaskEvent) -> String {
     if event.turn_id.is_some() {
+        remove_active_tasks_for_same_session(state, event);
         remove_active_tasks_for_same_turn(state, event);
         if let Some(key) = stable_task_key(event) {
             return key;
@@ -1827,6 +1862,32 @@ fn remove_active_tasks_for_same_turn(state: &mut BridgeState, event: &TaskEvent)
             state.active_tasks.get(key).and_then(|active| {
                 (active.turn_id.as_deref() == Some(turn_id) && task_sources_match(active, event))
                     .then(|| key.clone())
+            })
+        })
+        .collect::<Vec<_>>();
+    let count = keys.len();
+    for key in keys {
+        remove_active_task(state, &key);
+    }
+    count
+}
+
+fn remove_active_tasks_for_same_session(state: &mut BridgeState, event: &TaskEvent) -> usize {
+    let Some(session_id) = event.session_id.as_deref() else {
+        return 0;
+    };
+    if event.turn_id.is_none() {
+        return 0;
+    }
+
+    let keys = state
+        .active_order
+        .iter()
+        .filter_map(|key| {
+            state.active_tasks.get(key).and_then(|active| {
+                (active.session_id.as_deref() == Some(session_id)
+                    && task_sources_match(active, event))
+                .then(|| key.clone())
             })
         })
         .collect::<Vec<_>>();
@@ -2513,6 +2574,16 @@ fn post_allowed(peer: Option<SocketAddr>, request: &HttpRequest, config: &Bridge
         .unwrap_or(false)
 }
 
+fn private_post_allowed(
+    peer: Option<SocketAddr>,
+    request: &HttpRequest,
+    config: &BridgeConfig,
+) -> bool {
+    peer.map(|addr| private_get_allowed(addr.ip()))
+        .unwrap_or(false)
+        || post_allowed(peer, request, config)
+}
+
 fn music_get_allowed(peer: Option<SocketAddr>) -> bool {
     peer.map(|addr| private_get_allowed(addr.ip()))
         .unwrap_or(false)
@@ -2530,6 +2601,55 @@ fn is_loopback(ip: IpAddr) -> bool {
         IpAddr::V4(ip) => ip.is_loopback(),
         IpAddr::V6(ip) => ip.is_loopback(),
     }
+}
+
+fn schedule_bridge_restart() {
+    std::thread::spawn(|| {
+        std::thread::sleep(Duration::from_millis(150));
+        if let Err(error) = restart_bridge_process() {
+            eprintln!("bridge restart failed: {error}");
+        }
+    });
+}
+
+fn find_bridge_restart_root(exe: &Path) -> Option<PathBuf> {
+    exe.ancestors().skip(1).find_map(|candidate| {
+        let script = candidate
+            .join("scripts")
+            .join("start-codex-ornament-bridge.ps1");
+        script.is_file().then(|| candidate.to_path_buf())
+    })
+}
+
+fn restart_bridge_process() -> io::Result<()> {
+    let exe = env::current_exe()?;
+    let Some(root) = find_bridge_restart_root(&exe) else {
+        return Err(io::Error::other(format!(
+            "cannot determine repository root from {}",
+            exe.display()
+        )));
+    };
+    let script = root.join("scripts").join("start-codex-ornament-bridge.ps1");
+    if !script.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("restart script not found: {}", script.display()),
+        ));
+    }
+
+    Command::new("powershell.exe")
+        .arg("-NoProfile")
+        .arg("-ExecutionPolicy")
+        .arg("Bypass")
+        .arg("-File")
+        .arg(script)
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+
+    std::process::exit(0);
 }
 
 fn handle_music_resolve(
@@ -3258,8 +3378,6 @@ fn resolve_ready_music_stream(
                         candidate_request.index, request.song
                     );
                     cache_music_resolve(state, request, &resolved);
-                } else if candidate_request != *request {
-                    cache_music_resolve(state, request, &resolved);
                 }
                 return Ok((candidate_request, resolved, pcm_stream));
             }
@@ -3532,7 +3650,8 @@ fn resolve_song_yaohud(config: &BridgeConfig, request: &MusicRequest) -> io::Res
         _ => request.song.clone(),
     };
     let url = format!(
-        "https://api.yaohud.cn/api/music/wy?key={}&msg={}&n={}",
+        "https://api.yaohud.cn/api/music/{}?key={}&msg={}&n={}",
+        YAOHUD_MUSIC_TYPE,
         form_urlencode(key),
         form_urlencode(&query),
         request.index
@@ -3557,17 +3676,6 @@ fn resolve_song_yaohud(config: &BridgeConfig, request: &MusicRequest) -> io::Res
         ));
     }
 
-    let url = data
-        .url
-        .or(data.musicurl)
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Yaohud response missing playable url",
-            )
-        })?;
-
     let title = first_nonempty(&[
         data.name.as_deref(),
         data.title.as_deref(),
@@ -3585,10 +3693,27 @@ fn resolve_song_yaohud(config: &BridgeConfig, request: &MusicRequest) -> io::Res
     ])
     .unwrap_or("")
     .to_string();
-    let album = data.album.unwrap_or_default();
-    let picture = data.picture.or(data.pic).unwrap_or_default();
-    let lyrics = normalize_lyrics(&client, data.lrctxt.or(data.lyrics).or(data.lrc))
+    let album = data.album.clone().unwrap_or_default();
+    let mid = yaohud_music_mid(&data);
+    let picture = yaohud_picture_url(&data);
+    let lyric_seed = data
+        .lrctxt
+        .clone()
+        .or(data.lyrics.clone())
+        .or(data.lrc.clone());
+    let lyrics = fetch_yaohud_lyrics_for_mid(&client, key, mid.as_deref(), YAOHUD_MUSIC_TYPE)
+        .or_else(|| normalize_lyrics(&client, lyric_seed))
         .or_else(|| fetch_netease_lyrics_for_request(request));
+    let url = data
+        .url
+        .or(data.musicurl)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Yaohud response missing playable url",
+            )
+        })?;
 
     Ok(ResolvedSong {
         source: "yaohud",
@@ -3599,6 +3724,97 @@ fn resolve_song_yaohud(config: &BridgeConfig, request: &MusicRequest) -> io::Res
         url,
         lyrics,
     })
+}
+
+fn yaohud_music_mid(data: &YaohudMusicData) -> Option<String> {
+    first_nonempty(&[
+        data.mid.as_deref(),
+        data.id.as_deref(),
+        data.songmid.as_deref(),
+        data.hash.as_deref(),
+    ])
+    .map(str::to_string)
+}
+
+fn yaohud_picture_url(data: &YaohudMusicData) -> String {
+    first_nonempty(&[
+        data.picture.as_deref(),
+        data.pic.as_deref(),
+        data.cover.as_deref(),
+        data.img.as_deref(),
+        data.image.as_deref(),
+        data.picurl.as_deref(),
+        data.pic_url.as_deref(),
+        data.album_pic.as_deref(),
+    ])
+    .unwrap_or("")
+    .to_string()
+}
+
+fn fetch_yaohud_lyrics_for_mid(
+    client: &reqwest::blocking::Client,
+    key: &str,
+    mid: Option<&str>,
+    music_type: &str,
+) -> Option<String> {
+    let mid = mid?.trim();
+    if mid.is_empty() {
+        return None;
+    }
+    let url = yaohud_lrc_url(key, mid, music_type);
+    let body = fetch_yaohud_body(client, &url).ok()?;
+    parse_yaohud_lyrics_body(&body)
+}
+
+fn yaohud_lrc_url(key: &str, mid: &str, music_type: &str) -> String {
+    format!(
+        "https://api.yaohud.cn/api/music/lrc?key={}&mid={}&type={}",
+        form_urlencode(key),
+        form_urlencode(mid),
+        form_urlencode(music_type)
+    )
+}
+
+fn parse_yaohud_lyrics_body(body: &str) -> Option<String> {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if !trimmed.starts_with('{') {
+        return Some(trimmed.to_string());
+    }
+    let parsed: Value = serde_json::from_str(trimmed).ok()?;
+    if parsed
+        .get("code")
+        .and_then(Value::as_i64)
+        .is_some_and(|code| code != 200)
+    {
+        return None;
+    }
+    lyrics_from_json_value(parsed.get("data")).or_else(|| lyrics_from_json_value(Some(&parsed)))
+}
+
+fn lyrics_from_json_value(value: Option<&Value>) -> Option<String> {
+    let value = value?;
+    if let Some(text) = value.as_str() {
+        return nonempty_trimmed(text);
+    }
+    first_nonempty(&[
+        value.get("lrc").and_then(Value::as_str),
+        value.get("lyrics").and_then(Value::as_str),
+        value.get("lrctxt").and_then(Value::as_str),
+        value.get("lyric").and_then(Value::as_str),
+    ])
+    .and_then(nonempty_trimmed)
+}
+
+fn nonempty_trimmed(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
 }
 
 fn normalize_lyrics(client: &reqwest::blocking::Client, value: Option<String>) -> Option<String> {
@@ -3856,15 +4072,13 @@ fn render_music_cover_rgb565(url: &str) -> io::Result<Vec<u8>> {
 }
 
 fn render_standby_wallpaper_rgb565(path: &Path) -> io::Result<Vec<u8>> {
-    let vf = format!(
-        "scale={max}:{max}:force_original_aspect_ratio=decrease,pad={max}:{max}:(ow-iw)/2:(oh-ih)/2:black,scale={w}:{h}:flags=lanczos,format=rgb565le",
-        max = DEFAULT_STANDBY_WALLPAPER_MAX_DIMENSION,
-        w = DEFAULT_STANDBY_WALLPAPER_WIDTH,
-        h = DEFAULT_STANDBY_WALLPAPER_HEIGHT
-    );
-    let path_text = path
-        .to_str()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "wallpaper path is not valid UTF-8"))?;
+    let vf = standby_wallpaper_ffmpeg_filter();
+    let path_text = path.to_str().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "wallpaper path is not valid UTF-8",
+        )
+    })?;
     let expected_bytes =
         DEFAULT_STANDBY_WALLPAPER_WIDTH as usize * DEFAULT_STANDBY_WALLPAPER_HEIGHT as usize * 2;
     let output = Command::new("ffmpeg")
@@ -3904,6 +4118,14 @@ fn render_standby_wallpaper_rgb565(path: &Path) -> io::Result<Vec<u8>> {
         ));
     }
     Ok(output.stdout)
+}
+
+fn standby_wallpaper_ffmpeg_filter() -> String {
+    format!(
+        "scale={w}:{h}:force_original_aspect_ratio=increase:flags=lanczos,crop={w}:{h},format=rgb565le",
+        w = DEFAULT_STANDBY_WALLPAPER_WIDTH,
+        h = DEFAULT_STANDBY_WALLPAPER_HEIGHT
+    )
 }
 
 fn spawn_ffmpeg_pcm_stream(url: &str) -> io::Result<Child> {
@@ -4299,7 +4521,11 @@ fn active_task_is_stale_against_session_log(codex_home: &Path, event: &TaskEvent
                 .iter()
                 .any(|active| active.turn_id.as_deref() == Some(turn_id))
             {
-                return session_idle_stale;
+                return session_idle_stale
+                    || timestamp_is_older_than(
+                        &event.received_at,
+                        ACTIVE_SESSION_UNCONFIRMED_STALE_GRACE,
+                    );
             }
 
             let same_cwd_newer_active = event.cwd.as_deref().and_then(|cwd| {
@@ -4409,15 +4635,15 @@ fn handle_standby_wallpaper(
     match render_standby_wallpaper_rgb565(&wallpaper.path) {
         Ok(bitmap) => {
             let headers = [
-                ("X-Ornament-Wallpaper-Id", sanitize_header_value(&wallpaper.id)),
+                (
+                    "X-Ornament-Wallpaper-Id",
+                    sanitize_header_value(&wallpaper.id),
+                ),
                 (
                     "X-Ornament-Wallpaper-Name",
                     sanitize_header_value(&wallpaper.name),
                 ),
-                (
-                    "X-Ornament-Wallpaper-Mode",
-                    wallpaper.mode.to_string(),
-                ),
+                ("X-Ornament-Wallpaper-Mode", wallpaper.mode.to_string()),
                 ("X-Ornament-Wallpaper-Index", wallpaper.index.to_string()),
                 ("X-Ornament-Wallpaper-Total", wallpaper.total.to_string()),
                 (
@@ -4429,13 +4655,7 @@ fn handle_standby_wallpaper(
                     DEFAULT_STANDBY_WALLPAPER_HEIGHT.to_string(),
                 ),
             ];
-            write_response_with_headers(
-                stream,
-                200,
-                "application/octet-stream",
-                &headers,
-                &bitmap,
-            )
+            write_response_with_headers(stream, 200, "application/octet-stream", &headers, &bitmap)
         }
         Err(error) => {
             eprintln!("standby wallpaper render failed: {error}");
@@ -4493,7 +4713,10 @@ fn resolve_standby_wallpaper(config: &BridgeConfig) -> io::Result<ResolvedStandb
     let today = Local::now().date_naive();
     let epoch = NaiveDate::from_ymd_opt(1970, 1, 1)
         .ok_or_else(|| io::Error::other("failed to construct wallpaper epoch date"))?;
-    let day_index = today.signed_duration_since(epoch).num_days().rem_euclid(total as i64) as usize;
+    let day_index = today
+        .signed_duration_since(epoch)
+        .num_days()
+        .rem_euclid(total as i64) as usize;
     let path = entries
         .get(day_index)
         .cloned()
@@ -5554,7 +5777,11 @@ fn cached_or_refresh_weather(
     state: &Arc<Mutex<BridgeState>>,
     config: &BridgeConfig,
 ) -> WeatherSnapshot {
-    let cache_ttl = weather_refresh_interval(config);
+    let now = Instant::now();
+    let cache_ttl = match state.lock() {
+        Ok(state) => weather_refresh_interval_at(config, Some(&state), now),
+        Err(_) => weather_refresh_interval_at(config, None, now),
+    };
     if let Ok(state) = state.lock() {
         if let Some(cache) = state.weather.as_ref() {
             if cache.fetched_at.elapsed() < cache_ttl {
@@ -5591,7 +5818,7 @@ fn maybe_spawn_weather_refresh(state: SharedBridgeState, config: BridgeConfig) {
     }
 
     std::thread::spawn(move || {
-        let fetched = fetch_weather_snapshot(&config);
+        let fetched = fetch_weather_snapshot(&state, &config);
         let Ok(mut state) = state.lock() else {
             return;
         };
@@ -5619,7 +5846,7 @@ fn weather_refresh_is_due_at(state: &BridgeState, config: &BridgeConfig, now: In
         return false;
     }
 
-    let interval = weather_refresh_interval(config);
+    let interval = weather_refresh_interval_at(config, Some(state), now);
     if let Some(cache) = state.weather.as_ref() {
         if now.saturating_duration_since(cache.fetched_at) < interval {
             return false;
@@ -5633,11 +5860,24 @@ fn weather_refresh_is_due_at(state: &BridgeState, config: &BridgeConfig, now: In
     true
 }
 
-fn weather_refresh_interval(config: &BridgeConfig) -> Duration {
+fn weather_refresh_interval_at(
+    config: &BridgeConfig,
+    state: Option<&BridgeState>,
+    now: Instant,
+) -> Duration {
+    if caiyun_backoff_active(state, now) {
+        return DEFAULT_WEATHER_CACHE_TTL;
+    }
     if caiyun_budget_applies(config) {
         return caiyun_refresh_interval_for_hour(Local::now().hour());
     }
     DEFAULT_WEATHER_CACHE_TTL
+}
+
+fn caiyun_backoff_active(state: Option<&BridgeState>, now: Instant) -> bool {
+    state
+        .and_then(|state| state.weather_caiyun_backoff_until)
+        .is_some_and(|until| now < until)
 }
 
 fn caiyun_budget_applies(config: &BridgeConfig) -> bool {
@@ -5663,14 +5903,23 @@ fn ceil_div_u128(numerator: u128, denominator: u128) -> u128 {
     numerator.div_ceil(denominator)
 }
 
-fn fetch_weather_snapshot(config: &BridgeConfig) -> io::Result<WeatherSnapshot> {
+fn fetch_weather_snapshot(
+    state: &SharedBridgeState,
+    config: &BridgeConfig,
+) -> io::Result<WeatherSnapshot> {
     let client = reqwest::blocking::Client::builder()
         .timeout(WEATHER_FETCH_TIMEOUT)
         .build()
         .map_err(io_other)?;
     let mut last_error = None;
 
-    for provider in weather_fetch_order(config) {
+    let now = Instant::now();
+    let skip_caiyun = match state.lock() {
+        Ok(state) => caiyun_backoff_active(Some(&state), now),
+        Err(_) => false,
+    };
+
+    for provider in weather_fetch_order(config, skip_caiyun) {
         let fetched = match provider {
             WeatherProvider::Auto => unreachable!("auto is expanded by weather_fetch_order"),
             WeatherProvider::OpenMeteo => fetch_open_meteo_weather(&client, config),
@@ -5680,10 +5929,7 @@ fn fetch_weather_snapshot(config: &BridgeConfig) -> io::Result<WeatherSnapshot> 
         match fetched {
             Ok(snapshot) => return Ok(snapshot),
             Err(error) => {
-                eprintln!(
-                    "weather provider {} failed: {error}",
-                    weather_provider_name(provider)
-                );
+                log_weather_provider_failure(state, provider, &error);
                 last_error = Some(error);
             }
         }
@@ -5697,11 +5943,11 @@ fn fetch_weather_snapshot(config: &BridgeConfig) -> io::Result<WeatherSnapshot> 
     }))
 }
 
-fn weather_fetch_order(config: &BridgeConfig) -> Vec<WeatherProvider> {
+fn weather_fetch_order(config: &BridgeConfig, skip_caiyun: bool) -> Vec<WeatherProvider> {
     match config.weather_provider {
         WeatherProvider::Auto => {
             let mut providers = Vec::new();
-            if config.caiyun_token.is_some() {
+            if config.caiyun_token.is_some() && !skip_caiyun {
                 providers.push(WeatherProvider::Caiyun);
             }
             if config.qweather_host.is_some() && config.qweather_token.is_some() {
@@ -5712,8 +5958,50 @@ fn weather_fetch_order(config: &BridgeConfig) -> Vec<WeatherProvider> {
         }
         WeatherProvider::OpenMeteo => vec![WeatherProvider::OpenMeteo],
         WeatherProvider::QWeather => vec![WeatherProvider::QWeather, WeatherProvider::OpenMeteo],
-        WeatherProvider::Caiyun => vec![WeatherProvider::Caiyun, WeatherProvider::OpenMeteo],
+        WeatherProvider::Caiyun => {
+            if skip_caiyun {
+                vec![WeatherProvider::OpenMeteo]
+            } else {
+                vec![WeatherProvider::Caiyun, WeatherProvider::OpenMeteo]
+            }
+        }
     }
+}
+
+fn log_weather_provider_failure(
+    state: &SharedBridgeState,
+    provider: WeatherProvider,
+    error: &io::Error,
+) {
+    if provider == WeatherProvider::Caiyun && weather_error_is_rate_limited(error) {
+        let now = Instant::now();
+        let backoff_until = now + CAIYUN_RATE_LIMIT_BACKOFF;
+        let should_log = match state.lock() {
+            Ok(mut state) => {
+                let already_backing_off = caiyun_backoff_active(Some(&state), now);
+                state.weather_caiyun_backoff_until = Some(backoff_until);
+                !already_backing_off
+            }
+            Err(_) => true,
+        };
+        if should_log {
+            eprintln!(
+                "weather provider caiyun rate limited; backing off for {} minutes and using fallback providers",
+                CAIYUN_RATE_LIMIT_BACKOFF.as_secs() / 60
+            );
+        }
+        return;
+    }
+
+    eprintln!(
+        "weather provider {} failed: {error}",
+        weather_provider_name(provider)
+    );
+}
+
+fn weather_error_is_rate_limited(error: &io::Error) -> bool {
+    let message = error.to_string();
+    message.contains("429 TOO MANY REQUESTS") || message.contains("429 Too Many Requests")
 }
 
 fn fetch_open_meteo_weather(
@@ -6432,7 +6720,39 @@ mod tests {
         let mut config = test_config(None);
         config.caiyun_token = Some("token-123".to_string());
         assert_eq!(
-            weather_fetch_order(&config),
+            weather_fetch_order(&config, false),
+            vec![WeatherProvider::Caiyun, WeatherProvider::OpenMeteo]
+        );
+    }
+
+    #[test]
+    fn caiyun_backoff_uses_default_refresh_interval() {
+        let mut config = test_config(None);
+        config.caiyun_token = Some("token-123".to_string());
+        let now = Instant::now();
+        let state = BridgeState {
+            weather_caiyun_backoff_until: Some(now + CAIYUN_RATE_LIMIT_BACKOFF),
+            ..BridgeState::default()
+        };
+
+        assert_eq!(
+            weather_refresh_interval_at(&config, Some(&state), now),
+            DEFAULT_WEATHER_CACHE_TTL
+        );
+    }
+
+    #[test]
+    fn skips_caiyun_provider_while_rate_limit_backoff_is_active() {
+        let mut config = test_config(None);
+        config.weather_provider = WeatherProvider::Caiyun;
+        config.caiyun_token = Some("token-123".to_string());
+
+        assert_eq!(
+            weather_fetch_order(&config, true),
+            vec![WeatherProvider::OpenMeteo]
+        );
+        assert_eq!(
+            weather_fetch_order(&config, false),
             vec![WeatherProvider::Caiyun, WeatherProvider::OpenMeteo]
         );
     }
@@ -6518,6 +6838,53 @@ mod tests {
             }
         )
         .is_none());
+    }
+
+    #[test]
+    fn builds_yaohud_lrc_url_for_aggregate_lyrics_api() {
+        assert_eq!(
+            yaohud_lrc_url("key 1", "2058263034", "wy"),
+            "https://api.yaohud.cn/api/music/lrc?key=key+1&mid=2058263034&type=wy"
+        );
+    }
+
+    #[test]
+    fn parses_yaohud_lyrics_json_response() {
+        let body = r#"{"code":200,"data":{"lrc":"[00:01.00]hello\n[00:02.00]world"}}"#;
+
+        assert_eq!(
+            parse_yaohud_lyrics_body(body).as_deref(),
+            Some("[00:01.00]hello\n[00:02.00]world")
+        );
+    }
+
+    #[test]
+    fn parses_yaohud_lyrics_when_data_is_string() {
+        let body = r#"{"code":200,"data":"[00:01.00]hello"}"#;
+
+        assert_eq!(
+            parse_yaohud_lyrics_body(body).as_deref(),
+            Some("[00:01.00]hello")
+        );
+    }
+
+    #[test]
+    fn picks_yaohud_cover_from_common_picture_fields() {
+        let data = YaohudMusicData {
+            pic_url: Some("https://example.test/cover.jpg".to_string()),
+            ..YaohudMusicData::default()
+        };
+
+        assert_eq!(yaohud_picture_url(&data), "https://example.test/cover.jpg");
+    }
+
+    #[test]
+    fn standby_wallpaper_filter_covers_without_padding() {
+        let filter = standby_wallpaper_ffmpeg_filter();
+
+        assert!(filter.contains("force_original_aspect_ratio=increase"));
+        assert!(filter.contains("crop=240:240"));
+        assert!(!filter.contains("pad="));
     }
 
     #[test]
@@ -6613,6 +6980,30 @@ mod tests {
             &state,
             &config,
             now + CAIYUN_NIGHT_REFRESH_INTERVAL + Duration::from_millis(1)
+        ));
+    }
+
+    #[test]
+    fn weather_refresh_due_respects_caiyun_backoff_window() {
+        let mut config = test_config(None);
+        config.caiyun_token = Some("token-123".to_string());
+        let now = Instant::now();
+
+        let state = BridgeState {
+            weather_last_attempt: Some(now),
+            weather_caiyun_backoff_until: Some(now + CAIYUN_RATE_LIMIT_BACKOFF),
+            ..BridgeState::default()
+        };
+        assert!(!weather_refresh_is_due_at(
+            &state,
+            &config,
+            now + Duration::from_secs(7)
+        ));
+
+        assert!(weather_refresh_is_due_at(
+            &state,
+            &config,
+            now + DEFAULT_WEATHER_CACHE_TTL + Duration::from_millis(1)
         ));
     }
 
@@ -6990,6 +7381,82 @@ mod tests {
         assert_eq!(
             state.task.as_ref().map(|event| event.status.as_str()),
             Some("done")
+        );
+    }
+
+    #[test]
+    fn same_session_new_identified_turn_replaces_previous_active_task() {
+        let mut state = BridgeState::default();
+        let first = normalize_event(&json!({
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "session-1",
+            "turn_id": "turn-1"
+        }));
+        let second = normalize_event(&json!({
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "session-1",
+            "turn_id": "turn-2"
+        }));
+
+        apply_task_event(&mut state, first);
+        apply_task_event(&mut state, second);
+
+        assert_eq!(state.active_tasks.len(), 1);
+        assert_eq!(
+            state
+                .active_tasks
+                .values()
+                .next()
+                .and_then(|event| event.turn_id.as_deref()),
+            Some("turn-2")
+        );
+    }
+
+    #[test]
+    fn same_source_different_sessions_keep_concurrent_active_tasks() {
+        let mut state = BridgeState::default();
+        let first = normalize_event(&json!({
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "session-1",
+            "turn_id": "turn-1"
+        }));
+        let second = normalize_event(&json!({
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "session-2",
+            "turn_id": "turn-2"
+        }));
+
+        apply_task_event(&mut state, first);
+        apply_task_event(&mut state, second);
+
+        assert_eq!(state.active_tasks.len(), 2);
+    }
+
+    #[test]
+    fn same_session_identified_turn_replaces_anonymous_active_task() {
+        let mut state = BridgeState::default();
+        let anonymous = normalize_event(&json!({
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "session-1",
+            "prompt": "anonymous work"
+        }));
+        let identified = normalize_event(&json!({
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "session-1",
+            "turn_id": "turn-1"
+        }));
+
+        apply_task_event(&mut state, anonymous);
+        apply_task_event(&mut state, identified);
+
+        assert_eq!(state.active_tasks.len(), 1);
+        assert_eq!(
+            state
+                .active_tasks
+                .values()
+                .next()
+                .and_then(|event| event.turn_id.as_deref()),
+            Some("turn-1")
         );
     }
 
@@ -7654,13 +8121,11 @@ mod tests {
         }));
 
         assert_eq!(start.turn_id, stop.turn_id);
-        assert!(
-            start
-                .turn_id
-                .as_deref()
-                .unwrap_or_default()
-                .starts_with("claude-transcript-")
-        );
+        assert!(start
+            .turn_id
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with("claude-transcript-"));
     }
 
     #[test]
@@ -8136,7 +8601,7 @@ mod tests {
         let _ = fs::remove_dir_all(&codex_home);
 
         assert_eq!(snapshot.active_task_count, 1);
-        assert_eq!(snapshot.status, "done");
+        assert_eq!(snapshot.status, "running");
         assert_eq!(
             snapshot
                 .active_tasks
@@ -9520,6 +9985,29 @@ mod tests {
     }
 
     #[test]
+    fn finds_bridge_restart_root_from_target_debug_exe_path() {
+        let root = env::temp_dir().join(format!(
+            "codex-ornament-restart-root-{}",
+            std::process::id()
+        ));
+        let script_dir = root.join("scripts");
+        let exe_dir = root.join("target").join("debug");
+        fs::create_dir_all(&script_dir).unwrap();
+        fs::create_dir_all(&exe_dir).unwrap();
+        fs::write(
+            script_dir.join("start-codex-ornament-bridge.ps1"),
+            "Write-Output 'ok'",
+        )
+        .unwrap();
+
+        let exe = exe_dir.join("codex-ornament-bridge.exe");
+        let found = find_bridge_restart_root(&exe);
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(found.as_deref(), Some(root.as_path()));
+    }
+
+    #[test]
     fn recovers_active_turn_from_recent_session_log_without_tracked_session() {
         let codex_home = env::temp_dir().join(format!(
             "codex-ornament-recover-recent-{}",
@@ -9597,10 +10085,12 @@ mod tests {
 
         let older_session_id = "11111111-1111-1111-1111-111111111111";
         let newer_session_id = "22222222-2222-2222-2222-222222222222";
-        let older_path =
-            older_dir.join(format!("rollout-2026-05-30T11-43-03-{older_session_id}.jsonl"));
-        let newer_path =
-            newer_dir.join(format!("rollout-2026-05-31T11-43-03-{newer_session_id}.jsonl"));
+        let older_path = older_dir.join(format!(
+            "rollout-2026-05-30T11-43-03-{older_session_id}.jsonl"
+        ));
+        let newer_path = newer_dir.join(format!(
+            "rollout-2026-05-31T11-43-03-{newer_session_id}.jsonl"
+        ));
         fs::write(
             &older_path,
             format!(
@@ -9862,6 +10352,137 @@ mod tests {
 
         assert_eq!(snapshot.active_task_count, 0);
         assert_eq!(snapshot.status, "done");
+    }
+
+    #[test]
+    fn snapshot_drops_unconfirmed_codex_turn_after_stale_grace() {
+        let codex_home = env::temp_dir().join(format!(
+            "codex-ornament-unconfirmed-stale-{}",
+            std::process::id()
+        ));
+        let session_dir = codex_home
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("31");
+        fs::create_dir_all(&session_dir).unwrap();
+
+        let old_timestamp =
+            past_timestamp((ACTIVE_SESSION_UNCONFIRMED_STALE_GRACE.as_secs() as i64) + 60);
+        fs::write(
+            session_dir.join("rollout-2026-05-31T16-59-09-session-1.jsonl"),
+            format!(
+                "{}\n{}\n",
+                json!({
+                    "timestamp": old_timestamp,
+                    "payload": {
+                        "type": "task_started",
+                        "turn_id": "turn-1"
+                    }
+                }),
+                json!({
+                    "timestamp": old_timestamp,
+                    "payload": {
+                        "type": "turn_context",
+                        "turn_id": "turn-1",
+                        "cwd": "D:\\Desktop\\codex\\firmware",
+                        "model": "gpt-5.5"
+                    }
+                })
+            ),
+        )
+        .unwrap();
+
+        let state = Arc::new(Mutex::new(BridgeState::default()));
+        {
+            let mut state = state.lock().unwrap();
+            apply_task_event(
+                &mut state,
+                TaskEvent {
+                    kind: "UserPromptSubmit".to_string(),
+                    status: "running".to_string(),
+                    title: "Codex running".to_string(),
+                    message: "Codex running".to_string(),
+                    received_at: old_timestamp,
+                    source: None,
+                    session_id: Some("session-1".to_string()),
+                    turn_id: Some("turn-1".to_string()),
+                    cwd: Some("D:\\Desktop\\codex\\firmware".to_string()),
+                    model: Some("gpt-5.5".to_string()),
+                },
+            );
+        }
+
+        let snapshot = task_snapshot(&state, &scoped_test_config("session-1", &codex_home));
+        let _ = fs::remove_dir_all(&codex_home);
+
+        assert_eq!(snapshot.active_task_count, 0);
+        assert_eq!(snapshot.status, "done");
+    }
+
+    #[test]
+    fn snapshot_keeps_recent_unconfirmed_codex_turn() {
+        let codex_home = env::temp_dir().join(format!(
+            "codex-ornament-unconfirmed-recent-{}",
+            std::process::id()
+        ));
+        let session_dir = codex_home
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("31");
+        fs::create_dir_all(&session_dir).unwrap();
+
+        let recent = recent_timestamp(60);
+        fs::write(
+            session_dir.join("rollout-2026-05-31T16-59-09-session-1.jsonl"),
+            format!(
+                "{}\n{}\n",
+                json!({
+                    "timestamp": recent,
+                    "payload": {
+                        "type": "task_started",
+                        "turn_id": "turn-1"
+                    }
+                }),
+                json!({
+                    "timestamp": recent,
+                    "payload": {
+                        "type": "turn_context",
+                        "turn_id": "turn-1",
+                        "cwd": "D:\\Desktop\\codex\\firmware",
+                        "model": "gpt-5.5"
+                    }
+                })
+            ),
+        )
+        .unwrap();
+
+        let state = Arc::new(Mutex::new(BridgeState::default()));
+        {
+            let mut state = state.lock().unwrap();
+            apply_task_event(
+                &mut state,
+                TaskEvent {
+                    kind: "UserPromptSubmit".to_string(),
+                    status: "running".to_string(),
+                    title: "Codex running".to_string(),
+                    message: "Codex running".to_string(),
+                    received_at: recent,
+                    source: None,
+                    session_id: Some("session-1".to_string()),
+                    turn_id: Some("turn-1".to_string()),
+                    cwd: Some("D:\\Desktop\\codex\\firmware".to_string()),
+                    model: Some("gpt-5.5".to_string()),
+                },
+            );
+        }
+
+        let snapshot = task_snapshot(&state, &scoped_test_config("session-1", &codex_home));
+        let _ = fs::remove_dir_all(&codex_home);
+
+        assert_eq!(snapshot.active_task_count, 1);
+        assert_eq!(snapshot.status, "running");
     }
 
     #[test]

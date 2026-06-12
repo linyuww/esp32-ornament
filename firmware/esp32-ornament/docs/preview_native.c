@@ -91,6 +91,13 @@ const char *xiaozhi_client_state_name(xiaozhi_client_state_t state)
     }
 }
 
+bool standby_wallpaper_client_copy_frame(uint16_t *pixels, size_t pixel_count)
+{
+    (void)pixels;
+    (void)pixel_count;
+    return false;
+}
+
 static int write_ppm(const char *path, const uint16_t *pixels)
 {
     FILE *file = fopen(path, "wb");

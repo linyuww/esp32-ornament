@@ -1788,7 +1788,14 @@ static const char *xiaozhi_hud_done_text(void)
 static void draw_standby_background(void)
 {
     draw_standby_wallpaper();
-    blend_rect(0, 0, active_canvas->width, active_canvas->height, HUD_BLACK, 118);
+    blend_rect(0, 0, active_canvas->width, active_canvas->height, HUD_BLACK, 58);
+}
+
+static void draw_standby_text_masks(void)
+{
+    const int margin = sx(18);
+    const int width = active_canvas->width - margin * 2;
+    blend_rect(margin, sy(24), width, sy(332), HUD_BLACK, 108);
 }
 
 static void draw_standby_header(const char *time_text, const char *date_text, const char *reset_text)
@@ -2005,6 +2012,7 @@ void display_core_render_clock(display_core_canvas_t *canvas, const ornament_sta
     standby_reset_text(state, reset_text, sizeof(reset_text));
 
     draw_standby_background();
+    draw_standby_text_masks();
     draw_standby_header(time_text, date_text, reset_text);
     draw_standby_weather_row(state, temp_text);
     draw_standby_connectivity(state);
