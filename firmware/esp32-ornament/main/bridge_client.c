@@ -596,3 +596,44 @@ esp_err_t bridge_client_auto_match(bool verify_current, bridge_auto_match_result
     }
     return result->last_error;
 }
+
+esp_err_t bridge_client_restart(void)
+{
+    ornament_settings_t settings;
+    ESP_RETURN_ON_ERROR(settings_load(&settings), TAG, "settings load failed before bridge restart");
+
+    char response[256] = {0};
+    char restart_url[ORNAMENT_BRIDGE_URL_MAX + 16] = {0};
+    const char *state_url = settings_bridge_url_or_default(&settings);
+    if (state_url == NULL || state_url[0] == '\0') {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    const char *suffix = strstr(state_url, "/state");
+    size_t base_len = suffix != NULL ? (size_t)(suffix - state_url) : strlen(state_url);
+    if (base_len + strlen("/restart") + 1 > sizeof(restart_url)) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    memcpy(restart_url, state_url, base_len);
+    restart_url[base_len] = '\0';
+    strlcat(restart_url, "/restart", sizeof(restart_url));
+
+    size_t response_len = 0;
+    int status_code = 0;
+    ornament_http_request_t request = {
+        .method = "POST",
+        .url = restart_url,
+        .body = "",
+        .response = response,
+        .response_capacity = sizeof(response),
+        .response_len = &response_len,
+        .status_code = &status_code,
+        .timeout_ms = BRIDGE_PROBE_TIMEOUT_MS,
+    };
+
+    esp_err_t err = ornament_http_request(&request);
+    if (err != ESP_OK) {
+        return err;
+    }
+    return status_code == 202 ? ESP_OK : ESP_ERR_INVALID_RESPONSE;
+}

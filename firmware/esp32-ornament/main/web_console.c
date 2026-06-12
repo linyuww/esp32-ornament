@@ -108,6 +108,30 @@ static void appendf(char *text, size_t text_size, size_t *used, const char *form
     }
 }
 
+static void format_i64_decimal(int64_t value, char *output, size_t output_size)
+{
+    if (output == NULL || output_size == 0) {
+        return;
+    }
+
+    char scratch[24];
+    size_t cursor = sizeof(scratch);
+    scratch[--cursor] = '\0';
+
+    bool negative = value < 0;
+    uint64_t magnitude = negative ? (uint64_t)(-(value + 1)) + 1U : (uint64_t)value;
+    do {
+        scratch[--cursor] = (char)('0' + (magnitude % 10U));
+        magnitude /= 10U;
+    } while (magnitude > 0 && cursor > 0);
+
+    if (negative && cursor > 0) {
+        scratch[--cursor] = '-';
+    }
+
+    strlcpy(output, &scratch[cursor], output_size);
+}
+
 static void json_escape(const char *input, char *output, size_t output_size)
 {
     size_t used = 0;
@@ -292,15 +316,18 @@ static void append_diagnostics_json(
     size_t *used,
     const system_diagnostics_snapshot_t *diag)
 {
+    char uptime_ms[24];
+    format_i64_decimal(diag->uptime_ms, uptime_ms, sizeof(uptime_ms));
+
     appendf(
         json,
         json_size,
         used,
-        "\"system\":{\"uptime_ms\":%lld,\"reset_reason\":\"%s\",\"reset_reason_code\":%d,"
+        "\"system\":{\"uptime_ms\":%s,\"reset_reason\":\"%s\",\"reset_reason_code\":%d,"
         "\"heap\":{\"free\":%u,\"min_free\":%u,\"largest_free_block\":%u,"
         "\"internal_free\":%u,\"internal_min_free\":%u,\"largest_internal_block\":%u,"
         "\"spiram_free\":%u,\"spiram_min_free\":%u,\"largest_spiram_block\":%u},",
-        (long long)diag->uptime_ms,
+        uptime_ms,
         system_diagnostics_reset_reason_name(diag->reset_reason),
         (int)diag->reset_reason,
         (unsigned int)diag->free_heap,
@@ -335,15 +362,20 @@ static void append_diagnostics_json(
     append(json, json_size, used, "],\"heap_checkpoints\":[");
     for (size_t i = 0; i < diag->heap_checkpoint_count; i++) {
         const system_diagnostics_heap_checkpoint_t *checkpoint = &diag->heap_checkpoints[i];
+        char checkpoint_uptime_ms[24];
+        format_i64_decimal(
+            checkpoint->uptime_ms,
+            checkpoint_uptime_ms,
+            sizeof(checkpoint_uptime_ms));
         appendf(
             json,
             json_size,
             used,
-            "%s{\"stage\":\"%s\",\"uptime_ms\":%lld,\"free\":%u,\"min_free\":%u,"
+            "%s{\"stage\":\"%s\",\"uptime_ms\":%s,\"free\":%u,\"min_free\":%u,"
             "\"largest_free_block\":%u,\"internal_free\":%u,\"spiram_free\":%u}",
             i > 0 ? "," : "",
             checkpoint->stage,
-            (long long)checkpoint->uptime_ms,
+            checkpoint_uptime_ms,
             (unsigned int)checkpoint->free_heap,
             (unsigned int)checkpoint->minimum_free_heap,
             (unsigned int)checkpoint->largest_8bit_block,
@@ -495,10 +527,18 @@ static esp_err_t status_get_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
     size_t used = 0;
+    char uptime_ms[24];
+    char age_ms_text[24];
+    char last_success_ms[24];
+    char last_failure_ms[24];
+    format_i64_decimal(esp_timer_get_time() / 1000, uptime_ms, sizeof(uptime_ms));
+    format_i64_decimal(age_ms, age_ms_text, sizeof(age_ms_text));
+    format_i64_decimal(bridge_diag.last_success_ms, last_success_ms, sizeof(last_success_ms));
+    format_i64_decimal(bridge_diag.last_failure_ms, last_failure_ms, sizeof(last_failure_ms));
     append(json, json_size, &used, "{");
     append_diagnostics_json(json, json_size, &used, diag);
-    appendf(json, json_size, &used, "\"uptime_ms\":%lld,", (long long)(esp_timer_get_time() / 1000));
-    appendf(json, json_size, &used, "\"last_state_age_ms\":%lld,", (long long)age_ms);
+    appendf(json, json_size, &used, "\"uptime_ms\":%s,", uptime_ms);
+    appendf(json, json_size, &used, "\"last_state_age_ms\":%s,", age_ms_text);
     appendf(json, json_size, &used, "\"fetch_error\":\"%s\",", esp_err_to_name(fetch_error));
     appendf(json, json_size, &used, "\"bridge_offline\":%s,", state.bridge_offline ? "true" : "false");
     appendf(json, json_size, &used, "\"hostname\":\"%s\",", device_identity_hostname());
@@ -628,11 +668,11 @@ static esp_err_t status_get_handler(httpd_req_t *req)
         json,
         json_size,
         &used,
-        "\"bridge_debug\":{\"last_fetch_error\":\"%s\",\"consecutive_fetch_failures\":%d,\"last_success_ms\":%lld,\"last_failure_ms\":%lld,\"last_auto_match_ok\":%s,\"last_auto_match_error\":\"%s\",\"last_auto_match_reason\":\"%s\"},",
+        "\"bridge_debug\":{\"last_fetch_error\":\"%s\",\"consecutive_fetch_failures\":%d,\"last_success_ms\":%s,\"last_failure_ms\":%s,\"last_auto_match_ok\":%s,\"last_auto_match_error\":\"%s\",\"last_auto_match_reason\":\"%s\"},",
         esp_err_to_name(bridge_diag.last_fetch_error),
         bridge_diag.consecutive_fetch_failures,
-        (long long)bridge_diag.last_success_ms,
-        (long long)bridge_diag.last_failure_ms,
+        last_success_ms,
+        last_failure_ms,
         bridge_diag.last_auto_match_ok ? "true" : "false",
         esp_err_to_name(bridge_diag.last_auto_match_error),
         bridge_diag.last_auto_match_reason);
@@ -781,6 +821,12 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
     size_t used = 0;
+    char age_ms_text[24];
+    char last_success_ms[24];
+    char last_failure_ms[24];
+    format_i64_decimal(age_ms, age_ms_text, sizeof(age_ms_text));
+    format_i64_decimal(bridge_diag.last_success_ms, last_success_ms, sizeof(last_success_ms));
+    format_i64_decimal(bridge_diag.last_failure_ms, last_failure_ms, sizeof(last_failure_ms));
     append(
         html,
         html_size,
@@ -809,11 +855,11 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         html_size,
         &used,
         "<header class=\"top\"><div><h1>Codex Ornament</h1><p class=\"sub\">%s</p></div>"
-        "<div class=\"badges\"><span class=\"badge\">Bridge %s</span><span class=\"badge\">%s</span><span class=\"badge\">age %lld ms</span></div></header>",
+        "<div class=\"badges\"><span class=\"badge\">Bridge %s</span><span class=\"badge\">%s</span><span class=\"badge\">age %s ms</span></div></header>",
         device_identity_hostname(),
         esp_err_to_name(fetch_error),
         state.bridge_offline ? "Bridge offline" : "Bridge online",
-        (long long)age_ms);
+        age_ms_text);
     append(html, html_size, &used, "<section class=\"urls\">");
     appendf(html, html_size, &used, "<div class=\"urlbox\"><div class=\"k\">Local URL</div><code>%s</code></div>", device_identity_mdns_url());
     appendf(html, html_size, &used, "<div class=\"urlbox\"><div class=\"k\">Bridge URL</div><code>%s</code></div>", bridge_url);
@@ -846,12 +892,12 @@ static esp_err_t root_get_handler(httpd_req_t *req)
     appendf(html, html_size, &used, "<div class=\"card\"><div class=\"k\">Channel</div><div class=\"v\">%d</div></div>", wifi_debug.channel);
     appendf(html, html_size, &used, "<div class=\"card\"><div class=\"k\">BSSID</div><div class=\"v\">%s</div></div>", wifi_debug.bssid[0] != '\0' ? wifi_debug.bssid : "--");
     appendf(html, html_size, &used, "<div class=\"card\"><div class=\"k\">Disconnect</div><div class=\"v\">%u %s</div><div class=\"k\">rssi %d retries %d</div></div>", wifi_debug.last_disconnect_reason, wifi_debug.last_disconnect_name, wifi_debug.last_disconnect_rssi, wifi_debug.retry_count);
-    appendf(html, html_size, &used, "<div class=\"card\"><div class=\"k\">Bridge Fetch</div><div class=\"v\">%s</div><div class=\"k\">age %lld ms</div></div>", esp_err_to_name(fetch_error), (long long)age_ms);
+    appendf(html, html_size, &used, "<div class=\"card\"><div class=\"k\">Bridge Fetch</div><div class=\"v\">%s</div><div class=\"k\">age %s ms</div></div>", esp_err_to_name(fetch_error), age_ms_text);
     append(html, html_size, &used, "</section>");
     append(html, html_size, &used, "<h2>Bridge Debug</h2><section class=\"grid\">");
     appendf(html, html_size, &used, "<div class=\"card\"><div class=\"k\">Last Fetch</div><div class=\"v\">%s</div><div class=\"k\">failures %d</div></div>", esp_err_to_name(bridge_diag.last_fetch_error), bridge_diag.consecutive_fetch_failures);
-    appendf(html, html_size, &used, "<div class=\"card\"><div class=\"k\">Last Success</div><div class=\"v\">%lld ms</div><div class=\"k\">since boot</div></div>", (long long)bridge_diag.last_success_ms);
-    appendf(html, html_size, &used, "<div class=\"card\"><div class=\"k\">Last Failure</div><div class=\"v\">%lld ms</div><div class=\"k\">since boot</div></div>", (long long)bridge_diag.last_failure_ms);
+    appendf(html, html_size, &used, "<div class=\"card\"><div class=\"k\">Last Success</div><div class=\"v\">%s ms</div><div class=\"k\">since boot</div></div>", last_success_ms);
+    appendf(html, html_size, &used, "<div class=\"card\"><div class=\"k\">Last Failure</div><div class=\"v\">%s ms</div><div class=\"k\">since boot</div></div>", last_failure_ms);
     appendf(html, html_size, &used, "<div class=\"card\"><div class=\"k\">Auto Match</div><div class=\"v\">%s</div><div class=\"k\">%s / %s</div></div>", bridge_diag.last_auto_match_ok ? "ok" : "failed", esp_err_to_name(bridge_diag.last_auto_match_error), bridge_diag.last_auto_match_reason[0] != '\0' ? bridge_diag.last_auto_match_reason : "--");
     append(html, html_size, &used, "</section>");
     append(html, html_size, &used, "<h2>System</h2><section class=\"grid\">");
@@ -1052,7 +1098,8 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         html_size,
         &used,
         "\"><div class=\"actions\"><button type=\"submit\">Test</button>"
-        "<button class=\"warn\" type=\"submit\" formaction=\"/save-bridge\">Save</button></div></form>"
+        "<button class=\"warn\" type=\"submit\" formaction=\"/save-bridge\">Save</button>"
+        "<button class=\"warn\" type=\"submit\" formaction=\"/restart-bridge\">Restart Bridge</button></div></form>"
         "<form method=\"post\" action=\"/auto-bridge\">"
         "<div class=\"actions\"><button type=\"submit\">Auto Match This PC Bridge</button><a class=\"btn\" href=\"/status\">JSON Status</a></div></form>"
         "<div class=\"actions\"><form method=\"post\" action=\"/reboot\"><button class=\"warn\" type=\"submit\">Reboot</button></form>"
@@ -1842,6 +1889,43 @@ static esp_err_t auto_bridge_post_handler(httpd_req_t *req)
     return send_bridge_saved_page(req, result.bridge_url, detail);
 }
 
+static esp_err_t restart_bridge_post_handler(httpd_req_t *req)
+{
+    char body[256] = {0};
+    char url[ORNAMENT_BRIDGE_URL_MAX] = {0};
+    if (req->content_len > 0) {
+        if (read_form_body(req, body, sizeof(body)) != ESP_OK) {
+            return ESP_FAIL;
+        }
+        form_value(body, "bridge_url", url, sizeof(url));
+        if (url[0] != '\0') {
+            esp_err_t save_err = save_bridge_url(url);
+            if (save_err != ESP_OK) {
+                httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, esp_err_to_name(save_err));
+                return ESP_FAIL;
+            }
+            refresh_console_settings();
+        }
+    }
+
+    const char *active_url = settings_bridge_url_or_default(&console_settings);
+    esp_err_t err = bridge_client_restart();
+    if (err != ESP_OK) {
+        char detail[160];
+        snprintf(
+            detail,
+            sizeof(detail),
+            "Bridge restart failed: %s",
+            esp_err_to_name(err));
+        return send_bridge_saved_page(req, active_url, detail);
+    }
+
+    return send_bridge_saved_page(
+        req,
+        active_url,
+        "Bridge restart requested on this PC. The bridge should come back automatically in a moment.");
+}
+
 static esp_err_t reboot_post_handler(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "text/plain");
@@ -1945,6 +2029,11 @@ esp_err_t web_console_start(void)
         .method = HTTP_POST,
         .handler = auto_bridge_post_handler,
     };
+    const httpd_uri_t restart_bridge = {
+        .uri = "/restart-bridge",
+        .method = HTTP_POST,
+        .handler = restart_bridge_post_handler,
+    };
     const httpd_uri_t save_xiaozhi = {
         .uri = "/save-xiaozhi",
         .method = HTTP_POST,
@@ -1996,6 +2085,7 @@ esp_err_t web_console_start(void)
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &save_weather));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &clear_weather_token));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &auto_bridge));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &restart_bridge));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &save_xiaozhi));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &xiaozhi_start));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &xiaozhi_stop));

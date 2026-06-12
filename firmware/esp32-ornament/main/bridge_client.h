@@ -27,3 +27,4 @@ typedef struct {
 esp_err_t bridge_client_fetch_state(ornament_state_t *state);
 esp_err_t bridge_client_probe_url(const char *url, bridge_probe_result_t *result);
 esp_err_t bridge_client_auto_match(bool verify_current, bridge_auto_match_result_t *result);
+esp_err_t bridge_client_restart(void);
