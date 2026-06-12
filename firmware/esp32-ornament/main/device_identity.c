@@ -7,9 +7,11 @@
 #define CONFIG_ORNAMENT_MDNS_ENABLED 0
 #endif
 
-#if CONFIG_ORNAMENT_MDNS_ENABLED
-#include "mdns.h"
+#ifndef CONFIG_ORNAMENT_WEB_CONSOLE_ENABLED
+#define CONFIG_ORNAMENT_WEB_CONSOLE_ENABLED 0
 #endif
+
+#include "mdns.h"
 
 #include <stdbool.h>
 #include <stdio.h>
@@ -20,6 +22,7 @@ static char hostname[32];
 static char mdns_url[64];
 static bool identity_ready;
 static bool mdns_started;
+static bool mdns_available;
 
 static void build_hostname(void)
 {
@@ -63,7 +66,11 @@ esp_err_t device_identity_init(void)
     }
 
     build_hostname();
+#if CONFIG_ORNAMENT_MDNS_ENABLED && CONFIG_ORNAMENT_WEB_CONSOLE_ENABLED
     snprintf(mdns_url, sizeof(mdns_url), "http://%s.local/", hostname);
+#else
+    mdns_url[0] = '\0';
+#endif
     identity_ready = true;
     ESP_LOGI(TAG, "hostname=%s mdns_url=%s", hostname, mdns_url);
     return ESP_OK;
@@ -73,14 +80,20 @@ esp_err_t device_identity_start_mdns(void)
 {
     ESP_ERROR_CHECK_WITHOUT_ABORT(device_identity_init());
 
+#if !CONFIG_ORNAMENT_MDNS_ENABLED || !CONFIG_ORNAMENT_WEB_CONSOLE_ENABLED
+    ESP_LOGI(TAG, "mDNS unavailable: web console or mDNS disabled in sdkconfig");
+    mdns_available = false;
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
+
     if (mdns_started) {
         return ESP_OK;
     }
 
-#if CONFIG_ORNAMENT_MDNS_ENABLED
     esp_err_t err = mdns_init();
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "mDNS init failed: %s", esp_err_to_name(err));
+        mdns_available = false;
         return err;
     }
 
@@ -89,7 +102,7 @@ esp_err_t device_identity_start_mdns(void)
     ESP_ERROR_CHECK_WITHOUT_ABORT(mdns_service_add("Codex Ornament Web Console", "_http", "_tcp", 80, NULL, 0));
 
     mdns_started = true;
+    mdns_available = true;
     ESP_LOGI(TAG, "mDNS started: %s", mdns_url);
-#endif
     return ESP_OK;
 }

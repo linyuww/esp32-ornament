@@ -4,6 +4,7 @@
 #include "music_player.h"
 #include "ornament_state.h"
 #include "system_status.h"
+#include "standby_wallpaper_client.h"
 #include "task_audio.h"
 #include "web_console.h"
 #include "weather_client.h"
@@ -893,15 +894,14 @@ static bool should_announce_done_event(
     if (!is_new_done_event(state, have_seen_state, last_done_seq)) {
         return false;
     }
-    if (previous_active_task_count > 0 && state->active_task_count == 0) {
-        return true;
-    }
-    ESP_LOGW(
+    ESP_LOGI(
         TAG,
-        "suppress done alert: done_seq advanced but active task count is not idle %d -> %d",
+        "announce done alert: done_seq %d -> %d active_task_count %d -> %d",
+        last_done_seq,
+        state->done_seq,
         previous_active_task_count,
         state->active_task_count);
-    return false;
+    return true;
 }
 
 static void publish_state(
@@ -1342,6 +1342,7 @@ static void ui_render_task(void *arg)
 
         update_local_animation(&state, now, last_done_tick, have_last_done_tick);
         apply_local_state(&state, state.bridge_offline);
+        standby_wallpaper_client_refresh_if_needed(&state);
         web_console_set_last_state(&state, fetch_error);
         xiaozhi_client_status_snapshot(&xiaozhi_snapshot);
         music_player_status_snapshot(&ui_music_snapshot);
@@ -1425,6 +1426,10 @@ void app_main(void)
     display_init();
     display_render_boot();
     log_heap_status("after_display");
+    esp_err_t wallpaper_err = standby_wallpaper_client_init();
+    if (wallpaper_err != ESP_OK) {
+        ESP_LOGW(TAG, "standby wallpaper client unavailable: %s", esp_err_to_name(wallpaper_err));
+    }
     esp_err_t audio_err = task_audio_start();
     if (audio_err != ESP_OK) {
         ESP_LOGW(TAG, "task done audio unavailable: %s", esp_err_to_name(audio_err));

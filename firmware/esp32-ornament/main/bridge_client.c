@@ -211,6 +211,17 @@ static esp_err_t parse_state_json(const char *json_text, ornament_state_t *state
         state->weather_code = json_optional_int(weather, "weatherCode", -1);
     }
 
+    cJSON *standby_wallpaper = cJSON_GetObjectItemCaseSensitive(root, "standbyWallpaper");
+    if (cJSON_IsObject(standby_wallpaper)) {
+        state->has_standby_wallpaper = true;
+        copy_json_string(standby_wallpaper, "id", state->standby_wallpaper_id, sizeof(state->standby_wallpaper_id));
+        copy_json_string(standby_wallpaper, "name", state->standby_wallpaper_name, sizeof(state->standby_wallpaper_name));
+        copy_json_string(standby_wallpaper, "mode", state->standby_wallpaper_mode, sizeof(state->standby_wallpaper_mode));
+        copy_json_string(standby_wallpaper, "url", state->standby_wallpaper_url, sizeof(state->standby_wallpaper_url));
+        state->standby_wallpaper_index = json_optional_int(standby_wallpaper, "index", -1);
+        state->standby_wallpaper_total = json_optional_int(standby_wallpaper, "total", 0);
+    }
+
     cJSON_Delete(root);
     return ESP_OK;
 }
