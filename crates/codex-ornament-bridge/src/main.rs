@@ -5281,7 +5281,6 @@ fn open_shared_tail_read(path: &Path, max_bytes: u64) -> io::Result<File> {
     Ok(file)
 }
 
-
 fn active_tasks_in_session_file(path: &Path, session_id: &str) -> io::Result<Vec<TaskEvent>> {
     let file = open_shared_tail_read(path, SESSION_TASK_SCAN_TAIL_BYTES)?;
     let reader = BufReader::new(file);
