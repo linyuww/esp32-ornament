@@ -594,12 +594,16 @@ static void blend_pixel(int x, int y, uint16_t color, uint8_t alpha)
     *pixel = blend_rgb565(*pixel, color, alpha);
 }
 
-static int draw_utf8_text(int x, int y, const lv_font_t *font, const char *text, uint16_t color, int max_width)
+static bool draw_utf8_text(int x, int y, const lv_font_t *font, const char *text, uint16_t color, int max_width, int *width)
 {
-    if (font == NULL || text == NULL || text[0] == '\0') {
-        return 0;
-    }
     int cursor = x;
+    bool drew_any = false;
+    if (font == NULL || text == NULL || text[0] == '\0') {
+        if (width != NULL) {
+            *width = 0;
+        }
+        return false;
+    }
     uint32_t offset = 0;
     while (text[offset] != '\0') {
         uint32_t letter_offset = offset;
@@ -659,6 +663,7 @@ static int draw_utf8_text(int x, int y, const lv_font_t *font, const char *text,
                 for (int col = 0; col < glyph.box_w; col++) {
                     uint8_t alpha = glyph_alpha_at(bitmap, (uint32_t)row, (uint32_t)col, glyph_stride, bitmap_is_a8, glyph.format);
                     blend_pixel(glyph_x + col, glyph_y + row, color, alpha);
+                    drew_any = drew_any || alpha != 0;
                 }
             }
         }
@@ -668,10 +673,13 @@ static int draw_utf8_text(int x, int y, const lv_font_t *font, const char *text,
         }
         cursor += adv;
     }
-    return cursor - x;
+    if (width != NULL) {
+        *width = cursor - x;
+    }
+    return drew_any;
 }
 
-static void draw_utf8_text_line(
+static bool draw_utf8_text_line(
     int x,
     int y,
     const lv_font_t *font,
@@ -688,10 +696,10 @@ static void draw_utf8_text_line(
     }
     memcpy(line, text + start, length);
     line[length] = '\0';
-    draw_utf8_text(x, y, font, line, color, max_width);
+    return draw_utf8_text(x, y, font, line, color, max_width, NULL);
 }
 
-static void draw_utf8_text_wrapped(
+static bool draw_utf8_text_wrapped(
     int x,
     int y,
     const lv_font_t *font,
@@ -701,12 +709,13 @@ static void draw_utf8_text_wrapped(
     int max_lines)
 {
     if (font == NULL || max_lines <= 0) {
-        return;
+        return false;
     }
     if (text == NULL || text[0] == '\0') {
         text = "--";
     }
 
+    bool drew_any = false;
     uint32_t line_start = 0;
     for (int line = 0; line < max_lines && text[line_start] != '\0'; line++) {
         uint32_t offset = line_start;
@@ -736,7 +745,7 @@ static void draw_utf8_text_wrapped(
             break;
         }
 
-        draw_utf8_text_line(
+        drew_any = draw_utf8_text_line(
             x,
             y + line * (font->line_height + ss(2)),
             font,
@@ -744,13 +753,14 @@ static void draw_utf8_text_wrapped(
             line_start,
             line_end,
             color,
-            max_width);
+            max_width) || drew_any;
 
         line_start = line_end;
         while (text[line_start] == ' ') {
             line_start++;
         }
     }
+    return drew_any;
 }
 
 static int utf8_text_width(const lv_font_t *font, const char *text, int max_width)
@@ -838,7 +848,6 @@ static bool ascii_preview(const char *text, const char *fallback, char *out, siz
     return copied;
 }
 
-#if !CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
 static void draw_ascii_text_wrapped_xy(
     int x,
     int y,
@@ -854,7 +863,10 @@ static void draw_ascii_text_wrapped_xy(
     }
 
     char clean[128];
-    ascii_preview(text, "--", clean, sizeof(clean));
+    ascii_preview(text, "", clean, sizeof(clean));
+    if (clean[0] == '\0' || strcmp(clean, "--") == 0) {
+        return;
+    }
 
     int max_chars = max_width / (6 * x_scale);
     if (max_chars < 1) {
@@ -900,7 +912,143 @@ static void draw_ascii_text_wrapped_xy(
         }
     }
 }
-#endif
+
+typedef struct {
+    uint32_t codepoint;
+    uint16_t rows[16];
+} hud_cn_glyph_t;
+
+static const hud_cn_glyph_t HUD_CN_GLYPHS[] = {
+    {0x660E, {0x7CFE, 0x64C6, 0x6486, 0x6486, 0x64FE, 0x7C86, 0x6486, 0x6486, 0x64FE, 0x6586, 0x7D86, 0x6106, 0x0306, 0x063E, 0x0408, 0x0000}},
+    {0x5929, {0x0000, 0x7FFE, 0x0180, 0x0180, 0x0180, 0x0180, 0xFFFF, 0x0180, 0x03C0, 0x03C0, 0x0660, 0x0C30, 0x1818, 0x700E, 0xE006, 0x0000}},
+    {0x6C14, {0x0000, 0x1800, 0x1FFE, 0x3000, 0x2000, 0x7FFC, 0x4000, 0xC000, 0xBFF8, 0x0018, 0x0008, 0x000B, 0x000F, 0x000F, 0x0006, 0x0000}},
+    {0x600E, {0x0800, 0x1800, 0x3FFE, 0x3600, 0x67FC, 0xC600, 0x0600, 0x07FC, 0x0600, 0x2184, 0x6C9E, 0x4C16, 0xCC33, 0x0FF0, 0x0000, 0x0000}},
+    {0x4E48, {0x0100, 0x0300, 0x0300, 0x0630, 0x0C70, 0x1860, 0x30C0, 0x6180, 0xC190, 0x0318, 0x0618, 0x0C0C, 0x181C, 0x3FFE, 0x3002, 0x0002}},
+    {0x6837, {0x118C, 0x118C, 0x10D8, 0xFFFE, 0x3020, 0x3020, 0x3BFE, 0x7C20, 0x5420, 0xD020, 0x97FF, 0x1020, 0x1020, 0x1020, 0x1020, 0x0000}},
+    {0xFF1F, {0x0000, 0x0000, 0x3C00, 0x7E00, 0x0300, 0x0300, 0x0600, 0x0E00, 0x1C00, 0x1800, 0x1800, 0x0000, 0x1800, 0x1800, 0x0000, 0x0000}},
+    {0x591A, {0x0300, 0x0600, 0x0FFC, 0x181C, 0x3430, 0x67E0, 0x0780, 0x3CC0, 0x71FE, 0x070E, 0x1D1C, 0x31F0, 0x01C0, 0x1F00, 0x7800, 0x0000}},
+    {0x4E91, {0x3FFC, 0x0000, 0x0000, 0x0000, 0x0000, 0xFFFF, 0x0700, 0x0600, 0x0C20, 0x0C30, 0x1818, 0x3018, 0x7FFC, 0x2006, 0x0006, 0x0000}},
+    {0xFF0C, {0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x1800, 0x1800, 0x1000, 0x3000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000}},
+    {0x6709, {0x0200, 0x0600, 0xFFFF, 0x0C00, 0x0C00, 0x1FFC, 0x380C, 0x7FFC, 0xD80C, 0x180C, 0x1FFC, 0x180C, 0x180C, 0x187C, 0x0000, 0x0000}},
+    {0x5C0F, {0x0180, 0x0180, 0x0180, 0x0180, 0x1990, 0x1998, 0x1188, 0x318C, 0x3186, 0x6186, 0x6183, 0xC183, 0x0180, 0x0180, 0x0F80, 0x0600}},
+    {0x96E8, {0x0000, 0xFFFF, 0x0180, 0x0180, 0x7FFE, 0x6186, 0x79E6, 0x6DB6, 0x679E, 0x79E6, 0x6DB6, 0x659E, 0x6186, 0x61BE, 0x0000, 0x0000}},
+    {0x3002, {0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x3000, 0x7800, 0x7800, 0x7800, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000}},
+    {0x5BF9, {0x000C, 0x000C, 0xFE0C, 0x060C, 0x47FF, 0x640C, 0x348C, 0x1CCC, 0x186C, 0x1C6C, 0x3E0C, 0x360C, 0x620C, 0xC07C, 0x0020, 0x0000}},
+    {0x8BDD, {0x607E, 0x77F8, 0x1060, 0x0060, 0x0FFF, 0xF060, 0x3060, 0x33FE, 0x3306, 0x3206, 0x3206, 0x3206, 0x3E06, 0x3BFE, 0x3306, 0x0000}},
+    {0x5DF2, {0x0000, 0x7FFC, 0x000C, 0x000C, 0x200C, 0x200C, 0x3FFC, 0x200C, 0x2000, 0x2003, 0x2003, 0x2003, 0x3006, 0x3FFE, 0x0000, 0x0000}},
+    {0x5B8C, {0x0100, 0x0180, 0x7FFE, 0x4002, 0x0000, 0x3FFC, 0x0000, 0x0000, 0x7FFF, 0x0460, 0x0460, 0x0C63, 0x1863, 0x307E, 0xE000, 0x0000}},
+    {0x6210, {0x0058, 0x004C, 0x0040, 0x3FFF, 0x2060, 0x2060, 0x3F66, 0x236C, 0x236C, 0x6378, 0x6333, 0x7E73, 0xC0FF, 0x818E, 0x0000, 0x0000}},
+};
+
+static uint32_t utf8_next_basic(const char *text, uint32_t *offset)
+{
+    const unsigned char *bytes = (const unsigned char *)text;
+    unsigned char ch = bytes[*offset];
+    if (ch == '\0') {
+        return 0;
+    }
+    if (ch < 0x80) {
+        (*offset)++;
+        return ch;
+    }
+    if ((ch & 0xE0) == 0xC0 && bytes[*offset + 1] != '\0') {
+        uint32_t cp = ((uint32_t)(ch & 0x1F) << 6) | (uint32_t)(bytes[*offset + 1] & 0x3F);
+        *offset += 2;
+        return cp;
+    }
+    if ((ch & 0xF0) == 0xE0 && bytes[*offset + 1] != '\0' && bytes[*offset + 2] != '\0') {
+        uint32_t cp =
+            ((uint32_t)(ch & 0x0F) << 12) |
+            ((uint32_t)(bytes[*offset + 1] & 0x3F) << 6) |
+            (uint32_t)(bytes[*offset + 2] & 0x3F);
+        *offset += 3;
+        return cp;
+    }
+    (*offset)++;
+    return 0;
+}
+
+static const hud_cn_glyph_t *hud_cn_glyph(uint32_t codepoint)
+{
+    for (size_t i = 0; i < sizeof(HUD_CN_GLYPHS) / sizeof(HUD_CN_GLYPHS[0]); i++) {
+        if (HUD_CN_GLYPHS[i].codepoint == codepoint) {
+            return &HUD_CN_GLYPHS[i];
+        }
+    }
+    return NULL;
+}
+
+static bool draw_hud_builtin_cn_wrapped_text(
+    int x,
+    int y,
+    const char *text,
+    uint16_t color,
+    int max_width,
+    int max_lines)
+{
+    if (text == NULL || text[0] == '\0' || max_lines <= 0) {
+        return false;
+    }
+
+    uint32_t validate_offset = 0;
+    while (text[validate_offset] != '\0') {
+        uint32_t codepoint = utf8_next_basic(text, &validate_offset);
+        if (codepoint == '\r' || codepoint == '\n' || codepoint == ' ') {
+            continue;
+        }
+        if (hud_cn_glyph(codepoint) == NULL) {
+            return false;
+        }
+    }
+
+    const int glyph_w = 16;
+    const int line_h = 18;
+    int cursor_x = x;
+    int cursor_y = y;
+    int line_no = 0;
+    uint32_t offset = 0;
+    while (text[offset] != '\0' && line_no < max_lines) {
+        uint32_t codepoint = utf8_next_basic(text, &offset);
+        if (codepoint == '\r' || codepoint == '\n') {
+            cursor_x = x;
+            cursor_y += line_h;
+            line_no++;
+            continue;
+        }
+        if (codepoint == ' ') {
+            if (cursor_x + glyph_w > x + max_width) {
+                cursor_x = x;
+                cursor_y += line_h;
+                line_no++;
+            } else {
+                cursor_x += glyph_w / 2;
+            }
+            continue;
+        }
+        const hud_cn_glyph_t *glyph = hud_cn_glyph(codepoint);
+        if (glyph == NULL) {
+            return false;
+        }
+        if (cursor_x > x && max_width > 0 && cursor_x + glyph_w > x + max_width) {
+            cursor_x = x;
+            cursor_y += line_h;
+            line_no++;
+            if (line_no >= max_lines) {
+                break;
+            }
+        }
+        for (int row = 0; row < 16; row++) {
+            uint16_t bits = glyph->rows[row];
+            for (int col = 0; col < 16; col++) {
+                if ((bits & (uint16_t)(1U << (15 - col))) != 0) {
+                    draw_pixel(cursor_x + col, cursor_y + row, color);
+                }
+            }
+        }
+        cursor_x += glyph_w;
+    }
+    return true;
+}
 
 static void draw_hud_wrapped_text(
     int x,
@@ -917,7 +1065,7 @@ static void draw_hud_wrapped_text(
 #if CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
     render_text = text != NULL && text[0] != '\0' ? text : fallback;
 #else
-    render_text = fallback != NULL ? fallback : text;
+    render_text = text != NULL && text[0] != '\0' ? text : fallback;
 #endif
     if (render_text == NULL || render_text[0] == '\0') {
         return;
@@ -927,18 +1075,22 @@ static void draw_hud_wrapped_text(
     (void)fallback;
     (void)x_scale;
     (void)y_scale;
-    draw_utf8_text_wrapped(x, y, &font_puhui_16_4, render_text, color, max_width, max_lines);
-#else
+    if (draw_utf8_text_wrapped(x, y, &font_puhui_16_4, render_text, color, max_width, max_lines)) {
+        return;
+    }
+#endif
+    if (draw_hud_builtin_cn_wrapped_text(x, y, render_text, color, max_width, max_lines)) {
+        return;
+    }
     draw_ascii_text_wrapped_xy(
         x,
         y,
-        render_text,
+        fallback != NULL && fallback[0] != '\0' ? fallback : render_text,
         color,
         max_width,
         max_lines,
         x_scale,
         y_scale);
-#endif
 }
 
 static void draw_hud_center_text(
@@ -949,15 +1101,24 @@ static void draw_hud_center_text(
     int preferred_scale)
 {
 #if CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
-    (void)fallback;
     (void)preferred_scale;
+    const char *render_text = text != NULL && text[0] != '\0' ? text : fallback;
+    if (render_text == NULL || render_text[0] == '\0') {
+        return;
+    }
     const int max_width = active_canvas->width - sx(32);
-    int width = utf8_text_width(&font_puhui_16_4, text, max_width);
+    int width = utf8_text_width(&font_puhui_16_4, render_text, max_width);
     int x = ((int)active_canvas->width - width) / 2;
     if (x < sx(8)) {
         x = sx(8);
     }
-    draw_utf8_text(x, y, &font_puhui_16_4, text, color, max_width);
+    if (draw_utf8_text(x, y, &font_puhui_16_4, render_text, color, max_width, NULL)) {
+        return;
+    }
+    if (draw_hud_builtin_cn_wrapped_text(x, y, render_text, color, max_width, 1)) {
+        return;
+    }
+    draw_text_center_fit(y, fallback != NULL && fallback[0] != '\0' ? fallback : render_text, preferred_scale, color);
 #else
     draw_text_center_fit(y, fallback != NULL && fallback[0] != '\0' ? fallback : text, preferred_scale, color);
 #endif
@@ -1661,27 +1822,7 @@ static const char *xiaozhi_hud_main_ascii(xiaozhi_client_state_t state);
 
 static const char *xiaozhi_hud_user_hint(const xiaozhi_client_snapshot_t *snapshot)
 {
-    if (snapshot == NULL) {
-        return "";
-    }
-    if (snapshot->activation_pending) {
-        return snapshot->activation_code[0] != '\0' ? snapshot->activation_code : "";
-    }
-    if (snapshot->last_stt[0] != '\0') {
-        return snapshot->last_stt;
-    }
-    switch (snapshot->state) {
-    case XIAOZHI_CLIENT_STATE_ERROR:
-    case XIAOZHI_CLIENT_STATE_CONFIG_MISSING:
-        return snapshot->last_error[0] != '\0' ? snapshot->last_error : "";
-    case XIAOZHI_CLIENT_STATE_LISTENING:
-    case XIAOZHI_CLIENT_STATE_SPEAKING:
-    case XIAOZHI_CLIENT_STATE_CONNECTING:
-    case XIAOZHI_CLIENT_STATE_IDLE:
-    case XIAOZHI_CLIENT_STATE_DISABLED:
-    default:
-        return "";
-    }
+    return snapshot != NULL ? snapshot->last_stt : "";
 }
 
 static const char *xiaozhi_hud_main_text(xiaozhi_client_state_t state)
@@ -1728,54 +1869,14 @@ static const char *xiaozhi_hud_main_ascii(xiaozhi_client_state_t state)
 
 static const char *xiaozhi_hud_assistant_hint(const xiaozhi_client_snapshot_t *snapshot, const char *tts_text)
 {
-    if (snapshot == NULL) {
-        return "";
-    }
-    if (snapshot->activation_pending) {
-        return snapshot->activation_code[0] != '\0' ? snapshot->activation_code :
-            (snapshot->activation_message[0] != '\0' ? snapshot->activation_message : "");
-    }
-    if (snapshot->last_tts[0] != '\0') {
-        return tts_text;
-    }
-    switch (snapshot->state) {
-    case XIAOZHI_CLIENT_STATE_ERROR:
-    case XIAOZHI_CLIENT_STATE_CONFIG_MISSING:
-        return snapshot->last_error[0] != '\0' ? snapshot->last_error : "";
-    case XIAOZHI_CLIENT_STATE_LISTENING:
-    case XIAOZHI_CLIENT_STATE_SPEAKING:
-    case XIAOZHI_CLIENT_STATE_CONNECTING:
-    case XIAOZHI_CLIENT_STATE_IDLE:
-    case XIAOZHI_CLIENT_STATE_DISABLED:
-    default:
-        return "";
-    }
+    (void)tts_text;
+    return snapshot != NULL ? snapshot->last_tts : "";
 }
 
 static const char *xiaozhi_hud_assistant_ascii(const xiaozhi_client_snapshot_t *snapshot, const char *tts_text)
 {
-    if (snapshot == NULL) {
-        return "";
-    }
-    if (snapshot->activation_pending) {
-        return snapshot->activation_code[0] != '\0' ? snapshot->activation_code :
-            (snapshot->activation_message[0] != '\0' ? snapshot->activation_message : "");
-    }
-    if (snapshot->last_tts[0] != '\0') {
-        return tts_text;
-    }
-    switch (snapshot->state) {
-    case XIAOZHI_CLIENT_STATE_ERROR:
-    case XIAOZHI_CLIENT_STATE_CONFIG_MISSING:
-        return snapshot->last_error[0] != '\0' ? snapshot->last_error : "";
-    case XIAOZHI_CLIENT_STATE_LISTENING:
-    case XIAOZHI_CLIENT_STATE_SPEAKING:
-    case XIAOZHI_CLIENT_STATE_CONNECTING:
-    case XIAOZHI_CLIENT_STATE_IDLE:
-    case XIAOZHI_CLIENT_STATE_DISABLED:
-    default:
-        return "";
-    }
+    (void)tts_text;
+    return snapshot != NULL ? snapshot->last_tts : "";
 }
 
 static const char *xiaozhi_hud_done_text(void)
@@ -2363,7 +2464,14 @@ static void draw_music_lyrics(const music_player_snapshot_t *snapshot, int x, in
     if (line_count > 0) {
         for (int i = 0; i < 3; i++) {
             uint16_t color = i == 1 ? HUD_WHITE : HUD_MUTED;
-            draw_utf8_text(x, y + i * sy(24), &font_puhui_16_4, lines_utf8[i][0] != '\0' ? lines_utf8[i] : "--", color, w);
+            (void)draw_utf8_text(
+                x,
+                y + i * sy(24),
+                &font_puhui_16_4,
+                lines_utf8[i][0] != '\0' ? lines_utf8[i] : "--",
+                color,
+                w,
+                NULL);
         }
         return;
     }
@@ -2456,15 +2564,11 @@ void display_core_render_xiaozhi(
     char stt_preview[96];
     char assistant_preview[96];
     const char *stt_text = xiaozhi_hud_user_hint(snapshot);
-    const char *tts_text = snapshot->last_tts[0] != '\0' ? snapshot->last_tts :
-        (snapshot->activation_pending ?
-            (snapshot->activation_code[0] != '\0' ? snapshot->activation_code : "BIND DEVICE") :
-            "");
     const bool completed = snapshot->state == XIAOZHI_CLIENT_STATE_IDLE && snapshot->last_tts[0] != '\0';
     const char *main_text = completed ? xiaozhi_hud_done_text() : xiaozhi_hud_main_text(snapshot->state);
     const char *main_ascii = completed ? "DONE" : xiaozhi_hud_main_ascii(snapshot->state);
-    const char *assistant_text = xiaozhi_hud_assistant_hint(snapshot, tts_text);
-    const char *assistant_ascii = xiaozhi_hud_assistant_ascii(snapshot, tts_text);
+    const char *assistant_text = xiaozhi_hud_assistant_hint(snapshot, snapshot->last_tts);
+    const char *assistant_ascii = xiaozhi_hud_assistant_ascii(snapshot, snapshot->last_tts);
     bool stt_ascii_available = ascii_preview(stt_text, "", stt_preview, sizeof(stt_preview));
     bool assistant_ascii_available = ascii_preview(assistant_ascii, "", assistant_preview, sizeof(assistant_preview));
     if (!stt_ascii_available) {
