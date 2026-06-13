@@ -163,6 +163,19 @@ static bool standby_timer_eligible(const ornament_state_t *state)
     return status != ORNAMENT_STATUS_RUNNING && status != ORNAMENT_STATUS_ERROR;
 }
 
+static bool automatic_state_page_active(const ornament_state_t *state)
+{
+    if (state == NULL) {
+        return false;
+    }
+    if (state->active_task_count > 0 || state->done_flash_active) {
+        return true;
+    }
+
+    ornament_status_t status = ornament_state_panel_status(state);
+    return status == ORNAMENT_STATUS_RUNNING || status == ORNAMENT_STATUS_ERROR;
+}
+
 static bool should_show_standby_clock(const ornament_state_t *state, TickType_t idle_since_tick, TickType_t now)
 {
     if (state != NULL && state->bridge_offline && state->active_task_count == 0) {
@@ -1394,7 +1407,9 @@ static void ui_render_task(void *arg)
                                   voice_view_active(voice_state.view, voice_state.hold_until_tick, now);
         bool manual_xiaozhi_page = have_voice_state &&
                                    voice_manual_xiaozhi_page_active(&voice_state, now);
-        bool xiaozhi_page_visible = manual_xiaozhi_page || (xiaozhi_page_active && !manual_page_active);
+        bool automatic_state_page = automatic_state_page_active(&state);
+        bool xiaozhi_page_visible = !automatic_state_page &&
+                                    (manual_xiaozhi_page || (xiaozhi_page_active && !manual_page_active));
 
         bool standby_eligible = standby_timer_eligible(&state);
         if (standby_eligible) {
@@ -1416,17 +1431,20 @@ static void ui_render_task(void *arg)
         previous_xiaozhi_page_active = xiaozhi_page_visible;
 
         bool page_rendered = false;
-        if (manual_page_active) {
+        if (ui_music_snapshot.active || ui_music_snapshot.state == MUSIC_PLAYER_STATE_ERROR) {
+            display_render_music(&state, &ui_music_snapshot);
+            page_rendered = true;
+        } else if (automatic_state_page) {
+            display_render_state(&state);
+            page_rendered = true;
+        } else if (xiaozhi_page_visible) {
+            display_render_xiaozhi(&state, &xiaozhi_snapshot);
+            page_rendered = true;
+        } else if (manual_page_active) {
             page_rendered = render_voice_override(&state, fetch_error, &xiaozhi_snapshot, &voice_state, now);
         }
         if (!page_rendered) {
-            if (ui_music_snapshot.active || ui_music_snapshot.state == MUSIC_PLAYER_STATE_ERROR) {
-                display_render_music(&state, &ui_music_snapshot);
-            } else if (xiaozhi_page_visible) {
-                display_render_xiaozhi(&state, &xiaozhi_snapshot);
-            } else if (!(have_voice_state && render_voice_override(&state, fetch_error, &xiaozhi_snapshot, &voice_state, now))) {
-                render_current_state(&state, idle_since_tick, now);
-            }
+            render_current_state(&state, idle_since_tick, now);
         }
 
         previous_xiaozhi_snapshot = xiaozhi_snapshot;
