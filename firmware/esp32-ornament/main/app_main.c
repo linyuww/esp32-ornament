@@ -1434,14 +1434,14 @@ static void ui_render_task(void *arg)
         if (ui_music_snapshot.active || ui_music_snapshot.state == MUSIC_PLAYER_STATE_ERROR) {
             display_render_music(&state, &ui_music_snapshot);
             page_rendered = true;
+        } else if (manual_page_active) {
+            page_rendered = render_voice_override(&state, fetch_error, &xiaozhi_snapshot, &voice_state, now);
         } else if (automatic_state_page) {
             display_render_state(&state);
             page_rendered = true;
         } else if (xiaozhi_page_visible) {
             display_render_xiaozhi(&state, &xiaozhi_snapshot);
             page_rendered = true;
-        } else if (manual_page_active) {
-            page_rendered = render_voice_override(&state, fetch_error, &xiaozhi_snapshot, &voice_state, now);
         }
         if (!page_rendered) {
             render_current_state(&state, idle_since_tick, now);
