@@ -2651,8 +2651,9 @@ void display_core_render_xiaozhi(
     clear_canvas(HUD_HUD_BG);
     draw_hud_chamfer_box(margin, outer_y, active_canvas->width - margin * 2, outer_h, ss(12), line, HUD_HUD_CYAN);
     draw_hline(margin + sx(2), active_canvas->width - margin - sx(2), top_sep_y, thin, HUD_HUD_DIM);
-    fill_circle(active_canvas->center_x, time_y + ss(3), ss(3), HUD_HUD_CYAN);
-    draw_text_xy(sx(22), time_y, time_text, text_scale, text_scale, HUD_HUD_CYAN);
+    draw_text_xy(sx(22), time_y, "XIAOZHI", text_scale, text_scale, HUD_WHITE);
+    fill_circle(active_canvas->center_x, time_y + ss(3), ss(3), state_color);
+    draw_text_right_fit_xy(active_canvas->width - sx(22), time_y, time_text, text_scale, text_scale, HUD_HUD_CYAN);
 
     draw_hud_chamfer_box(query_x, query_y, query_w, query_h, ss(8), thin, HUD_HUD_DIM);
     draw_hud_user_icon(query_x + ss(8), query_y + ss(9), icon_size, HUD_HUD_CYAN);
