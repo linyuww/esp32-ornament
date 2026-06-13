@@ -548,60 +548,11 @@ static uint32_t utf8_next(const char *text, uint32_t *offset)
     return lv_text_encoded_next(text, offset);
 }
 
-static uint8_t lv_alpha_from_bitmap(const uint8_t *bitmap, uint32_t index, lv_font_glyph_format_t format)
+static void ensure_lvgl_font_decoder_ready(void)
 {
-    switch (format) {
-    case LV_FONT_GLYPH_FORMAT_A1:
-        return (bitmap[index / 8] & (uint8_t)(0x80 >> (index % 8))) ? 255 : 0;
-    case LV_FONT_GLYPH_FORMAT_A2:
-        return (uint8_t)(((bitmap[index / 4] >> (6 - (index % 4) * 2)) & 0x03) * 85);
-    case LV_FONT_GLYPH_FORMAT_A4:
-        return (uint8_t)(((index & 1) == 0 ? (bitmap[index / 2] >> 4) : bitmap[index / 2] & 0x0F) * 17);
-    case LV_FONT_GLYPH_FORMAT_A8:
-        return bitmap[index];
-    default:
-        return 0;
+    if (!lv_is_initialized()) {
+        lv_init();
     }
-}
-
-static uint8_t glyph_alpha_at(
-    const uint8_t *bitmap,
-    uint32_t row,
-    uint32_t col,
-    uint32_t stride,
-    bool bitmap_is_a8,
-    lv_font_glyph_format_t format)
-{
-    uint32_t bitmap_index = row * stride + col;
-    if (bitmap_is_a8) {
-        return bitmap[bitmap_index];
-    }
-    return lv_alpha_from_bitmap(bitmap, bitmap_index, format);
-}
-
-static const uint8_t *glyph_bitmap_bytes(
-    const void *bitmap_ref,
-    const lv_draw_buf_t *draw_buf,
-    uint32_t *stride,
-    bool *bitmap_is_a8)
-{
-    if (bitmap_ref == NULL) {
-        return NULL;
-    }
-    if (draw_buf != NULL &&
-        (bitmap_ref == (const void *)draw_buf || bitmap_ref == (const void *)draw_buf->data)) {
-        if (stride != NULL) {
-            *stride = draw_buf->header.stride;
-        }
-        if (bitmap_is_a8 != NULL) {
-            *bitmap_is_a8 = true;
-        }
-        return draw_buf->data;
-    }
-    if (bitmap_is_a8 != NULL) {
-        *bitmap_is_a8 = false;
-    }
-    return (const uint8_t *)bitmap_ref;
 }
 
 static void blend_pixel(int x, int y, uint16_t color, uint8_t alpha)
@@ -627,6 +578,7 @@ static bool draw_utf8_text(int x, int y, const lv_font_t *font, const char *text
         }
         return false;
     }
+    ensure_lvgl_font_decoder_ready();
     uint32_t offset = 0;
     while (text[offset] != '\0') {
         uint32_t letter_offset = offset;
@@ -648,51 +600,60 @@ static bool draw_utf8_text(int x, int y, const lv_font_t *font, const char *text
             cursor += adv > 0 ? adv : font->line_height / 2;
             continue;
         }
-        uint8_t glyph_bitmap_storage[384];
-        uint8_t *glyph_bitmap_buffer = glyph_bitmap_storage;
+        if (glyph.is_placeholder) {
+            lv_font_glyph_release_draw_data(&glyph);
+            cursor += adv > 0 ? adv : font->line_height / 2;
+            continue;
+        }
+        uint8_t glyph_bitmap_storage[384 + LV_DRAW_BUF_ALIGN];
+        uint8_t *glyph_bitmap_buffer = (uint8_t *)LV_ROUND_UP((lv_uintptr_t)glyph_bitmap_storage, LV_DRAW_BUF_ALIGN);
+        uint8_t *allocated_bitmap_buffer = NULL;
         lv_draw_buf_t glyph_draw_buf;
-        lv_draw_buf_t *glyph_draw_buf_ptr = NULL;
         uint32_t glyph_stride = lv_draw_buf_width_to_stride(glyph.box_w, LV_COLOR_FORMAT_A8);
         uint32_t glyph_bitmap_size = LV_DRAW_BUF_SIZE(glyph.box_w, glyph.box_h, LV_COLOR_FORMAT_A8);
-        bool bitmap_is_a8 = false;
+        size_t glyph_bitmap_capacity =
+            sizeof(glyph_bitmap_storage) - (size_t)(glyph_bitmap_buffer - glyph_bitmap_storage);
         if (glyph.box_w <= 0 || glyph.box_h <= 0) {
             cursor += adv;
             continue;
         }
-        if (glyph_bitmap_size > sizeof(glyph_bitmap_storage)) {
-            glyph_bitmap_buffer = lv_malloc(glyph_bitmap_size);
-            if (glyph_bitmap_buffer == NULL) {
+        if (glyph_bitmap_size > glyph_bitmap_capacity) {
+            allocated_bitmap_buffer = lv_malloc(glyph_bitmap_size + LV_DRAW_BUF_ALIGN);
+            if (allocated_bitmap_buffer == NULL) {
                 lv_font_glyph_release_draw_data(&glyph);
                 cursor += adv;
                 continue;
             }
+            glyph_bitmap_buffer = (uint8_t *)LV_ROUND_UP((lv_uintptr_t)allocated_bitmap_buffer, LV_DRAW_BUF_ALIGN);
+            glyph_bitmap_capacity =
+                glyph_bitmap_size + LV_DRAW_BUF_ALIGN - (size_t)(glyph_bitmap_buffer - allocated_bitmap_buffer);
         }
-        if (lv_draw_buf_init(
-                &glyph_draw_buf,
-                glyph.box_w,
-                glyph.box_h,
-                LV_COLOR_FORMAT_A8,
-                glyph_stride,
-                glyph_bitmap_buffer,
-                glyph_bitmap_size) == LV_RESULT_OK) {
-            glyph_draw_buf_ptr = &glyph_draw_buf;
-        }
-        const void *bitmap_ref = lv_font_get_glyph_bitmap(&glyph, glyph_draw_buf_ptr);
-        const uint8_t *bitmap = glyph_bitmap_bytes(bitmap_ref, glyph_draw_buf_ptr, &glyph_stride, &bitmap_is_a8);
-        if (bitmap != NULL) {
+        const lv_result_t draw_buf_ready = lv_draw_buf_init(
+            &glyph_draw_buf,
+            glyph.box_w,
+            glyph.box_h,
+            LV_COLOR_FORMAT_A8,
+            glyph_stride,
+            glyph_bitmap_buffer,
+            glyph_bitmap_capacity);
+        const lv_draw_buf_t *glyph_bitmap = draw_buf_ready == LV_RESULT_OK
+            ? (const lv_draw_buf_t *)lv_font_get_glyph_bitmap(&glyph, &glyph_draw_buf)
+            : NULL;
+        if (glyph_bitmap != NULL && glyph_bitmap->data != NULL) {
+            glyph_stride = glyph_bitmap->header.stride;
             int glyph_x = cursor + glyph.ofs_x;
             int glyph_y = y + font->line_height - font->base_line - glyph.box_h - glyph.ofs_y;
             for (int row = 0; row < glyph.box_h; row++) {
                 for (int col = 0; col < glyph.box_w; col++) {
-                    uint8_t alpha = glyph_alpha_at(bitmap, (uint32_t)row, (uint32_t)col, glyph_stride, bitmap_is_a8, glyph.format);
+                    uint8_t alpha = glyph_bitmap->data[(uint32_t)row * glyph_stride + (uint32_t)col];
                     blend_pixel(glyph_x + col, glyph_y + row, color, alpha);
                     drew_any = drew_any || alpha != 0;
                 }
             }
         }
         lv_font_glyph_release_draw_data(&glyph);
-        if (glyph_bitmap_buffer != glyph_bitmap_storage) {
-            lv_free(glyph_bitmap_buffer);
+        if (allocated_bitmap_buffer != NULL) {
+            lv_free(allocated_bitmap_buffer);
         }
         cursor += adv;
     }
@@ -700,6 +661,35 @@ static bool draw_utf8_text(int x, int y, const lv_font_t *font, const char *text
         *width = cursor - x;
     }
     return drew_any;
+}
+
+static bool utf8_text_has_placeholder_glyph(const lv_font_t *font, const char *text)
+{
+    if (font == NULL || text == NULL || text[0] == '\0') {
+        return false;
+    }
+    ensure_lvgl_font_decoder_ready();
+
+    uint32_t offset = 0;
+    while (text[offset] != '\0') {
+        uint32_t letter_offset = offset;
+        uint32_t letter = utf8_next(text, &offset);
+        uint32_t next_offset = offset;
+        uint32_t letter_next = utf8_next(text, &next_offset);
+        if (letter == 0 || offset == letter_offset) {
+            offset++;
+            continue;
+        }
+
+        lv_font_glyph_dsc_t glyph = {0};
+        if (!lv_font_get_glyph_dsc(font, &glyph, letter, letter_next) || glyph.is_placeholder) {
+            lv_font_glyph_release_draw_data(&glyph);
+            return true;
+        }
+        lv_font_glyph_release_draw_data(&glyph);
+    }
+
+    return false;
 }
 
 static bool draw_utf8_text_line(
@@ -734,6 +724,7 @@ static bool draw_utf8_text_wrapped(
     if (font == NULL || max_lines <= 0) {
         return false;
     }
+    ensure_lvgl_font_decoder_ready();
     if (text == NULL || text[0] == '\0') {
         text = "--";
     }
@@ -791,6 +782,7 @@ static int utf8_text_width(const lv_font_t *font, const char *text, int max_widt
     if (font == NULL || text == NULL || text[0] == '\0') {
         return 0;
     }
+    ensure_lvgl_font_decoder_ready();
 
     int width = 0;
     uint32_t offset = 0;
@@ -2383,6 +2375,9 @@ static bool draw_music_utf8_text_fit(
 {
     const char *render_text = text != NULL && text[0] != '\0' ? text : fallback;
     if (font == NULL || render_text == NULL || render_text[0] == '\0') {
+        return false;
+    }
+    if (utf8_text_has_placeholder_glyph(font, render_text)) {
         return false;
     }
 
