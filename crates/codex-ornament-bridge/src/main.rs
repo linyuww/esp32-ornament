@@ -67,8 +67,7 @@ const DEFAULT_STANDBY_WALLPAPER_WIDTH: u32 = 240;
 const DEFAULT_STANDBY_WALLPAPER_HEIGHT: u32 = 240;
 const RECONCILED_DONE_NOTIFY_WINDOW: Duration = Duration::from_secs(120);
 const COMBINED_DONE_SOURCE_WINDOW: Duration = Duration::from_secs(5);
-const RECOVER_UNSCOPED_ACTIVE_TASK_WINDOW: Duration = Duration::from_secs(10 * 60);
-const ACTIVE_SESSION_UNCONFIRMED_STALE_GRACE: Duration = Duration::from_secs(10 * 60);
+const RECOVER_UNSCOPED_ACTIVE_TASK_WINDOW: Duration = Duration::from_secs(30 * 60);
 const RECOVER_ACTIVE_SESSION_SCAN_LIMIT: usize = 24;
 const SESSION_TASK_SCAN_TAIL_BYTES: u64 = 2 * 1024 * 1024;
 const ACTIVE_SESSION_FILE_MISSING_GRACE: Duration = Duration::from_secs(30);
@@ -2057,11 +2056,7 @@ fn remember_done_task(state: &mut BridgeState, event: TaskEvent) {
 
 fn recover_active_task_if_needed(state: &mut BridgeState, config: &BridgeConfig) {
     let events = if let Some(session_id) = config.tracked_session_id.as_deref() {
-        active_task_for_session(&config.codex_home, session_id)
-            .into_iter()
-            .collect::<Vec<_>>()
-    } else if state_has_active_codex_task(state) {
-        Vec::new()
+        active_tasks_for_session(&config.codex_home, session_id)
     } else {
         cached_active_recovery_events(state, config)
     };
@@ -2072,13 +2067,6 @@ fn recover_active_task_if_needed(state: &mut BridgeState, config: &BridgeConfig)
         }
         apply_task_event(state, event);
     }
-}
-
-fn state_has_active_codex_task(state: &BridgeState) -> bool {
-    state
-        .active_tasks
-        .values()
-        .any(|event| done_source(event) == DoneSource::Codex)
 }
 
 fn cached_active_recovery_events(state: &mut BridgeState, config: &BridgeConfig) -> Vec<TaskEvent> {
@@ -2096,11 +2084,10 @@ fn cached_active_recovery_events(state: &mut BridgeState, config: &BridgeConfig)
     events
 }
 
-fn active_task_for_session(codex_home: &Path, session_id: &str) -> Option<TaskEvent> {
-    let session_file = find_session_file(codex_home, session_id)?;
-    active_task_in_session_file(&session_file, session_id)
-        .ok()
-        .flatten()
+fn active_tasks_for_session(codex_home: &Path, session_id: &str) -> Vec<TaskEvent> {
+    find_session_file(codex_home, session_id)
+        .and_then(|session_file| active_tasks_in_session_file(&session_file, session_id).ok())
+        .unwrap_or_default()
 }
 
 fn active_task_is_already_tracked(state: &BridgeState, event: &TaskEvent) -> bool {
@@ -4560,11 +4547,7 @@ fn active_task_is_stale_against_session_log(codex_home: &Path, event: &TaskEvent
                 .iter()
                 .any(|active| active.turn_id.as_deref() == Some(turn_id))
             {
-                return session_idle_stale
-                    || timestamp_is_older_than(
-                        &event.received_at,
-                        ACTIVE_SESSION_UNCONFIRMED_STALE_GRACE,
-                    );
+                return session_idle_stale;
             }
 
             let same_cwd_newer_active = event.cwd.as_deref().and_then(|cwd| {
@@ -4970,24 +4953,40 @@ fn find_session_file(codex_home: &Path, session_id: &str) -> Option<PathBuf> {
 }
 
 fn active_tasks_in_recent_session_files(codex_home: &Path) -> Vec<TaskEvent> {
-    recent_session_files(&codex_home.join("sessions"))
-        .into_iter()
-        .filter_map(|path| {
-            let session_id = session_id_from_file_name(&path)?;
-            let active = active_task_in_session_file(&path, &session_id)
-                .ok()
-                .flatten()?;
+    let mut recovered = Vec::new();
+    for path in recent_session_files(&codex_home.join("sessions")) {
+        let Some(session_id) = session_id_from_file_name(&path) else {
+            continue;
+        };
+        let session_is_recent = session_file_is_recent(&path, RECOVER_UNSCOPED_ACTIVE_TASK_WINDOW);
+        let Ok(active_tasks) = active_tasks_in_session_file(&path, &session_id) else {
+            continue;
+        };
+        for active in active_tasks {
             let has_newer_turn = active_task_has_newer_turn_in_session_file(&path, &active)
                 .ok()
                 .unwrap_or(false);
+            let task_is_recent =
+                timestamp_is_recent(&active.received_at, RECOVER_UNSCOPED_ACTIVE_TASK_WINDOW);
             if has_newer_turn
-                || !timestamp_is_recent(&active.received_at, RECOVER_UNSCOPED_ACTIVE_TASK_WINDOW)
+                || (!task_is_recent && !session_is_recent)
+                || active_task_is_stale_against_session_log(codex_home, &active)
             {
-                return None;
+                continue;
             }
-            Some(active)
-        })
-        .collect()
+            recovered.push(active);
+        }
+    }
+    recovered
+}
+
+fn session_file_is_recent(path: &Path, window: Duration) -> bool {
+    session_file_last_timestamp(path)
+        .ok()
+        .flatten()
+        .is_some_and(|timestamp| timestamp_is_recent(&timestamp, window))
+        || file_modified_at(path)
+            .is_some_and(|modified_at| system_time_is_recent(modified_at, window))
 }
 
 fn session_ancestor_ids(codex_home: &Path, session_id: &str) -> Vec<String> {
@@ -5190,9 +5189,6 @@ fn open_shared_tail_read(path: &Path, max_bytes: u64) -> io::Result<File> {
     Ok(file)
 }
 
-fn active_task_in_session_file(path: &Path, session_id: &str) -> io::Result<Option<TaskEvent>> {
-    Ok(active_tasks_in_session_file(path, session_id)?.pop())
-}
 
 fn active_tasks_in_session_file(path: &Path, session_id: &str) -> io::Result<Vec<TaskEvent>> {
     let file = open_shared_tail_read(path, SESSION_TASK_SCAN_TAIL_BYTES)?;
@@ -5581,6 +5577,13 @@ fn timestamp_is_recent(timestamp: &str, window: Duration) -> bool {
     };
     let age = Local::now().signed_duration_since(timestamp.with_timezone(&Local));
     age.to_std().map(|age| age <= window).unwrap_or(false)
+}
+
+fn system_time_is_recent(timestamp: std::time::SystemTime, window: Duration) -> bool {
+    timestamp
+        .elapsed()
+        .map(|age| age <= window)
+        .unwrap_or(false)
 }
 
 fn timestamp_is_older_than(timestamp: &str, window: Duration) -> bool {
@@ -8694,7 +8697,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_skips_recent_session_recovery_while_other_task_is_active() {
+    fn snapshot_recovers_recent_session_while_current_task_is_active() {
         let codex_home = env::temp_dir().join(format!(
             "codex-ornament-recover-with-active-{}",
             std::process::id()
@@ -8731,21 +8734,24 @@ mod tests {
         let snapshot = task_snapshot(&state, &config);
         let _ = fs::remove_dir_all(&codex_home);
 
-        assert_eq!(snapshot.active_task_count, 1);
+        assert_eq!(snapshot.active_task_count, 2);
         assert_eq!(
             snapshot
                 .active_tasks
                 .iter()
                 .filter_map(|event| event.session_id.as_deref())
                 .collect::<Vec<_>>(),
-            vec!["22222222-2222-2222-2222-222222222222"]
+            vec![
+                "22222222-2222-2222-2222-222222222222",
+                "11111111-1111-1111-1111-111111111111"
+            ]
         );
     }
 
     #[test]
-    fn snapshot_does_not_recover_other_session_when_codex_task_is_already_active() {
+    fn snapshot_counts_current_task_with_recovered_recent_tasks() {
         let codex_home = env::temp_dir().join(format!(
-            "codex-ornament-skip-recover-with-current-active-{}",
+            "codex-ornament-count-current-plus-recovered-{}",
             std::process::id()
         ));
         let session_dir = codex_home
@@ -8754,14 +8760,33 @@ mod tests {
             .join("05")
             .join("31");
         fs::create_dir_all(&session_dir).unwrap();
-        let recovered_at = recent_timestamp(1);
-        fs::write(
-            session_dir.join("rollout-2026-05-31T20-42-42-11111111-1111-1111-1111-111111111111.jsonl"),
-            format!(
-                "{{\"timestamp\":\"{recovered_at}\",\"payload\":{{\"type\":\"task_started\",\"turn_id\":\"ghost-turn\"}}}}\n"
+        let recovered_sessions = [
+            (
+                "11111111-1111-1111-1111-111111111111",
+                "recovered-turn-1",
+                4,
             ),
-        )
-        .unwrap();
+            (
+                "33333333-3333-3333-3333-333333333333",
+                "recovered-turn-2",
+                3,
+            ),
+            (
+                "44444444-4444-4444-4444-444444444444",
+                "recovered-turn-3",
+                2,
+            ),
+        ];
+        for (session_id, turn_id, seconds_ago) in recovered_sessions {
+            fs::write(
+                session_dir.join(format!("rollout-2026-05-31T20-42-42-{session_id}.jsonl")),
+                format!(
+                    "{{\"timestamp\":\"{}\",\"payload\":{{\"type\":\"task_started\",\"turn_id\":\"{turn_id}\"}}}}\n",
+                    recent_timestamp(seconds_ago)
+                ),
+            )
+            .unwrap();
+        }
         let state = Arc::new(Mutex::new(BridgeState::default()));
         {
             let mut state = state.lock().unwrap();
@@ -8780,14 +8805,20 @@ mod tests {
         let snapshot = task_snapshot(&state, &config);
         let _ = fs::remove_dir_all(&codex_home);
 
-        assert_eq!(snapshot.active_task_count, 1);
-        assert_eq!(
-            snapshot
-                .active_tasks
-                .first()
-                .and_then(|event| event.turn_id.as_deref()),
-            Some("current-turn")
-        );
+        let active: HashSet<(Option<String>, Option<String>)> = snapshot
+            .active_tasks
+            .into_iter()
+            .map(|event| (event.session_id, event.turn_id))
+            .collect();
+
+        assert_eq!(snapshot.active_task_count, 4);
+        assert!(active.contains(&(
+            Some("22222222-2222-2222-2222-222222222222".to_string()),
+            Some("current-turn".to_string())
+        )));
+        for (session_id, turn_id, _) in recovered_sessions {
+            assert!(active.contains(&(Some(session_id.to_string()), Some(turn_id.to_string()))));
+        }
     }
 
     #[test]
@@ -10437,7 +10468,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_drops_unconfirmed_codex_turn_after_stale_grace() {
+    fn snapshot_drops_unconfirmed_codex_turn_after_session_idle_grace() {
         let codex_home = env::temp_dir().join(format!(
             "codex-ornament-unconfirmed-stale-{}",
             std::process::id()
@@ -10449,8 +10480,7 @@ mod tests {
             .join("31");
         fs::create_dir_all(&session_dir).unwrap();
 
-        let old_timestamp =
-            past_timestamp((ACTIVE_SESSION_UNCONFIRMED_STALE_GRACE.as_secs() as i64) + 60);
+        let old_timestamp = past_timestamp((ACTIVE_SESSION_IDLE_STALE_GRACE.as_secs() as i64) + 60);
         fs::write(
             session_dir.join("rollout-2026-05-31T16-59-09-session-1.jsonl"),
             format!(
