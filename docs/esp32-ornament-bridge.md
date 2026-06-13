@@ -33,9 +33,9 @@ POST /event        /hook/codex 的别名
 
 ## 音乐播放桥接
 
-ESP32 只负责拉取固定格式数据：音频为 `audio/L16; rate=16000; channels=1`，封面为 96x96 RGB565LE 原始像素，歌词随 `/v1/music/resolve` 的 `lyrics` 字段返回。桥接服务负责调用音乐 API、获取专辑图和歌词，并使用本机 `ffmpeg` 转码音频与封面。
+ESP32 只负责拉取固定格式数据：音频为 `audio/L16; rate=16000; channels=1`，封面为 96x96 RGB565LE 原始像素。桥接服务负责调用音乐 API、获取专辑图和可选歌词，并使用本机 `ffmpeg` 转码音频与封面。
 
-`/v1/music/resolve?song=...&artist=...&index=1` 返回 `title`、`artist`、`album`、`picture`、`coverUrl`、`url` 和可选 `lyrics`。ESP32 播放时先解析元数据，再拉取 `coverUrl` 显示专辑封面，同时从 `lyrics` 做播放页滚动显示。
+`/v1/music/resolve?song=...&artist=...&index=1` 返回 `title`、`artist`、`album`、`picture`、`coverUrl`、`url`、可选 `durationMs` 和可选 `lyrics`。ESP32 播放时先解析元数据，再拉取 `coverUrl` 显示专辑封面；音乐页不显示歌词，播放进度由设备实际播放时间和桥端总时长计算。
 
 运行音乐功能前确认 `ffmpeg` 在 PATH 中：
 

@@ -412,6 +412,8 @@ struct MusicResolveResponse {
     cover_url: String,
     url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    duration_ms: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     lyrics: Option<String>,
 }
 
@@ -430,6 +432,7 @@ struct ResolvedSong {
     album: String,
     picture: String,
     url: String,
+    duration_ms: Option<u32>,
     lyrics: Option<String>,
 }
 
@@ -623,6 +626,16 @@ struct YaohudMusicData {
     #[serde(default)]
     url: Option<String>,
     #[serde(default)]
+    duration_ms: Option<Value>,
+    #[serde(default, rename = "durationMs")]
+    duration_ms_camel: Option<Value>,
+    #[serde(default, rename = "duration")]
+    duration: Option<Value>,
+    #[serde(default)]
+    interval: Option<Value>,
+    #[serde(default, rename = "songTime")]
+    song_time: Option<Value>,
+    #[serde(default)]
     lrc: Option<String>,
     #[serde(default)]
     lyrics: Option<String>,
@@ -651,6 +664,8 @@ struct NeteaseSearchResult {
 struct NeteaseSong {
     id: u64,
     name: String,
+    #[serde(default)]
+    duration: Option<u32>,
     #[serde(default)]
     artists: Vec<NeteaseArtist>,
     album: Option<NeteaseAlbum>,
@@ -3329,6 +3344,7 @@ fn music_resolve_response(
         picture: song.picture.clone(),
         cover_url: music_cover_url(config, peer, request, Some(song)),
         url: music_stream_url(config, peer, request),
+        duration_ms: song.duration_ms,
         lyrics: song.lyrics.clone(),
     }
 }
@@ -3730,6 +3746,7 @@ fn resolve_song_yaohud(config: &BridgeConfig, request: &MusicRequest) -> io::Res
     let lyrics = fetch_yaohud_lyrics_for_mid(&client, key, mid.as_deref(), YAOHUD_MUSIC_TYPE)
         .or_else(|| normalize_lyrics(&client, lyric_seed))
         .or_else(|| fetch_netease_lyrics_for_request(request));
+    let duration_ms = yaohud_duration_ms(&data);
     let url = data
         .url
         .or(data.musicurl)
@@ -3748,6 +3765,7 @@ fn resolve_song_yaohud(config: &BridgeConfig, request: &MusicRequest) -> io::Res
         album,
         picture,
         url,
+        duration_ms,
         lyrics,
     })
 }
@@ -3775,6 +3793,79 @@ fn yaohud_picture_url(data: &YaohudMusicData) -> String {
     ])
     .unwrap_or("")
     .to_string()
+}
+
+fn music_duration_ms_from_value(value: Option<&Value>) -> Option<u32> {
+    let value = value?;
+    if let Some(number) = value.as_u64() {
+        return normalize_music_duration_number(number);
+    }
+    if let Some(number) = value.as_f64() {
+        return normalize_music_duration_float(number);
+    }
+    value
+        .as_str()
+        .and_then(|text| music_duration_ms_from_str(text.trim()))
+}
+
+fn normalize_music_duration_number(value: u64) -> Option<u32> {
+    if value == 0 {
+        return None;
+    }
+    if value > 12 * 60 * 60 {
+        return u32::try_from(value).ok();
+    }
+    value
+        .checked_mul(1000)
+        .and_then(|ms| u32::try_from(ms).ok())
+}
+
+fn normalize_music_duration_float(value: f64) -> Option<u32> {
+    if !value.is_finite() || value <= 0.0 {
+        return None;
+    }
+    if value > 12.0 * 60.0 * 60.0 {
+        return (value <= u32::MAX as f64).then_some(value.round() as u32);
+    }
+    let ms = value * 1000.0;
+    (ms <= u32::MAX as f64).then_some(ms.round() as u32)
+}
+
+fn music_duration_ms_from_str(text: &str) -> Option<u32> {
+    if text.is_empty() {
+        return None;
+    }
+    if let Ok(value) = text.parse::<u64>() {
+        return normalize_music_duration_number(value);
+    }
+    if let Ok(value) = text.parse::<f64>() {
+        return normalize_music_duration_float(value);
+    }
+    let mut total = 0u64;
+    let mut saw_part = false;
+    for part in text.split(':') {
+        let value = part.trim().parse::<u64>().ok()?;
+        total = total.checked_mul(60)?.checked_add(value)?;
+        saw_part = true;
+    }
+    if saw_part {
+        return total
+            .checked_mul(1000)
+            .and_then(|ms| u32::try_from(ms).ok());
+    }
+    None
+}
+
+fn yaohud_duration_ms(data: &YaohudMusicData) -> Option<u32> {
+    [
+        data.duration_ms.as_ref(),
+        data.duration_ms_camel.as_ref(),
+        data.duration.as_ref(),
+        data.interval.as_ref(),
+        data.song_time.as_ref(),
+    ]
+    .into_iter()
+    .find_map(music_duration_ms_from_value)
 }
 
 fn fetch_yaohud_lyrics_for_mid(
@@ -3965,6 +4056,7 @@ fn resolve_song_netease(request: &MusicRequest) -> io::Result<ResolvedSong> {
         album,
         picture,
         url,
+        duration_ms: song.duration,
         lyrics,
     })
 }
@@ -6838,6 +6930,7 @@ mod tests {
             album: "lucky album".to_string(),
             picture: "https://example.test/cover art.jpg".to_string(),
             url: "https://example.test/play.mp3".to_string(),
+            duration_ms: Some(227_000),
             lyrics: None,
         };
         let cover_url = music_cover_url(&config, None, &request, Some(&resolved));
@@ -6882,6 +6975,7 @@ mod tests {
             album: "lucky album".to_string(),
             picture: String::new(),
             url: "https://music.163.com/song/media/outer/url?id=333750.mp3".to_string(),
+            duration_ms: Some(188_000),
             lyrics: None,
         };
         cache_music_resolve(&state, &request, &song);
@@ -6916,6 +7010,7 @@ mod tests {
             album: "fallback album".to_string(),
             picture: "https://example.test/fallback.jpg".to_string(),
             url: "https://example.test/fallback.mp3".to_string(),
+            duration_ms: Some(205_000),
             lyrics: Some("[00:01.00]fallback".to_string()),
         };
 

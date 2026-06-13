@@ -475,7 +475,7 @@ config ORNAMENT_MUSIC_STREAM_CHUNK_BYTES
 config ORNAMENT_MUSIC_COVER_ENABLED
     bool "Fetch and cache music cover on device"
     depends on ORNAMENT_MUSIC_PLAYER_ENABLED
-    default n
+    default y
     help
         Downloads bridge-rendered RGB565 cover art and keeps it in the music
         snapshot. The bridge preprocesses artwork to a fixed 96x96 RGB565

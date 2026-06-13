@@ -23,6 +23,34 @@ static void set_text(char *dst, size_t dst_size, const char *src)
     snprintf(dst, dst_size, "%s", src);
 }
 
+static const char *preview_env_or_default(const char *name, const char *fallback)
+{
+    const char *value = getenv(name);
+    return value != NULL && value[0] != '\0' ? value : fallback;
+}
+
+static uint32_t preview_u32_env_or_default(const char *name, uint32_t fallback)
+{
+    const char *value = getenv(name);
+    if (value == NULL || value[0] == '\0') {
+        return fallback;
+    }
+    char *end = NULL;
+    unsigned long parsed = strtoul(value, &end, 10);
+    return end != value && *end == '\0' ? (uint32_t)parsed : fallback;
+}
+
+static int preview_int_env_or_default(const char *name, int fallback)
+{
+    const char *value = getenv(name);
+    if (value == NULL || value[0] == '\0') {
+        return fallback;
+    }
+    char *end = NULL;
+    long parsed = strtol(value, &end, 10);
+    return end != value && *end == '\0' ? (int)parsed : fallback;
+}
+
 typedef struct {
     const char *last_stt;
     const char *last_tts;
@@ -198,9 +226,19 @@ static int render_music(const char *output_dir, const ornament_state_t *state)
 
     for (int y = 0; y < MUSIC_PLAYER_COVER_SIZE; y++) {
         for (int x = 0; x < MUSIC_PLAYER_COVER_SIZE; x++) {
-            uint8_t r = (uint8_t)(32 + x * 2);
-            uint8_t g = (uint8_t)(28 + y * 2);
-            uint8_t b = (uint8_t)(180 - (x + y) / 2);
+            uint8_t r = (uint8_t)(8 + x / 2);
+            uint8_t g = (uint8_t)(24 + y);
+            uint8_t b = (uint8_t)(92 + (x + y) / 2);
+            if (x > 18 && x < 78 && y > 22 && y < 76) {
+                r = (uint8_t)(22 + y);
+                g = (uint8_t)(150 + x / 3);
+                b = (uint8_t)(180 + y / 3);
+            }
+            if ((x - 48) * (x - 48) + (y - 48) * (y - 48) < 18 * 18) {
+                r = 232;
+                g = 246;
+                b = 248;
+            }
             cover[y * MUSIC_PLAYER_COVER_SIZE + x] = display_core_rgb565(r, g, b);
         }
     }
@@ -208,15 +246,14 @@ static int render_music(const char *output_dir, const ornament_state_t *state)
     music_player_snapshot_t music = {0};
     music.active = true;
     music.state = MUSIC_PLAYER_STATE_PLAYING;
-    music.playback_ms = 54000;
+    music.playback_ms = preview_u32_env_or_default("ORNAMENT_PREVIEW_MUSIC_PLAYBACK_MS", 83000);
+    music.duration_ms = preview_u32_env_or_default("ORNAMENT_PREVIEW_MUSIC_DURATION_MS", 227000);
+    music.volume_percent = preview_int_env_or_default("ORNAMENT_PREVIEW_MUSIC_VOLUME", 70);
+    music.battery_percent = preview_int_env_or_default("ORNAMENT_PREVIEW_MUSIC_BATTERY", 85);
     music.has_cover = true;
     music.cover_pixels = cover;
-    set_text(music.title, sizeof(music.title), "Bad Guy");
-    set_text(music.artist_name, sizeof(music.artist_name), "Billie Eilish");
-    set_text(
-        music.lyrics,
-        sizeof(music.lyrics),
-        "[00:44.00]White shirt now red\n[00:54.00]Sleeping you're on your tippy toes\n[01:04.00]Creeping around like no one knows\n[01:14.00]Think you're so criminal");
+    set_text(music.title, sizeof(music.title), preview_env_or_default("ORNAMENT_PREVIEW_MUSIC_TITLE", "Bridge Track"));
+    set_text(music.artist_name, sizeof(music.artist_name), preview_env_or_default("ORNAMENT_PREVIEW_MUSIC_ARTIST", "Bridge Artist"));
 
     display_core_canvas_t canvas;
     display_core_canvas_init(&canvas, PREVIEW_WIDTH, PREVIEW_HEIGHT, pixels);

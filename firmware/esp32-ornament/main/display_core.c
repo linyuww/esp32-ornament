@@ -27,6 +27,7 @@
 
 #if CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
 LV_FONT_DECLARE(font_puhui_16_4);
+LV_FONT_DECLARE(font_puhui_14_1);
 LV_FONT_DECLARE(font_puhui_basic_16_4);
 #endif
 
@@ -36,6 +37,10 @@ LV_FONT_DECLARE(font_puhui_basic_16_4);
 
 #ifndef CONFIG_ORNAMENT_QUOTA_WARN_PERCENT
 #define CONFIG_ORNAMENT_QUOTA_WARN_PERCENT 25
+#endif
+
+#ifndef CONFIG_ORNAMENT_AUDIO_VOLUME_PERCENT
+#define CONFIG_ORNAMENT_AUDIO_VOLUME_PERCENT 70
 #endif
 
 #define HUD_BLACK display_core_rgb565(0, 0, 0)
@@ -181,6 +186,24 @@ static int ss(int value)
     int x_scaled = sx(value);
     int y_scaled = sy(value);
     return x_scaled < y_scaled ? x_scaled : y_scaled;
+}
+
+static int mx(int value)
+{
+    return value * (int)active_canvas->width / 240;
+}
+
+static int my(int value)
+{
+    return value * (int)active_canvas->height / 240;
+}
+
+static int ms(int value)
+{
+    int x_scaled = mx(value);
+    int y_scaled = my(value);
+    int scaled = x_scaled < y_scaled ? x_scaled : y_scaled;
+    return value > 0 && scaled < 1 ? 1 : scaled;
 }
 
 static int ts(int value)
@@ -795,6 +818,11 @@ static int utf8_text_width(const lv_font_t *font, const char *text, int max_widt
 static int min_int(int a, int b)
 {
     return a < b ? a : b;
+}
+
+static int max_int(int a, int b)
+{
+    return a > b ? a : b;
 }
 
 static bool ascii_preview(const char *text, const char *fallback, char *out, size_t out_size)
@@ -2199,170 +2227,239 @@ void display_core_render_tasks(display_core_canvas_t *canvas, const ornament_sta
     draw_status_badge(state);
 }
 
-static bool parse_lrc_timestamp(const char *text, uint32_t *timestamp_ms, const char **line_text)
+static void draw_music_note_icon(int x, int y, int size, uint16_t color)
 {
-    if (text == NULL || text[0] != '[' || timestamp_ms == NULL || line_text == NULL) {
-        return false;
-    }
-
-    int minute = 0;
-    int second = 0;
-    int fraction = 0;
-    int fraction_digits = 0;
-    const char *cursor = text + 1;
-    if (*cursor < '0' || *cursor > '9') {
-        return false;
-    }
-    while (*cursor >= '0' && *cursor <= '9') {
-        minute = minute * 10 + (*cursor - '0');
-        cursor++;
-    }
-    if (*cursor != ':') {
-        return false;
-    }
-    cursor++;
-    for (int i = 0; i < 2; i++) {
-        if (*cursor < '0' || *cursor > '9') {
-            return false;
-        }
-        second = second * 10 + (*cursor - '0');
-        cursor++;
-    }
-    if (*cursor == '.' || *cursor == ':') {
-        cursor++;
-        while (*cursor >= '0' && *cursor <= '9' && fraction_digits < 3) {
-            fraction = fraction * 10 + (*cursor - '0');
-            fraction_digits++;
-            cursor++;
-        }
-        while (fraction_digits < 3) {
-            fraction *= 10;
-            fraction_digits++;
-        }
-        while (*cursor >= '0' && *cursor <= '9') {
-            cursor++;
-        }
-    }
-    if (*cursor != ']') {
-        return false;
-    }
-    cursor++;
-    while (*cursor == '[') {
-        const char *end = strchr(cursor, ']');
-        if (end == NULL) {
-            break;
-        }
-        cursor = end + 1;
-    }
-    while (*cursor == ' ' || *cursor == '\t') {
-        cursor++;
-    }
-
-    *timestamp_ms = (uint32_t)((minute * 60 + second) * 1000 + fraction);
-    *line_text = cursor;
-    return true;
+    int stem = max_int(1, size / 7);
+    int head_r = max_int(2, size / 5);
+    draw_vline(x + size * 2 / 3, y + size / 6, y + size * 2 / 3, stem, color);
+    draw_hline(x + size / 3, x + size * 2 / 3, y + size / 6, stem, color);
+    fill_circle(x + size / 3, y + size * 2 / 3, head_r, color);
+    fill_circle(x + size * 2 / 3, y + size * 7 / 12, head_r, color);
 }
 
-static int collect_lrc_lines(
-    const char *lyrics,
-    uint32_t playback_ms,
-    const char **lines,
-    uint32_t *timestamps,
-    int max_lines)
+static void draw_music_battery(int x, int y, int w, int h, int percent)
 {
-    int count = 0;
-    if (lyrics == NULL || max_lines <= 0) {
-        return 0;
+    int tip_w = max_int(1, w / 10);
+    int border = max_int(1, ms(1));
+    draw_rect_outline(x, y, w, h, border, HUD_WHITE);
+    fill_rect(x + w, y + h / 4, tip_w, h / 2, HUD_WHITE);
+
+    int fill_percent = percent_or_zero(percent);
+    int fill_w = (w - border * 4) * fill_percent / 100;
+    if (fill_w > 0) {
+        fill_rect(x + border * 2, y + border * 2, fill_w, h - border * 4, HUD_HUD_CYAN);
     }
-
-    const char *cursor = lyrics;
-    while (*cursor != '\0' && count < max_lines) {
-        const char *line_start = cursor;
-        while (*cursor != '\0' && *cursor != '\n' && *cursor != '\r') {
-            cursor++;
-        }
-        char line[160];
-        size_t len = (size_t)(cursor - line_start);
-        if (len >= sizeof(line)) {
-            len = sizeof(line) - 1;
-        }
-        memcpy(line, line_start, len);
-        line[len] = '\0';
-        while (*cursor == '\r' || *cursor == '\n') {
-            cursor++;
-        }
-
-        uint32_t timestamp_ms = 0;
-        const char *line_text = NULL;
-        if (!parse_lrc_timestamp(line, &timestamp_ms, &line_text) || line_text == NULL || line_text[0] == '\0') {
-            continue;
-        }
-        timestamps[count] = timestamp_ms;
-        lines[count] = line_start;
-        count++;
-    }
-
-    (void)playback_ms;
-    return count;
 }
 
-static void copy_lyric_line_text(const char *source, char *target, size_t target_size)
+static void draw_music_progress_bar(int x, int y, int w, int h, int percent)
+{
+    int fill_w = w * percent_or_zero(percent) / 100;
+    fill_rect(x, y, w, h, display_core_rgb565(42, 48, 56));
+    if (fill_w > 0) {
+        fill_rect(x, y, fill_w, h, HUD_HUD_CYAN);
+    }
+    if (fill_w > 0 && fill_w < w) {
+        fill_rect(x + fill_w - max_int(1, ms(1)), y - max_int(1, ms(1)), max_int(2, ms(2)), h + max_int(2, ms(2)), HUD_HUD_CYAN);
+    }
+}
+
+static void draw_music_control_icon(int cx, int cy, int size, const char *label, bool active)
+{
+    uint16_t color = HUD_HUD_CYAN;
+    int tri = max_int(4, size / 3);
+    if (strcmp(label, "PREV") == 0) {
+        draw_line(cx - tri / 2, cy, cx + tri / 2, cy - tri / 2, max_int(1, ms(2)), color);
+        draw_line(cx - tri / 2, cy, cx + tri / 2, cy + tri / 2, max_int(1, ms(2)), color);
+        draw_line(cx + tri / 2, cy - tri / 2, cx + tri / 2, cy + tri / 2, max_int(1, ms(2)), color);
+        draw_vline(cx - tri * 2 / 3, cy - tri / 2, cy + tri / 2, max_int(1, ms(2)), color);
+    } else if (strcmp(label, "NEXT") == 0) {
+        draw_line(cx + tri / 2, cy, cx - tri / 2, cy - tri / 2, max_int(1, ms(2)), color);
+        draw_line(cx + tri / 2, cy, cx - tri / 2, cy + tri / 2, max_int(1, ms(2)), color);
+        draw_line(cx - tri / 2, cy - tri / 2, cx - tri / 2, cy + tri / 2, max_int(1, ms(2)), color);
+        draw_vline(cx + tri * 2 / 3, cy - tri / 2, cy + tri / 2, max_int(1, ms(2)), color);
+    } else if (active) {
+        draw_line(cx - tri / 2, cy - tri / 2, cx - tri / 2, cy + tri / 2, max_int(2, ms(3)), color);
+        draw_line(cx + tri / 3, cy - tri / 2, cx + tri / 3, cy + tri / 2, max_int(2, ms(3)), color);
+    } else {
+        draw_line(cx - tri / 2, cy - tri / 2, cx + tri / 2, cy, max_int(1, ms(2)), color);
+        draw_line(cx - tri / 2, cy + tri / 2, cx + tri / 2, cy, max_int(1, ms(2)), color);
+        draw_vline(cx - tri / 2, cy - tri / 2, cy + tri / 2, max_int(1, ms(2)), color);
+    }
+}
+
+static void draw_music_volume(int bar_x, int y, int bar_w, int percent)
+{
+    int bars = 14;
+    int gap = max_int(1, ms(2));
+    int bar_width = max_int(1, (bar_w - gap * (bars - 1)) / bars);
+    int volume = percent_or_zero(percent);
+    int active = volume == 0 ? 0 : (volume * bars + 99) / 100;
+
+    draw_hud_speaker(bar_x - ms(23), y + ms(6), ms(13), HUD_HUD_CYAN);
+    for (int i = 0; i < bars; i++) {
+        uint16_t color = i < active ? HUD_HUD_CYAN : display_core_rgb565(42, 52, 58);
+        int bar_h = ms(7);
+        fill_rect(bar_x + i * (bar_width + gap), y + ms(3), bar_width, bar_h, color);
+    }
+
+    char volume_text[8];
+    snprintf(volume_text, sizeof(volume_text), "%d", volume);
+    draw_text_right_fit_xy(active_canvas->width - mx(12), y + ms(2), volume_text, ms(1), ms(1), HUD_HUD_CYAN);
+}
+
+static void draw_music_column_label(int center_x, int y, const char *text, uint16_t color)
+{
+    int scale = max_int(1, ms(1));
+    int width = text_width(text, scale);
+    draw_text(center_x - width / 2, y, text, scale, color);
+}
+
+static void copy_music_ellipsis(const char *text, char *target, size_t target_size, int max_chars)
 {
     if (target == NULL || target_size == 0) {
         return;
     }
     target[0] = '\0';
-    if (source == NULL) {
+    if (text == NULL) {
+        text = "--";
+    }
+    if (max_chars < 1) {
+        max_chars = 1;
+    }
+
+    size_t limit = (size_t)max_chars;
+    if (limit >= target_size) {
+        limit = target_size - 1;
+    }
+    size_t source_len = strlen(text);
+    if (source_len <= limit) {
+        memcpy(target, text, source_len);
+        target[source_len] = '\0';
+        return;
+    }
+    if (limit <= 3) {
+        for (size_t i = 0; i < limit; i++) {
+            target[i] = '.';
+        }
+        target[limit] = '\0';
         return;
     }
 
-    char line[160];
-    size_t len = 0;
-    while (source[len] != '\0' && source[len] != '\r' && source[len] != '\n' && len + 1 < sizeof(line)) {
-        line[len] = source[len];
-        len++;
-    }
-    line[len] = '\0';
+    size_t prefix_len = limit - 3;
+    memcpy(target, text, prefix_len);
+    memcpy(target + prefix_len, "...", 4);
+}
 
-    uint32_t ignored_ms = 0;
-    const char *text = line;
-    (void)parse_lrc_timestamp(line, &ignored_ms, &text);
-    ascii_preview(text, "--", target, target_size);
+static void draw_music_ascii_text_fit(int x, int y, int w, const char *text, int preferred_scale, uint16_t color, bool center)
+{
+    int scale = max_int(1, preferred_scale);
+    int max_chars = w / max_int(1, 6 * scale);
+    char fitted[96];
+    copy_music_ellipsis(text, fitted, sizeof(fitted), max_chars);
+    int width = text_width(fitted, scale);
+    int draw_x = center ? x + (w - width) / 2 : x;
+    if (draw_x < x) {
+        draw_x = x;
+    }
+    if (draw_x + width > x + w) {
+        draw_x = x + w - width;
+    }
+    if (draw_x < x) {
+        draw_x = x;
+    }
+    draw_text(draw_x, y, fitted, scale, color);
 }
 
 #if CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
-static void copy_lyric_line_utf8(const char *source, char *target, size_t target_size)
+static bool draw_music_utf8_text_fit(
+    int x,
+    int y,
+    int w,
+    const lv_font_t *font,
+    const char *text,
+    const char *fallback,
+    uint16_t color,
+    int ellipsis_scale)
 {
-    if (target == NULL || target_size == 0) {
-        return;
-    }
-    target[0] = '\0';
-    if (source == NULL) {
-        return;
+    const char *render_text = text != NULL && text[0] != '\0' ? text : fallback;
+    if (font == NULL || render_text == NULL || render_text[0] == '\0') {
+        return false;
     }
 
-    char line[160];
-    size_t len = 0;
-    while (source[len] != '\0' && source[len] != '\r' && source[len] != '\n' && len + 1 < sizeof(line)) {
-        line[len] = source[len];
-        len++;
+    int full_width = utf8_text_width(font, render_text, 0);
+    if (full_width <= 0) {
+        return false;
     }
-    line[len] = '\0';
+    if (full_width <= w) {
+        return draw_utf8_text(x + (w - full_width) / 2, y, font, render_text, color, w, NULL);
+    }
 
-    uint32_t ignored_ms = 0;
-    const char *text = line;
-    (void)parse_lrc_timestamp(line, &ignored_ms, &text);
-    strlcpy(target, text != NULL && text[0] != '\0' ? text : "--", target_size);
+    int ellipsis_width = text_width("...", ellipsis_scale);
+    int text_width_limit = w - ellipsis_width - ms(3);
+    if (text_width_limit < w / 2) {
+        text_width_limit = w;
+        ellipsis_width = 0;
+    }
+    bool drew = draw_utf8_text(x, y, font, render_text, color, text_width_limit, NULL);
+    if (ellipsis_width > 0) {
+        int ellipsis_y = y + max_int(0, (font->line_height - 7 * ellipsis_scale) / 2);
+        draw_text(x + w - ellipsis_width, ellipsis_y, "...", ellipsis_scale, color);
+    }
+    return drew;
 }
 #endif
 
+static void draw_music_metadata_text(
+    int x,
+    int y,
+    int w,
+    const char *text,
+    const char *fallback,
+    int preferred_scale,
+    uint16_t color,
+    bool title_style)
+{
+#if CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
+    const lv_font_t *font = title_style ? &font_puhui_16_4 : &font_puhui_14_1;
+    if (draw_music_utf8_text_fit(x, y, w, font, text, fallback, color, max_int(1, ms(1)))) {
+        return;
+    }
+#else
+    (void)title_style;
+#endif
+
+    char clean[96];
+    ascii_preview(text, fallback, clean, sizeof(clean));
+    draw_music_ascii_text_fit(x, y, w, clean, preferred_scale, color, true);
+}
+
+static void format_music_time(uint32_t ms_value, char *target, size_t target_size)
+{
+    uint32_t total_seconds = ms_value / 1000U;
+    snprintf(
+        target,
+        target_size,
+        "%02lu:%02lu",
+        (unsigned long)(total_seconds / 60U),
+        (unsigned long)(total_seconds % 60U));
+}
+
+static void format_music_optional_time(uint32_t ms_value, char *target, size_t target_size)
+{
+    if (ms_value == 0) {
+        snprintf(target, target_size, "--:--");
+        return;
+    }
+    format_music_time(ms_value, target, target_size);
+}
+
 static void draw_cover_placeholder(int x, int y, int size, uint16_t accent)
 {
-    fill_round_rect(x, y, size, size, ss(10), MUSIC_COVER_BG);
-    draw_rect_outline(x, y, size, size, ss(1), HUD_HUD_DIM);
+    fill_round_rect(x, y, size, size, ms(6), MUSIC_COVER_BG);
+    draw_rect_outline(x, y, size, size, max_int(1, ms(1)), HUD_HUD_DIM);
     fill_circle(x + size / 2, y + size / 2, size / 3, MUSIC_COVER_DIM);
     fill_circle(x + size / 2, y + size / 2, size / 9, HUD_HUD_BG);
-    draw_circle_outline(x + size / 2, y + size / 2, size / 3, ss(2), accent);
+    draw_circle_outline(x + size / 2, y + size / 2, size / 3, max_int(1, ms(2)), accent);
 }
 
 static void draw_cover_pixels(int x, int y, int size, const music_player_snapshot_t *snapshot)
@@ -2392,99 +2489,7 @@ static void draw_cover_pixels(int x, int y, int size, const music_player_snapsho
 #endif
         }
     }
-    draw_rect_outline(x, y, size, size, ss(1), HUD_HUD_CYAN);
-}
-
-static void draw_music_lyrics(const music_player_snapshot_t *snapshot, int x, int y, int w)
-{
-#if !CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
-    (void)x;
-#endif
-    char lines_text[3][96];
-#if CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
-    char lines_utf8[3][160];
-#endif
-    const char *lrc_lines[96];
-    uint32_t lrc_times[96];
-    int current = 0;
-    int line_count = collect_lrc_lines(snapshot->lyrics, snapshot->playback_ms, lrc_lines, lrc_times, 96);
-
-    memset(lines_text, 0, sizeof(lines_text));
-#if CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
-    memset(lines_utf8, 0, sizeof(lines_utf8));
-#endif
-    if (line_count > 0) {
-        for (int i = 0; i < line_count; i++) {
-            if (lrc_times[i] <= snapshot->playback_ms) {
-                current = i;
-            } else {
-                break;
-            }
-        }
-        int first = current > 0 ? current - 1 : 0;
-        for (int i = 0; i < 3; i++) {
-            int source_index = first + i;
-            if (source_index < line_count) {
-                copy_lyric_line_text(lrc_lines[source_index], lines_text[i], sizeof(lines_text[i]));
-#if CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
-                copy_lyric_line_utf8(lrc_lines[source_index], lines_utf8[i], sizeof(lines_utf8[i]));
-#endif
-            }
-        }
-    } else {
-        char clean[220];
-        ascii_preview(snapshot->lyrics, "NO LYRIC", clean, sizeof(clean));
-        int base_scale = ss(1);
-        if (base_scale < 1) {
-            base_scale = 1;
-        }
-        int max_chars = w / (6 * base_scale);
-        if (max_chars < 8) {
-            max_chars = 8;
-        }
-        int len = (int)strlen(clean);
-        int offset = len > max_chars ? (int)((snapshot->playback_ms / 420) % (uint32_t)(len + 4)) : 0;
-        for (int i = 0; i < 3; i++) {
-            int start = offset + i * max_chars;
-            if (start >= len) {
-                start -= len;
-            }
-            for (int j = 0; j < max_chars && j + 1 < (int)sizeof(lines_text[i]); j++) {
-                int source_index = start + j;
-                if (source_index >= len) {
-                    break;
-                }
-                lines_text[i][j] = clean[source_index];
-                lines_text[i][j + 1] = '\0';
-            }
-        }
-    }
-
-#if CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
-    if (line_count > 0) {
-        for (int i = 0; i < 3; i++) {
-            uint16_t color = i == 1 ? HUD_WHITE : HUD_MUTED;
-            (void)draw_utf8_text(
-                x,
-                y + i * sy(24),
-                &font_puhui_16_4,
-                lines_utf8[i][0] != '\0' ? lines_utf8[i] : "--",
-                color,
-                w,
-                NULL);
-        }
-        return;
-    }
-#endif
-
-    for (int i = 0; i < 3; i++) {
-        uint16_t color = i == 1 ? HUD_WHITE : HUD_MUTED;
-        int scale = ss(1);
-        if (scale < 1) {
-            scale = 1;
-        }
-        draw_text_center_fit(y + i * sy(26), lines_text[i][0] != '\0' ? lines_text[i] : "--", scale, color);
-    }
+    draw_rect_outline(x, y, size, size, max_int(1, ms(1)), HUD_HUD_CYAN);
 }
 
 void display_core_render_music(
@@ -2503,45 +2508,70 @@ void display_core_render_music(
 
     char title[96];
     char artist[96];
-    char status[32];
+    char battery_text[8];
+    char elapsed_text[12];
+    char duration_text[12];
     const char *raw_title = snapshot->title[0] != '\0' ? snapshot->title : snapshot->song_name;
     const char *raw_artist = snapshot->artist_name[0] != '\0' ? snapshot->artist_name : snapshot->album;
     ascii_preview(raw_title, "MUSIC", title, sizeof(title));
     ascii_preview(raw_artist, music_player_state_name(snapshot->state), artist, sizeof(artist));
-    snprintf(
-        status,
-        sizeof(status),
-        "%s %02lu:%02lu",
-        music_player_state_name(snapshot->state),
-        (unsigned long)(snapshot->playback_ms / 60000),
-        (unsigned long)((snapshot->playback_ms / 1000) % 60));
+    int volume_percent = snapshot->volume_percent == MUSIC_PLAYER_PERCENT_UNKNOWN ?
+        CONFIG_ORNAMENT_AUDIO_VOLUME_PERCENT : snapshot->volume_percent;
+    int battery_percent = snapshot->battery_percent;
+    uint32_t duration_ms = snapshot->duration_ms;
+    int progress_percent = duration_ms > 0 ? (int)((uint64_t)snapshot->playback_ms * 100ULL / duration_ms) : 0;
+    format_music_time(snapshot->playback_ms, elapsed_text, sizeof(elapsed_text));
+    format_music_optional_time(duration_ms, duration_text, sizeof(duration_text));
+    if (battery_percent >= 0) {
+        snprintf(battery_text, sizeof(battery_text), "%d%%", percent_or_zero(battery_percent));
+    } else {
+        snprintf(battery_text, sizeof(battery_text), "--%%");
+    }
+
+    const bool playing = snapshot->state == MUSIC_PLAYER_STATE_PLAYING && !snapshot->stop_requested;
 
     clear_canvas(HUD_HUD_BG);
-    draw_hud_chamfer_box(sx(8), sy(6), active_canvas->width - sx(16), active_canvas->height - sy(12), ss(12), ss(2), HUD_HUD_CYAN);
-    draw_text_xy(sx(18), sy(18), "MUSIC", ss(1), ss(1), HUD_WHITE);
-    draw_text_right_fit_xy(active_canvas->width - sx(18), sy(18), status, ss(1), ss(1), HUD_HUD_CYAN);
+    blend_rect(0, 0, active_canvas->width, active_canvas->height, HUD_DEEP_BLUE, 36);
 
-    int cover_size = ss(96);
-    if (cover_size < 64) {
-        cover_size = 64;
-    }
-    if (cover_size > 104) {
-        cover_size = 104;
-    }
-    int cover_x = active_canvas->center_x - cover_size / 2;
-    int cover_y = sy(40);
+    int header_y = my(8);
+    int text_scale = max_int(1, ms(1));
+    draw_music_note_icon(mx(13), my(7), ms(15), HUD_HUD_CYAN);
+    draw_text_xy(mx(36), header_y, "MUSIC", text_scale, text_scale, HUD_WHITE);
+    draw_text_right_fit_xy(active_canvas->width - mx(42), header_y, battery_text, text_scale, text_scale, HUD_WHITE);
+    draw_music_battery(mx(205), my(7), mx(22), my(12), battery_percent);
+    draw_hline(mx(8), mx(232), my(28), max_int(1, ms(1)), HUD_HUD_CYAN);
+
+    int cover_size = ms(88);
+    int cover_x = mx(76);
+    int cover_y = my(42);
     draw_cover_pixels(cover_x, cover_y, cover_size, snapshot);
 
-    draw_text_center_fit(cover_y + cover_size + sy(12), title, ss(1), HUD_WHITE);
-    draw_text_center_fit(cover_y + cover_size + sy(32), artist, ss(1), HUD_MUTED);
-    draw_music_lyrics(snapshot, sx(24), cover_y + cover_size + sy(58), active_canvas->width - sx(48));
+    draw_music_metadata_text(mx(10), my(138), mx(220), raw_title, title, max_int(1, ms(2)), HUD_WHITE, true);
+    draw_music_metadata_text(mx(10), my(160), mx(220), raw_artist, artist, text_scale, display_core_rgb565(176, 184, 192), false);
+
     if (snapshot->stop_requested) {
-        draw_text_center_fit(active_canvas->height - sy(24), "STOPPING", ss(1), HUD_AMBER);
+        draw_music_ascii_text_fit(mx(10), my(172), mx(220), "STOPPING", text_scale, HUD_AMBER, true);
     } else if (snapshot->last_error[0] != '\0' && snapshot->state == MUSIC_PLAYER_STATE_ERROR) {
-        draw_text_center_fit(active_canvas->height - sy(24), snapshot->last_error, ss(1), HUD_RED);
-    } else {
-        draw_hud_wave(active_canvas->center_x, active_canvas->height - sy(24), sx(70), sy(18), HUD_HUD_CYAN);
+        char error_text[96];
+        ascii_preview(snapshot->last_error, "ERROR", error_text, sizeof(error_text));
+        draw_music_ascii_text_fit(mx(10), my(172), mx(220), error_text, text_scale, HUD_RED, true);
     }
+
+    draw_text_xy(mx(12), my(178), elapsed_text, text_scale, text_scale, HUD_WHITE);
+    draw_music_progress_bar(mx(58), my(185), mx(124), max_int(2, my(4)), progress_percent);
+    draw_text_right_fit_xy(active_canvas->width - mx(12), my(178), duration_text, text_scale, text_scale, HUD_WHITE);
+
+    int control_y = my(201);
+    draw_vline(mx(80), my(198), my(218), max_int(1, ms(1)), HUD_HUD_DIM);
+    draw_vline(mx(160), my(198), my(218), max_int(1, ms(1)), HUD_HUD_DIM);
+    draw_music_control_icon(mx(40), control_y, ms(21), "PREV", false);
+    draw_music_control_icon(mx(120), control_y, ms(23), "PLAY/PAUSE", playing);
+    draw_music_control_icon(mx(200), control_y, ms(21), "NEXT", false);
+    draw_music_column_label(mx(40), my(212), "PREV", HUD_WHITE);
+    draw_music_column_label(mx(120), my(212), "PLAY/PAUSE", playing ? HUD_HUD_CYAN : HUD_WHITE);
+    draw_music_column_label(mx(200), my(212), "NEXT", HUD_WHITE);
+
+    draw_music_volume(mx(45), my(224), mx(150), volume_percent);
 
     (void)state;
 }

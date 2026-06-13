@@ -418,6 +418,11 @@ void task_audio_set_volume_percent(int volume_percent)
     s_play_volume_percent = volume_percent;
 }
 
+int task_audio_volume_percent(void)
+{
+    return s_play_volume_percent;
+}
+
 esp_err_t task_audio_output_acquire(void)
 {
     if (s_bus_mutex == NULL || s_tx_chan == NULL) {
@@ -663,6 +668,11 @@ void task_audio_play_done(void)
 void task_audio_set_volume_percent(int volume_percent)
 {
     (void)volume_percent;
+}
+
+int task_audio_volume_percent(void)
+{
+    return CONFIG_ORNAMENT_AUDIO_VOLUME_PERCENT;
 }
 
 esp_err_t task_audio_output_acquire(void)

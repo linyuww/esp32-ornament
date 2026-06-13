@@ -11,6 +11,7 @@
 #define MUSIC_PLAYER_COVER_SIZE 96
 #define MUSIC_PLAYER_COVER_PIXELS (MUSIC_PLAYER_COVER_SIZE * MUSIC_PLAYER_COVER_SIZE)
 #define MUSIC_PLAYER_LYRICS_MAX 1024
+#define MUSIC_PLAYER_PERCENT_UNKNOWN (-1)
 
 #ifndef CONFIG_ORNAMENT_MUSIC_COVER_ENABLED
 #define CONFIG_ORNAMENT_MUSIC_COVER_ENABLED 0
@@ -30,6 +31,9 @@ typedef struct {
     music_player_state_t state;
     uint32_t index;
     uint32_t playback_ms;
+    uint32_t duration_ms;
+    int volume_percent;
+    int battery_percent;
     char song_name[ORNAMENT_TEXT_MAX];
     char artist_name[ORNAMENT_TEXT_MAX];
     char title[ORNAMENT_TEXT_MAX];

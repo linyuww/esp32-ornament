@@ -28,6 +28,7 @@ typedef struct {
 esp_err_t task_audio_start(void);
 void task_audio_play_done(void);
 void task_audio_set_volume_percent(int volume_percent);
+int task_audio_volume_percent(void);
 esp_err_t task_audio_output_acquire(void);
 esp_err_t task_audio_output_acquire_with_volume(const ornament_settings_t *settings);
 esp_err_t task_audio_output_write_mono(const int16_t *samples, size_t frame_count, uint32_t timeout_ms);

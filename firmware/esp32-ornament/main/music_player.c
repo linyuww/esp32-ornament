@@ -65,6 +65,7 @@ typedef struct {
     char picture[ORNAMENT_BRIDGE_URL_MAX];
     char cover_url[ORNAMENT_BRIDGE_URL_MAX];
     char lyrics[MUSIC_PLAYER_LYRICS_MAX];
+    uint32_t duration_ms;
 } resolved_song_t;
 
 static const char *TAG = "music_player";
@@ -176,6 +177,29 @@ static void mark_idle_locked(void)
     s_stop_requested = false;
     s_snapshot.stop_requested = false;
     set_state_locked(MUSIC_PLAYER_STATE_IDLE);
+}
+
+static uint32_t json_u32_or_zero(const cJSON *root, const char *name)
+{
+    const cJSON *value = cJSON_GetObjectItemCaseSensitive((cJSON *)root, name);
+    if (cJSON_IsNumber(value) && value->valuedouble > 0.0) {
+        return (uint32_t)value->valuedouble;
+    }
+    return 0;
+}
+
+static uint32_t normalize_duration_ms(uint32_t value)
+{
+    if (value == 0) {
+        return 0;
+    }
+    if (value > 12U * 60U * 60U) {
+        return value;
+    }
+    if (value > UINT32_MAX / 1000U) {
+        return 0;
+    }
+    return value * 1000U;
 }
 
 static bool stop_requested(void)
@@ -375,6 +399,13 @@ static esp_err_t resolve_song(
     copy_json_string(root, "picture", parsed.picture, sizeof(parsed.picture));
     copy_json_string(root, "coverUrl", parsed.cover_url, sizeof(parsed.cover_url));
     copy_json_string(root, "lyrics", parsed.lyrics, sizeof(parsed.lyrics));
+    parsed.duration_ms = json_u32_or_zero(root, "durationMs");
+    if (parsed.duration_ms == 0) {
+        parsed.duration_ms = json_u32_or_zero(root, "duration_ms");
+    }
+    if (parsed.duration_ms == 0) {
+        parsed.duration_ms = normalize_duration_ms(json_u32_or_zero(root, "duration"));
+    }
     cJSON *ok = cJSON_GetObjectItemCaseSensitive(root, "ok");
     cJSON *error = cJSON_GetObjectItemCaseSensitive(root, "error");
     if (cJSON_IsString(error) && error->valuestring != NULL) {
@@ -546,6 +577,16 @@ static esp_err_t stream_song(
         ornament_http_stream_close(stream);
         return ESP_ERR_NOT_SUPPORTED;
     }
+    if (content_length > 0 && s_mutex != NULL && xSemaphoreTake(s_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+        if (s_snapshot.duration_ms == 0) {
+            uint64_t frames = (uint64_t)content_length / MUSIC_PLAYER_PCM_SAMPLE_BYTES;
+            uint64_t ms = (frames * 1000ULL) / ORNAMENT_AUDIO_SAMPLE_RATE_HZ;
+            if (ms <= UINT32_MAX) {
+                s_snapshot.duration_ms = (uint32_t)ms;
+            }
+        }
+        xSemaphoreGive(s_mutex);
+    }
     (void)ornament_http_stream_set_timeout(stream, MUSIC_PLAYER_STREAM_READ_TIMEOUT_MS);
 
     uint8_t *read_buffer = heap_caps_calloc(CONFIG_ORNAMENT_MUSIC_STREAM_CHUNK_BYTES + 1, 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -695,6 +736,7 @@ static void music_player_task(void *arg)
         strlcpy(s_snapshot.picture, resolved->picture, sizeof(s_snapshot.picture));
         strlcpy(s_snapshot.cover_url, resolved->cover_url, sizeof(s_snapshot.cover_url));
         strlcpy(s_snapshot.lyrics, resolved->lyrics, sizeof(s_snapshot.lyrics));
+        s_snapshot.duration_ms = resolved->duration_ms;
         if (resolved->artist[0] != '\0') {
             strlcpy(s_snapshot.artist_name, resolved->artist, sizeof(s_snapshot.artist_name));
         }
@@ -850,6 +892,9 @@ static esp_err_t start_music_request(
     s_snapshot.stop_requested = false;
     s_snapshot.index = request->index;
     s_snapshot.playback_ms = 0;
+    s_snapshot.duration_ms = 0;
+    s_snapshot.volume_percent = settings_audio_volume_percent_or_default(&request->settings);
+    s_snapshot.battery_percent = MUSIC_PLAYER_PERCENT_UNKNOWN;
     strlcpy(s_snapshot.song_name, request->song_name, sizeof(s_snapshot.song_name));
     strlcpy(s_snapshot.artist_name, request->artist_name, sizeof(s_snapshot.artist_name));
     clear_metadata_locked();
@@ -978,6 +1023,7 @@ void music_player_status_snapshot(music_player_snapshot_t *snapshot)
     }
     if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
         *snapshot = s_snapshot;
+        snapshot->volume_percent = task_audio_volume_percent();
         xSemaphoreGive(s_mutex);
     }
 }

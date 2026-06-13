@@ -624,7 +624,7 @@ static esp_err_t status_get_handler(httpd_req_t *req)
         json,
         json_size,
         &used,
-        "\"music\":{\"active\":%s,\"stop_requested\":%s,\"state\":\"%s\",\"title\":\"%s\",\"artist\":\"%s\",\"album\":\"%s\",\"picture\":\"%s\",\"cover_url\":\"%s\",\"has_cover\":%s,\"has_lyrics\":%s,\"lyrics_bytes\":%u,\"playback_ms\":%u},",
+        "\"music\":{\"active\":%s,\"stop_requested\":%s,\"state\":\"%s\",\"title\":\"%s\",\"artist\":\"%s\",\"album\":\"%s\",\"picture\":\"%s\",\"cover_url\":\"%s\",\"has_cover\":%s,\"has_lyrics\":%s,\"lyrics_bytes\":%u,\"playback_ms\":%u,\"duration_ms\":%u,\"volume_percent\":%d,\"battery_percent\":%d},",
         music->active ? "true" : "false",
         music->stop_requested ? "true" : "false",
         music_player_state_name(music->state),
@@ -636,7 +636,10 @@ static esp_err_t status_get_handler(httpd_req_t *req)
         music->has_cover ? "true" : "false",
         music->lyrics[0] != '\0' ? "true" : "false",
         (unsigned int)strlen(music->lyrics),
-        (unsigned int)music->playback_ms);
+        (unsigned int)music->playback_ms,
+        (unsigned int)music->duration_ms,
+        music->volume_percent,
+        music->battery_percent);
     appendf(
         json,
         json_size,
@@ -1040,8 +1043,10 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         html,
         html_size,
         &used,
-        "<div class=\"card\"><div class=\"k\">Playback</div><div class=\"v\">%u ms</div><div class=\"k\">%s</div></div>",
+        "<div class=\"card\"><div class=\"k\">Playback</div><div class=\"v\">%u / %u ms</div><div class=\"k\">volume %d%% %s</div></div>",
         (unsigned int)music->playback_ms,
+        (unsigned int)music->duration_ms,
+        music->volume_percent,
         music_error[0] != '\0' ? music_error : "no error");
     append(
         html,

@@ -161,6 +161,9 @@ static cJSON *music_status_json(void)
     cJSON_AddStringToObject(status, "cover_url", snapshot->cover_url);
     cJSON_AddBoolToObject(status, "has_cover", snapshot->has_cover);
     cJSON_AddNumberToObject(status, "playback_ms", (double)snapshot->playback_ms);
+    cJSON_AddNumberToObject(status, "duration_ms", (double)snapshot->duration_ms);
+    cJSON_AddNumberToObject(status, "volume_percent", snapshot->volume_percent);
+    cJSON_AddNumberToObject(status, "battery_percent", snapshot->battery_percent);
     cJSON_AddStringToObject(status, "lyrics", snapshot->lyrics);
     cJSON_AddStringToObject(status, "last_error", snapshot->last_error);
     return status;
