@@ -1180,7 +1180,10 @@ static esp_err_t ensure_tts_output_locked(void)
         return ESP_OK;
     }
 
-    esp_err_t acquire_err = task_audio_output_acquire_with_volume(NULL);
+    ornament_settings_t settings;
+    esp_err_t acquire_err = copy_active_settings(&settings)
+        ? task_audio_output_acquire_with_volume(&settings)
+        : task_audio_output_acquire();
     if (acquire_err == ESP_OK) {
         s_tts_output_active = true;
     }
