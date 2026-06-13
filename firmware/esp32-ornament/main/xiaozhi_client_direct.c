@@ -35,6 +35,10 @@
 
 #if CONFIG_ORNAMENT_XIAOZHI_ENABLED
 
+#ifndef CONFIG_ORNAMENT_XIAOZHI_ALLOW_REMOTE_REBOOT
+#define CONFIG_ORNAMENT_XIAOZHI_ALLOW_REMOTE_REBOOT 0
+#endif
+
 #define XIAOZHI_EVENT_CONNECTED BIT0
 #define XIAOZHI_EVENT_HELLO BIT1
 #define XIAOZHI_EVENT_STOP BIT2
@@ -1552,8 +1556,12 @@ static void handle_text_message(const char *data, int len)
     } else if (strcmp(type->valuestring, "system") == 0) {
         const cJSON *command = cJSON_GetObjectItem(root, "command");
         if (cJSON_IsString(command) && strcmp(command->valuestring, "reboot") == 0) {
+#if CONFIG_ORNAMENT_XIAOZHI_ALLOW_REMOTE_REBOOT
             ESP_LOGW(TAG, "server requested reboot");
             esp_restart();
+#else
+            ESP_LOGW(TAG, "ignored Xiaozhi server reboot request");
+#endif
         }
     }
 

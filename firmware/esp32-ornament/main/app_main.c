@@ -18,6 +18,7 @@
 #include "driver/gpio.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
+#include "esp_system.h"
 #include "freertos/idf_additions.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -47,6 +48,14 @@
 #define CONFIG_ORNAMENT_PAGE_BUTTON_DEBOUNCE_MS 50
 #endif
 
+#ifndef CONFIG_ORNAMENT_PAGE_BUTTON_MIN_HOLD_MS
+#define CONFIG_ORNAMENT_PAGE_BUTTON_MIN_HOLD_MS 1000
+#endif
+
+#ifndef CONFIG_ORNAMENT_PAGE_BUTTON_REPEAT_GUARD_MS
+#define CONFIG_ORNAMENT_PAGE_BUTTON_REPEAT_GUARD_MS 2500
+#endif
+
 #ifdef CONFIG_ORNAMENT_PAGE_BUTTON_ACTIVE_LOW
 #define ORNAMENT_PAGE_BUTTON_ACTIVE_LOW 1
 #else
@@ -65,6 +74,14 @@
 #define CONFIG_ORNAMENT_AI_BUTTON_DEBOUNCE_MS 50
 #endif
 
+#ifndef CONFIG_ORNAMENT_AI_BUTTON_MIN_HOLD_MS
+#define CONFIG_ORNAMENT_AI_BUTTON_MIN_HOLD_MS 700
+#endif
+
+#ifndef CONFIG_ORNAMENT_AI_BUTTON_REPEAT_GUARD_MS
+#define CONFIG_ORNAMENT_AI_BUTTON_REPEAT_GUARD_MS 1200
+#endif
+
 #ifdef CONFIG_ORNAMENT_AI_BUTTON_ACTIVE_LOW
 #define ORNAMENT_AI_BUTTON_ACTIVE_LOW 1
 #else
@@ -78,10 +95,12 @@ static const char *TAG = "ornament";
 #define VOICE_STATUS_TEXT_MAX 40
 #define ORNAMENT_MIN_VALID_EPOCH 1577836800LL
 #define BRIDGE_SINGLE_RETRY_DELAY_MS 1000
+#define BRIDGE_POLL_TASK_STACK 12288
 #define PAGE_BUTTON_TASK_STACK 4096
 #define AI_BUTTON_TASK_STACK 8192
 #define UI_RENDER_TASK_STACK 24576
 #define UI_RENDER_LOW_STACK_WARN_BYTES 2048
+#define BUTTON_MIN_DEBOUNCE_MS 150
 
 #ifndef CONFIG_ORNAMENT_EXPIRED_QUOTA_RETRY_MS
 #define CONFIG_ORNAMENT_EXPIRED_QUOTA_RETRY_MS 30000
@@ -1018,6 +1037,33 @@ static bool button_pressed_level(int level, bool active_low)
     return active_low ? level == 0 : level != 0;
 }
 
+static uint32_t button_effective_debounce_ms(int configured_ms)
+{
+    if (configured_ms < BUTTON_MIN_DEBOUNCE_MS) {
+        return BUTTON_MIN_DEBOUNCE_MS;
+    }
+    return (uint32_t)configured_ms;
+}
+
+typedef struct {
+    const char *name;
+    gpio_num_t gpio;
+    bool active_low;
+    uint32_t debounce_ms;
+    uint32_t min_hold_ms;
+    uint32_t repeat_guard_ms;
+    TickType_t debounce_ticks;
+    TickType_t min_hold_ticks;
+    TickType_t repeat_guard_ticks;
+    bool stable_pressed;
+    bool last_sample_pressed;
+    bool armed;
+    bool press_consumed;
+    TickType_t changed_tick;
+    TickType_t pressed_tick;
+    TickType_t last_action_tick;
+} button_filter_t;
+
 static esp_err_t configure_button_gpio(gpio_num_t gpio, bool active_low)
 {
     const gpio_config_t config = {
@@ -1029,6 +1075,93 @@ static esp_err_t configure_button_gpio(gpio_num_t gpio, bool active_low)
     };
     return gpio_config(&config);
 }
+
+static void button_filter_init(
+    button_filter_t *button,
+    const char *name,
+    gpio_num_t gpio,
+    bool active_low,
+    uint32_t debounce_ms,
+    uint32_t min_hold_ms,
+    uint32_t repeat_guard_ms)
+{
+    const TickType_t now = xTaskGetTickCount();
+    bool pressed = button_pressed_level(gpio_get_level(gpio), active_low);
+
+    *button = (button_filter_t) {
+        .name = name,
+        .gpio = gpio,
+        .active_low = active_low,
+        .debounce_ms = debounce_ms,
+        .min_hold_ms = min_hold_ms,
+        .repeat_guard_ms = repeat_guard_ms,
+        .debounce_ticks = pdMS_TO_TICKS(debounce_ms),
+        .min_hold_ticks = pdMS_TO_TICKS(min_hold_ms),
+        .repeat_guard_ticks = pdMS_TO_TICKS(repeat_guard_ms),
+        .stable_pressed = pressed,
+        .last_sample_pressed = pressed,
+        .armed = !pressed,
+        .press_consumed = false,
+        .changed_tick = now,
+        .pressed_tick = pressed ? now : 0,
+        .last_action_tick = 0,
+    };
+
+    ESP_LOGI(
+        TAG,
+        "%s button enabled: gpio=%d active_%s debounce=%lums hold=%lums guard=%lums",
+        button->name,
+        (int)button->gpio,
+        button->active_low ? "low" : "high",
+        (unsigned long)button->debounce_ms,
+        (unsigned long)button->min_hold_ms,
+        (unsigned long)button->repeat_guard_ms);
+    if (!button->armed) {
+        ESP_LOGW(TAG, "%s button starts pressed; waiting for release before accepting input", button->name);
+    }
+}
+
+static bool button_filter_poll(button_filter_t *button, TickType_t now)
+{
+    bool sample_pressed = button_pressed_level(gpio_get_level(button->gpio), button->active_low);
+    if (sample_pressed != button->last_sample_pressed) {
+        button->last_sample_pressed = sample_pressed;
+        button->changed_tick = now;
+    }
+
+    if (sample_pressed != button->stable_pressed && (now - button->changed_tick) >= button->debounce_ticks) {
+        button->stable_pressed = sample_pressed;
+        if (button->stable_pressed) {
+            button->pressed_tick = now;
+            button->press_consumed = false;
+        } else {
+            if (!button->press_consumed && button->pressed_tick != 0) {
+                ESP_LOGD(TAG, "%s button released before minimum hold", button->name);
+            }
+            button->pressed_tick = 0;
+            button->press_consumed = false;
+            button->armed = true;
+        }
+    }
+
+    if (!button->stable_pressed || !button->armed || button->press_consumed) {
+        return false;
+    }
+    if ((now - button->pressed_tick) < button->min_hold_ticks) {
+        return false;
+    }
+
+    button->press_consumed = true;
+    button->armed = false;
+    if (button->last_action_tick != 0 && (now - button->last_action_tick) < button->repeat_guard_ticks) {
+        ESP_LOGD(TAG, "%s button press ignored within guard interval", button->name);
+        return false;
+    }
+
+    button->last_action_tick = now;
+    ESP_LOGI(TAG, "%s button accepted after %lums hold", button->name, (unsigned long)button->min_hold_ms);
+    return true;
+}
 #endif
 
 #if CONFIG_ORNAMENT_PAGE_BUTTON_ENABLED
@@ -1039,30 +1172,22 @@ static void page_button_task(void *arg)
     ESP_ERROR_CHECK(configure_button_gpio(gpio, ORNAMENT_PAGE_BUTTON_ACTIVE_LOW));
 
     const TickType_t poll_ticks = pdMS_TO_TICKS(20);
-    const TickType_t debounce_ticks = pdMS_TO_TICKS(CONFIG_ORNAMENT_PAGE_BUTTON_DEBOUNCE_MS);
-    bool stable_pressed = button_pressed_level(gpio_get_level(gpio), ORNAMENT_PAGE_BUTTON_ACTIVE_LOW);
-    bool last_sample_pressed = stable_pressed;
-    TickType_t changed_tick = xTaskGetTickCount();
-
-    ESP_LOGI(
-        TAG,
-        "page button enabled: gpio=%d active_%s debounce=%dms cycle=standby->quota->xiaozhi",
-        CONFIG_ORNAMENT_PAGE_BUTTON_GPIO,
-        ORNAMENT_PAGE_BUTTON_ACTIVE_LOW ? "low" : "high",
-        CONFIG_ORNAMENT_PAGE_BUTTON_DEBOUNCE_MS);
+    const uint32_t debounce_ms = button_effective_debounce_ms(CONFIG_ORNAMENT_PAGE_BUTTON_DEBOUNCE_MS);
+    button_filter_t button;
+    button_filter_init(
+        &button,
+        "page",
+        gpio,
+        ORNAMENT_PAGE_BUTTON_ACTIVE_LOW,
+        debounce_ms,
+        CONFIG_ORNAMENT_PAGE_BUTTON_MIN_HOLD_MS,
+        CONFIG_ORNAMENT_PAGE_BUTTON_REPEAT_GUARD_MS);
+    ESP_LOGI(TAG, "page button cycle=standby->quota->xiaozhi");
 
     while (true) {
         TickType_t now = xTaskGetTickCount();
-        bool sample_pressed = button_pressed_level(gpio_get_level(gpio), ORNAMENT_PAGE_BUTTON_ACTIVE_LOW);
-        if (sample_pressed != last_sample_pressed) {
-            last_sample_pressed = sample_pressed;
-            changed_tick = now;
-        }
-        if (sample_pressed != stable_pressed && (now - changed_tick) >= debounce_ticks) {
-            stable_pressed = sample_pressed;
-            if (stable_pressed) {
-                voice_control_cycle_page(now);
-            }
+        if (button_filter_poll(&button, now)) {
+            voice_control_cycle_page(now);
         }
         vTaskDelay(poll_ticks);
     }
@@ -1077,68 +1202,59 @@ static void ai_button_task(void *arg)
     ESP_ERROR_CHECK(configure_button_gpio(gpio, ORNAMENT_AI_BUTTON_ACTIVE_LOW));
 
     const TickType_t poll_ticks = pdMS_TO_TICKS(20);
-    const TickType_t debounce_ticks = pdMS_TO_TICKS(CONFIG_ORNAMENT_AI_BUTTON_DEBOUNCE_MS);
-    bool stable_pressed = button_pressed_level(gpio_get_level(gpio), ORNAMENT_AI_BUTTON_ACTIVE_LOW);
-    bool last_sample_pressed = stable_pressed;
-    TickType_t changed_tick = xTaskGetTickCount();
-
-    ESP_LOGI(
-        TAG,
-        "AI button enabled: gpio=%d active_%s debounce=%dms",
-        CONFIG_ORNAMENT_AI_BUTTON_GPIO,
-        ORNAMENT_AI_BUTTON_ACTIVE_LOW ? "low" : "high",
-        CONFIG_ORNAMENT_AI_BUTTON_DEBOUNCE_MS);
+    const uint32_t debounce_ms = button_effective_debounce_ms(CONFIG_ORNAMENT_AI_BUTTON_DEBOUNCE_MS);
+    button_filter_t button;
+    button_filter_init(
+        &button,
+        "AI",
+        gpio,
+        ORNAMENT_AI_BUTTON_ACTIVE_LOW,
+        debounce_ms,
+        CONFIG_ORNAMENT_AI_BUTTON_MIN_HOLD_MS,
+        CONFIG_ORNAMENT_AI_BUTTON_REPEAT_GUARD_MS);
 
     while (true) {
         TickType_t now = xTaskGetTickCount();
-        bool sample_pressed = button_pressed_level(gpio_get_level(gpio), ORNAMENT_AI_BUTTON_ACTIVE_LOW);
-        if (sample_pressed != last_sample_pressed) {
-            last_sample_pressed = sample_pressed;
-            changed_tick = now;
-        }
-        if (sample_pressed != stable_pressed && (now - changed_tick) >= debounce_ticks) {
-            stable_pressed = sample_pressed;
-            if (stable_pressed) {
-                xiaozhi_client_snapshot_t xiaozhi_snapshot = {0};
-                xiaozhi_client_status_snapshot(&xiaozhi_snapshot);
-                if (xiaozhi_snapshot_active(&xiaozhi_snapshot)) {
-                    ESP_LOGI(
+        if (button_filter_poll(&button, now)) {
+            xiaozhi_client_snapshot_t xiaozhi_snapshot = {0};
+            xiaozhi_client_status_snapshot(&xiaozhi_snapshot);
+            if (xiaozhi_snapshot_active(&xiaozhi_snapshot)) {
+                ESP_LOGI(
+                    TAG,
+                    "AI button interrupting Xiaozhi conversation: state=%s requested=%d",
+                    xiaozhi_client_state_name(xiaozhi_snapshot.state),
+                    xiaozhi_snapshot.session_requested);
+                queue_xiaozhi_session_action(XIAOZHI_SESSION_ACTION_STOP, "AI button interrupt");
+                continue;
+            }
+
+            voice_view_t active_view = VOICE_VIEW_AUTO;
+            bool manual_active = false;
+            if (!voice_control_active_view(now, &active_view, &manual_active) ||
+                !manual_active ||
+                active_view != VOICE_VIEW_XIAOZHI) {
+                if (music_player_is_active()) {
+                    ESP_LOGI(TAG, "AI button stopping music and returning to Xiaozhi");
+                    music_player_request_stop();
+                    voice_control_set_view(VOICE_VIEW_XIAOZHI, now, "AI BUTTON", "STOP MUSIC");
+                    queue_xiaozhi_session_action(XIAOZHI_SESSION_ACTION_START, "AI button stopped music");
+                } else {
+                    ESP_LOGD(
                         TAG,
-                        "AI button interrupting Xiaozhi conversation: state=%s requested=%d",
-                        xiaozhi_client_state_name(xiaozhi_snapshot.state),
-                        xiaozhi_snapshot.session_requested);
-                    queue_xiaozhi_session_action(XIAOZHI_SESSION_ACTION_STOP, "AI button interrupt");
+                        "AI button ignored on page=%s manual=%d",
+                        voice_view_name(active_view),
+                        manual_active);
+                }
+            } else {
+                if (music_player_is_active()) {
+                    ESP_LOGI(TAG, "AI button stopping music on Xiaozhi page");
+                    music_player_request_stop();
+                    voice_control_set_view(VOICE_VIEW_XIAOZHI, now, "AI BUTTON", "STOP MUSIC");
+                    queue_xiaozhi_session_action(XIAOZHI_SESSION_ACTION_START, "AI button stopped music on Xiaozhi page");
                     continue;
                 }
-
-                voice_view_t active_view = VOICE_VIEW_AUTO;
-                bool manual_active = false;
-                if (!voice_control_active_view(now, &active_view, &manual_active) ||
-                    !manual_active ||
-                    active_view != VOICE_VIEW_XIAOZHI) {
-                    if (music_player_is_active()) {
-                        ESP_LOGI(TAG, "AI button stopping music and returning to Xiaozhi");
-                        music_player_request_stop();
-                        voice_control_set_view(VOICE_VIEW_XIAOZHI, now, "AI BUTTON", "STOP MUSIC");
-                        queue_xiaozhi_session_action(XIAOZHI_SESSION_ACTION_START, "AI button stopped music");
-                    } else {
-                        ESP_LOGD(
-                            TAG,
-                            "AI button ignored on page=%s manual=%d",
-                            voice_view_name(active_view),
-                            manual_active);
-                    }
-                } else {
-                    if (music_player_is_active()) {
-                        ESP_LOGI(TAG, "AI button stopping music on Xiaozhi page");
-                        music_player_request_stop();
-                        voice_control_set_view(VOICE_VIEW_XIAOZHI, now, "AI BUTTON", "STOP MUSIC");
-                        queue_xiaozhi_session_action(XIAOZHI_SESSION_ACTION_START, "AI button stopped music on Xiaozhi page");
-                        continue;
-                    }
-                    ESP_LOGI(TAG, "AI button pressed on Xiaozhi page");
-                    queue_xiaozhi_session_action(XIAOZHI_SESSION_ACTION_TOGGLE, "AI button toggle");
-                }
+                ESP_LOGI(TAG, "AI button pressed on Xiaozhi page");
+                queue_xiaozhi_session_action(XIAOZHI_SESSION_ACTION_TOGGLE, "AI button toggle");
             }
         }
         vTaskDelay(poll_ticks);
@@ -1457,6 +1573,16 @@ static void ui_render_task(void *arg)
 void app_main(void)
 {
     ESP_LOGI(TAG, "starting Codex ornament");
+#if CONFIG_ORNAMENT_WEB_CONSOLE_ENABLED
+    esp_reset_reason_t reset_reason = esp_reset_reason();
+    ESP_LOGW(
+        TAG,
+        "last reset reason: %s (%d)",
+        system_diagnostics_reset_reason_name(reset_reason),
+        (int)reset_reason);
+#else
+    ESP_LOGW(TAG, "last reset reason code: %d", (int)esp_reset_reason());
+#endif
     log_heap_status("boot");
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -1520,7 +1646,7 @@ void app_main(void)
 #if CONFIG_ORNAMENT_AI_BUTTON_ENABLED
     create_app_task(ai_button_task, "ai_button", AI_BUTTON_TASK_STACK, 5);
 #endif
-    create_app_task(poll_task, "bridge_poll", 8192, 5);
+    create_app_task(poll_task, "bridge_poll", BRIDGE_POLL_TASK_STACK, 5);
     create_app_task_psram(ui_render_task, "ui_render", UI_RENDER_TASK_STACK, 4);
     log_heap_status("after_tasks");
 

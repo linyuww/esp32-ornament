@@ -145,6 +145,25 @@ config ORNAMENT_PAGE_BUTTON_DEBOUNCE_MS
     default 50
     range 10 500
 
+config ORNAMENT_PAGE_BUTTON_MIN_HOLD_MS
+    int "Page button minimum hold in milliseconds"
+    depends on ORNAMENT_PAGE_BUTTON_ENABLED
+    default 1000
+    range 250 3000
+    help
+        Requires the page button to remain pressed before a page change is
+        accepted. This filters short GPIO noise that can otherwise cycle into
+        the Xiaozhi page and start a session unexpectedly.
+
+config ORNAMENT_PAGE_BUTTON_REPEAT_GUARD_MS
+    int "Page button repeat guard in milliseconds"
+    depends on ORNAMENT_PAGE_BUTTON_ENABLED
+    default 2500
+    range 0 10000
+    help
+        Ignores a new page button press until this time has elapsed after the
+        previous accepted press.
+
 endmenu
 
 menu "AI button"
@@ -176,6 +195,25 @@ config ORNAMENT_AI_BUTTON_DEBOUNCE_MS
     depends on ORNAMENT_AI_BUTTON_ENABLED
     default 50
     range 10 500
+
+config ORNAMENT_AI_BUTTON_MIN_HOLD_MS
+    int "AI button minimum hold in milliseconds"
+    depends on ORNAMENT_AI_BUTTON_ENABLED
+    default 700
+    range 250 3000
+    help
+        Requires the AI button to remain pressed before toggling or
+        interrupting Xiaozhi. This filters short GPIO noise while keeping the
+        button responsive for deliberate presses.
+
+config ORNAMENT_AI_BUTTON_REPEAT_GUARD_MS
+    int "AI button repeat guard in milliseconds"
+    depends on ORNAMENT_AI_BUTTON_ENABLED
+    default 1200
+    range 0 10000
+    help
+        Ignores a new AI button press until this time has elapsed after the
+        previous accepted press.
 
 endmenu
 
@@ -328,6 +366,15 @@ config ORNAMENT_XIAOZHI_AUTO_START
     bool "Start Xiaozhi session after Wi-Fi connects"
     depends on ORNAMENT_XIAOZHI_ENABLED
     default n
+
+config ORNAMENT_XIAOZHI_ALLOW_REMOTE_REBOOT
+    bool "Allow Xiaozhi server reboot command"
+    depends on ORNAMENT_XIAOZHI_TRANSPORT_DIRECT
+    default n
+    help
+        The direct Xiaozhi protocol can deliver a system/reboot command over
+        the WebSocket. Keep this disabled for normal ornament use so a remote
+        service message cannot cause intermittent device restarts.
 
 config ORNAMENT_XIAOZHI_CLIENT_ID
     string "Xiaozhi client ID override"
