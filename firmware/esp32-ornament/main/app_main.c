@@ -49,11 +49,11 @@
 #endif
 
 #ifndef CONFIG_ORNAMENT_PAGE_BUTTON_MIN_HOLD_MS
-#define CONFIG_ORNAMENT_PAGE_BUTTON_MIN_HOLD_MS 1000
+#define CONFIG_ORNAMENT_PAGE_BUTTON_MIN_HOLD_MS 0
 #endif
 
 #ifndef CONFIG_ORNAMENT_PAGE_BUTTON_REPEAT_GUARD_MS
-#define CONFIG_ORNAMENT_PAGE_BUTTON_REPEAT_GUARD_MS 2500
+#define CONFIG_ORNAMENT_PAGE_BUTTON_REPEAT_GUARD_MS 250
 #endif
 
 #ifdef CONFIG_ORNAMENT_PAGE_BUTTON_ACTIVE_LOW
@@ -100,7 +100,7 @@ static const char *TAG = "ornament";
 #define AI_BUTTON_TASK_STACK 8192
 #define UI_RENDER_TASK_STACK 24576
 #define UI_RENDER_LOW_STACK_WARN_BYTES 2048
-#define BUTTON_MIN_DEBOUNCE_MS 150
+#define BUTTON_MIN_DEBOUNCE_MS 10
 
 #ifndef CONFIG_ORNAMENT_EXPIRED_QUOTA_RETRY_MS
 #define CONFIG_ORNAMENT_EXPIRED_QUOTA_RETRY_MS 30000
@@ -1132,7 +1132,7 @@ static bool button_filter_poll(button_filter_t *button, TickType_t now)
     if (sample_pressed != button->stable_pressed && (now - button->changed_tick) >= button->debounce_ticks) {
         button->stable_pressed = sample_pressed;
         if (button->stable_pressed) {
-            button->pressed_tick = now;
+            button->pressed_tick = button->changed_tick;
             button->press_consumed = false;
         } else {
             if (!button->press_consumed && button->pressed_tick != 0) {
@@ -1147,7 +1147,8 @@ static bool button_filter_poll(button_filter_t *button, TickType_t now)
     if (!button->stable_pressed || !button->armed || button->press_consumed) {
         return false;
     }
-    if ((now - button->pressed_tick) < button->min_hold_ticks) {
+    TickType_t held_ticks = now - button->pressed_tick;
+    if (held_ticks < button->min_hold_ticks) {
         return false;
     }
 
@@ -1159,7 +1160,7 @@ static bool button_filter_poll(button_filter_t *button, TickType_t now)
     }
 
     button->last_action_tick = now;
-    ESP_LOGI(TAG, "%s button accepted after %lums hold", button->name, (unsigned long)button->min_hold_ms);
+    ESP_LOGI(TAG, "%s button accepted after %lums hold", button->name, (unsigned long)ticks_to_ms(held_ticks));
     return true;
 }
 #endif

@@ -148,17 +148,16 @@ config ORNAMENT_PAGE_BUTTON_DEBOUNCE_MS
 config ORNAMENT_PAGE_BUTTON_MIN_HOLD_MS
     int "Page button minimum hold in milliseconds"
     depends on ORNAMENT_PAGE_BUTTON_ENABLED
-    default 1000
-    range 250 3000
+    default 0
+    range 0 3000
     help
         Requires the page button to remain pressed before a page change is
-        accepted. This filters short GPIO noise that can otherwise cycle into
-        the Xiaozhi page and start a session unexpectedly.
+        accepted. Set 0 to switch pages as soon as the press is debounced.
 
 config ORNAMENT_PAGE_BUTTON_REPEAT_GUARD_MS
     int "Page button repeat guard in milliseconds"
     depends on ORNAMENT_PAGE_BUTTON_ENABLED
-    default 2500
+    default 250
     range 0 10000
     help
         Ignores a new page button press until this time has elapsed after the
