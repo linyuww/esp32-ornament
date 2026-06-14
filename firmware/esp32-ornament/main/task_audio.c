@@ -450,13 +450,6 @@ esp_err_t task_audio_output_acquire_with_volume(const ornament_settings_t *setti
     }
     if (settings != NULL) {
         refresh_output_volume_from_settings(settings);
-    } else {
-        ornament_settings_t loaded;
-        if (settings_load(&loaded) == ESP_OK) {
-            refresh_output_volume_from_settings(&loaded);
-        } else {
-            s_play_volume_percent = CONFIG_ORNAMENT_AUDIO_VOLUME_PERCENT;
-        }
     }
     esp_err_t err = switch_route_locked(AUDIO_ROUTE_TX);
     if (err != ESP_OK) {
@@ -677,6 +670,12 @@ int task_audio_volume_percent(void)
 
 esp_err_t task_audio_output_acquire(void)
 {
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
+esp_err_t task_audio_output_acquire_with_volume(const ornament_settings_t *settings)
+{
+    (void)settings;
     return ESP_ERR_NOT_SUPPORTED;
 }
 

@@ -16,6 +16,7 @@
 | 小智 AI | 默认通过 PC bridge 代理，直连 WebSocket + Opus 仅作备用 |
 | 页面按键 | GPIO15 短按切换 `Standby -> Quota -> Xiaozhi` |
 | AI 启停按键 | GPIO16，仅在 Xiaozhi 页生效 |
+| 音量按键 | GPIO17，调节音乐和 AI 助手共享扬声器音量 |
 | 任务完成提示 | 边框闪烁；可选 MAX98357A I2S 本地 PCM 提示音 |
 
 默认引脚：
@@ -38,6 +39,7 @@
 - 空闲 `CONFIG_ORNAMENT_STANDBY_CLOCK_MS` 后进入待机时钟页，默认 60000 ms。
 - GPIO15 页面按键可短按循环 `Standby` / `Quota` / `Xiaozhi` 三个手动页。
 - GPIO16 AI 按键仅在手动 Xiaozhi 页生效，用于启动或停止小智会话。
+- GPIO17 音量按键每次增加 10% 共享扬声器音量，超过 100% 后回到 0%，音乐播放和小智 AI 语音使用同一音量值。
 - 开启本地 Web 控制台后，网页 `Start AI` 会启动小智后台监听并立即切到 AI 页面；进入监听待机后，屏幕默认回到额度/待机页。
 - 小智检测到唤醒词或新的对话活动后，屏幕会自动切回小智页面显示 STT/TTS。
 - 开启本地 Web 控制台后，网页 `Stop AI` 会彻底关闭小智会话；关闭后仅喊唤醒词不会重新启动 AI。
@@ -182,12 +184,15 @@ http://<ESP32-IP>/
 | Mic DOUT | GPIO14 | INMP441 `SD`/`DOUT` 输入 |
 | Page Button | GPIO15 | 另一端接 GND，内部上拉，低电平触发 |
 | AI Button | GPIO16 | 另一端接 GND，内部上拉，低电平触发 |
+| Volume Button | GPIO17 | 另一端接 GND，内部上拉，低电平触发 |
 
 INMP441 `SCK`/`BCLK` 接 GPIO4，`WS`/`LRCLK` 接 GPIO5，`SD`/`DOUT` 接 GPIO14，`L/R` 接 GND 使用左声道。若 `L/R` 改接 3V3，需要启用 `CONFIG_ORNAMENT_XIAOZHI_MIC_SLOT_RIGHT`。小智会话播放 TTS 时会占用 I2S 输出；此时任务完成提示音会跳过，避免两个音频源同时写同一喇叭。
 
 页面切换按键：按钮一端接 GPIO15，另一端接 GND。默认启用内部上拉，短按循环 `Standby -> Quota -> Xiaozhi -> Standby`。切到 Xiaozhi 页时会自动启动小智会话；从 Xiaozhi 页切到其他手动页时会自动停止小智会话。未进入手动页覆盖时，屏幕仍按原有自动额度/待机逻辑显示。
 
 AI 启停按键：按钮一端接 GPIO16，另一端接 GND。默认启用内部上拉，仅在当前手动页为 Xiaozhi 时响应。进入 Xiaozhi 页后会自动启动一次 AI；如果在该页内手动按 GPIO16 停止，会保持停止直到再次按 GPIO16 启动，或切走后再切回 Xiaozhi 页时重新自动启动。
+
+音量按键：按钮一端接 GPIO17，另一端接 GND。默认启用内部上拉，短按按 10% 步进调节共享扬声器音量；网页端 `AI Assistant Volume` 保存的音量和实体音量键写入同一个 NVS 音量值，音乐播放与小智 TTS 都使用该值。
 
 如果开启 Clash Verge Rev TUN 后 `.local` 访问失败，推荐在 Clash Verge Rev 全局扩展中添加静态 hosts，或在路由器中给 ESP32 绑定 DHCP 静态地址。不要只依赖 `DOMAIN-SUFFIX,local,DIRECT`，因为它不能解决 mDNS 解析被 TUN/DNS 劫持的问题。
 

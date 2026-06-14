@@ -619,7 +619,7 @@ static esp_err_t status_get_handler(httpd_req_t *req)
         status,
         task_title,
         task_message);
-    appendf(json, json_size, &used, "\"audio\":{\"enabled\":%s,\"volume_percent\":%d},", CONFIG_ORNAMENT_AUDIO_ENABLED ? "true" : "false", settings_audio_volume_percent_or_default(&console_settings));
+    appendf(json, json_size, &used, "\"audio\":{\"enabled\":%s,\"volume_percent\":%d},", CONFIG_ORNAMENT_AUDIO_ENABLED ? "true" : "false", task_audio_volume_percent());
     appendf(
         json,
         json_size,
@@ -742,7 +742,7 @@ static esp_err_t root_get_handler(httpd_req_t *req)
     char weather_lon_text[24];
     web_console_bridge_debug_t bridge_diag = {0};
     system_diagnostics_snapshot_t *diag = alloc_console_buffer(sizeof(*diag));
-    int audio_volume_percent = settings_audio_volume_percent_or_default(&console_settings);
+    int audio_volume_percent = task_audio_volume_percent();
 
     if (xiaozhi == NULL || music == NULL || diag == NULL) {
         free(xiaozhi);
@@ -1414,7 +1414,7 @@ static esp_err_t send_audio_saved_page(httpd_req_t *req, int volume_percent, boo
         "<style>body{font-family:system-ui;margin:24px;background:#0b1116;color:#edf7fb}a{color:#49d3c8}</style>"
         "</head><body><h1>AI Assistant Volume</h1><p>Volume: %d%%</p><p>%s</p><p><a href=\"/\">Back</a></p></body></html>",
         volume_percent,
-        played ? "Test audio queued with this volume." : "Saved and applied to AI assistant speech.");
+        played ? "Test audio queued with this volume." : "Saved and applied to AI assistant speech and shared speaker output.");
 
     httpd_resp_set_type(req, "text/html; charset=utf-8");
     return httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
@@ -1655,7 +1655,7 @@ static esp_err_t test_audio_post_handler(httpd_req_t *req)
 {
     char body[128] = {0};
     char value[8] = {0};
-    int volume_percent = settings_audio_volume_percent_or_default(&console_settings);
+    int volume_percent = task_audio_volume_percent();
     if (req->content_len > 0) {
         if (read_form_body(req, body, sizeof(body)) != ESP_OK) {
             return ESP_FAIL;

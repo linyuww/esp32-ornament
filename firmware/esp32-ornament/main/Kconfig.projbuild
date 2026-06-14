@@ -217,6 +217,58 @@ config ORNAMENT_AI_BUTTON_REPEAT_GUARD_MS
 
 endmenu
 
+menu "Volume button"
+
+config ORNAMENT_VOLUME_BUTTON_ENABLED
+    bool "Enable hardware volume button"
+    default y
+    help
+        Enables a dedicated physical button that steps the shared speaker
+        volume used by music playback and Xiaozhi assistant speech.
+
+config ORNAMENT_VOLUME_BUTTON_GPIO
+    int "Volume button GPIO"
+    depends on ORNAMENT_VOLUME_BUTTON_ENABLED
+    default 17
+    help
+        Connect one side of the button to this GPIO and the other side to
+        GND when active-low mode is enabled. Keep this GPIO separate from
+        the page and AI buttons.
+
+config ORNAMENT_VOLUME_BUTTON_ACTIVE_LOW
+    bool "Volume button is active low"
+    depends on ORNAMENT_VOLUME_BUTTON_ENABLED
+    default y
+    help
+        Enables the GPIO internal pull-up and treats a low level as pressed.
+
+config ORNAMENT_VOLUME_BUTTON_DEBOUNCE_MS
+    int "Volume button debounce in milliseconds"
+    depends on ORNAMENT_VOLUME_BUTTON_ENABLED
+    default 50
+    range 10 500
+
+config ORNAMENT_VOLUME_BUTTON_MIN_HOLD_MS
+    int "Volume button minimum hold in milliseconds"
+    depends on ORNAMENT_VOLUME_BUTTON_ENABLED
+    default 0
+    range 0 3000
+    help
+        Requires the volume button to remain pressed before changing the
+        shared speaker volume. Set 0 to respond as soon as the press is
+        debounced.
+
+config ORNAMENT_VOLUME_BUTTON_REPEAT_GUARD_MS
+    int "Volume button repeat guard in milliseconds"
+    depends on ORNAMENT_VOLUME_BUTTON_ENABLED
+    default 250
+    range 0 10000
+    help
+        Ignores a new volume button press until this time has elapsed after
+        the previous accepted press.
+
+endmenu
+
 config ORNAMENT_SNTP_SERVER
     string "SNTP server"
     default "pool.ntp.org"

@@ -654,7 +654,7 @@ static esp_err_t stream_song(
                 break;
             }
             first_chunk_logged = true;
-            err = task_audio_output_acquire_with_volume(settings);
+            err = task_audio_output_acquire_with_volume(NULL);
             if (err != ESP_OK) {
                 ESP_LOGW(TAG, "audio output acquire failed: %s", esp_err_to_name(err));
                 break;

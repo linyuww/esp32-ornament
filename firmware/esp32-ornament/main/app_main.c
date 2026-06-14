@@ -3,6 +3,7 @@
 #include "display.h"
 #include "music_player.h"
 #include "ornament_state.h"
+#include "settings.h"
 #include "system_status.h"
 #include "standby_wallpaper_client.h"
 #include "task_audio.h"
@@ -31,6 +32,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+
+#define ORNAMENT_VOLUME_BUTTON_STEP_PERCENT 10
 
 #ifndef CONFIG_ORNAMENT_XIAOZHI_AUTO_START
 #define CONFIG_ORNAMENT_XIAOZHI_AUTO_START 0
@@ -88,6 +91,44 @@
 #define ORNAMENT_AI_BUTTON_ACTIVE_LOW 0
 #endif
 
+#ifndef CONFIG_ORNAMENT_VOLUME_BUTTON_ENABLED
+#define CONFIG_ORNAMENT_VOLUME_BUTTON_ENABLED 0
+#endif
+
+#ifndef CONFIG_ORNAMENT_VOLUME_BUTTON_GPIO
+#define CONFIG_ORNAMENT_VOLUME_BUTTON_GPIO 17
+#endif
+
+#ifndef CONFIG_ORNAMENT_VOLUME_BUTTON_DEBOUNCE_MS
+#define CONFIG_ORNAMENT_VOLUME_BUTTON_DEBOUNCE_MS 50
+#endif
+
+#ifndef CONFIG_ORNAMENT_VOLUME_BUTTON_MIN_HOLD_MS
+#define CONFIG_ORNAMENT_VOLUME_BUTTON_MIN_HOLD_MS 0
+#endif
+
+#ifndef CONFIG_ORNAMENT_VOLUME_BUTTON_REPEAT_GUARD_MS
+#define CONFIG_ORNAMENT_VOLUME_BUTTON_REPEAT_GUARD_MS 250
+#endif
+
+#ifdef CONFIG_ORNAMENT_VOLUME_BUTTON_ACTIVE_LOW
+#define ORNAMENT_VOLUME_BUTTON_ACTIVE_LOW 1
+#else
+#define ORNAMENT_VOLUME_BUTTON_ACTIVE_LOW 0
+#endif
+
+#if CONFIG_ORNAMENT_VOLUME_BUTTON_ENABLED && \
+    CONFIG_ORNAMENT_PAGE_BUTTON_ENABLED && \
+    CONFIG_ORNAMENT_VOLUME_BUTTON_GPIO == CONFIG_ORNAMENT_PAGE_BUTTON_GPIO
+#error "Volume button GPIO conflicts with page button GPIO"
+#endif
+
+#if CONFIG_ORNAMENT_VOLUME_BUTTON_ENABLED && \
+    CONFIG_ORNAMENT_AI_BUTTON_ENABLED && \
+    CONFIG_ORNAMENT_VOLUME_BUTTON_GPIO == CONFIG_ORNAMENT_AI_BUTTON_GPIO
+#error "Volume button GPIO conflicts with AI button GPIO"
+#endif
+
 static const char *TAG = "ornament";
 
 #define VOICE_PAGE_HOLD_MS 12000
@@ -98,6 +139,7 @@ static const char *TAG = "ornament";
 #define BRIDGE_POLL_TASK_STACK 12288
 #define PAGE_BUTTON_TASK_STACK 4096
 #define AI_BUTTON_TASK_STACK 8192
+#define VOLUME_BUTTON_TASK_STACK 4096
 #define UI_RENDER_TASK_STACK 24576
 #define UI_RENDER_LOW_STACK_WARN_BYTES 2048
 #define BUTTON_MIN_DEBOUNCE_MS 10
@@ -1031,7 +1073,34 @@ static bool voice_manual_xiaozhi_page_active(const voice_control_state_t *voice_
            voice_view_active(voice_state->view, voice_state->hold_until_tick, now);
 }
 
-#if CONFIG_ORNAMENT_PAGE_BUTTON_ENABLED || CONFIG_ORNAMENT_AI_BUTTON_ENABLED
+#if CONFIG_ORNAMENT_VOLUME_BUTTON_ENABLED
+static int next_button_volume_percent(int current)
+{
+    if (current < 0 || current > 100) {
+        current = CONFIG_ORNAMENT_AUDIO_VOLUME_PERCENT;
+    }
+
+    int next = ((current / ORNAMENT_VOLUME_BUTTON_STEP_PERCENT) + 1) * ORNAMENT_VOLUME_BUTTON_STEP_PERCENT;
+    return next > 100 ? 0 : next;
+}
+
+static esp_err_t apply_volume_button_step(void)
+{
+    int current = task_audio_volume_percent();
+    int next = next_button_volume_percent(current);
+    esp_err_t err = settings_save_audio_volume_percent(next);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "volume button save failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    task_audio_set_volume_percent(next);
+    ESP_LOGI(TAG, "volume button adjusted shared speaker volume: %d%% -> %d%%", current, next);
+    return ESP_OK;
+}
+#endif
+
+#if CONFIG_ORNAMENT_PAGE_BUTTON_ENABLED || CONFIG_ORNAMENT_AI_BUTTON_ENABLED || CONFIG_ORNAMENT_VOLUME_BUTTON_ENABLED
 static bool button_pressed_level(int level, bool active_low)
 {
     return active_low ? level == 0 : level != 0;
@@ -1257,6 +1326,36 @@ static void ai_button_task(void *arg)
                 ESP_LOGI(TAG, "AI button pressed on Xiaozhi page");
                 queue_xiaozhi_session_action(XIAOZHI_SESSION_ACTION_TOGGLE, "AI button toggle");
             }
+        }
+        vTaskDelay(poll_ticks);
+    }
+}
+#endif
+
+#if CONFIG_ORNAMENT_VOLUME_BUTTON_ENABLED
+static void volume_button_task(void *arg)
+{
+    (void)arg;
+    const gpio_num_t gpio = (gpio_num_t)CONFIG_ORNAMENT_VOLUME_BUTTON_GPIO;
+    ESP_ERROR_CHECK(configure_button_gpio(gpio, ORNAMENT_VOLUME_BUTTON_ACTIVE_LOW));
+
+    const TickType_t poll_ticks = pdMS_TO_TICKS(20);
+    const uint32_t debounce_ms = button_effective_debounce_ms(CONFIG_ORNAMENT_VOLUME_BUTTON_DEBOUNCE_MS);
+    button_filter_t button;
+    button_filter_init(
+        &button,
+        "volume",
+        gpio,
+        ORNAMENT_VOLUME_BUTTON_ACTIVE_LOW,
+        debounce_ms,
+        CONFIG_ORNAMENT_VOLUME_BUTTON_MIN_HOLD_MS,
+        CONFIG_ORNAMENT_VOLUME_BUTTON_REPEAT_GUARD_MS);
+    ESP_LOGI(TAG, "volume button step=%d%% shared speaker output", ORNAMENT_VOLUME_BUTTON_STEP_PERCENT);
+
+    while (true) {
+        TickType_t now = xTaskGetTickCount();
+        if (button_filter_poll(&button, now)) {
+            (void)apply_volume_button_step();
         }
         vTaskDelay(poll_ticks);
     }
@@ -1646,6 +1745,9 @@ void app_main(void)
 #endif
 #if CONFIG_ORNAMENT_AI_BUTTON_ENABLED
     create_app_task(ai_button_task, "ai_button", AI_BUTTON_TASK_STACK, 5);
+#endif
+#if CONFIG_ORNAMENT_VOLUME_BUTTON_ENABLED
+    create_app_task(volume_button_task, "volume_button", VOLUME_BUTTON_TASK_STACK, 5);
 #endif
     create_app_task(poll_task, "bridge_poll", BRIDGE_POLL_TASK_STACK, 5);
     create_app_task_psram(ui_render_task, "ui_render", UI_RENDER_TASK_STACK, 4);
