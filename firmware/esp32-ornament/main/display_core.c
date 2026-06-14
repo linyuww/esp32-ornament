@@ -1721,14 +1721,6 @@ static void draw_hud_chamfer_box(int x, int y, int w, int h, int cut, int thickn
     draw_line(x + w - thickness, y + h - cut, x + w - cut, y + h - thickness, thickness, color);
 }
 
-static void draw_hud_user_icon(int x, int y, int size, uint16_t color)
-{
-    draw_hud_chamfer_box(x, y, size, size, ss(8), ss(1), color);
-    draw_circle_outline(x + size / 2, y + size / 3, size / 8, ss(2), color);
-    draw_circle_outline(x + size / 2, y + size * 2 / 3, size / 4, ss(2), color);
-    fill_rect(x + size / 4, y + size * 2 / 3, size / 2, size / 3, HUD_HUD_BG);
-}
-
 static void draw_hud_bot_icon(int x, int y, int size, uint16_t color)
 {
     draw_hud_chamfer_box(x, y, size, size, ss(8), ss(1), color);
@@ -1839,11 +1831,6 @@ static void draw_hud_panel_marks(int x, int y, int w, int h, uint16_t color)
 }
 
 static const char *xiaozhi_hud_main_ascii(xiaozhi_client_state_t state);
-
-static const char *xiaozhi_hud_user_hint(const xiaozhi_client_snapshot_t *snapshot)
-{
-    return snapshot != NULL ? snapshot->last_stt : "";
-}
 
 static const char *xiaozhi_hud_main_text(xiaozhi_client_state_t state)
 {
@@ -2586,19 +2573,13 @@ void display_core_render_xiaozhi(
         snapshot = &snapshot_fallback;
     }
 
-    char stt_preview[96];
     char assistant_preview[96];
-    const char *stt_text = xiaozhi_hud_user_hint(snapshot);
     const bool completed = snapshot->state == XIAOZHI_CLIENT_STATE_IDLE && snapshot->last_tts[0] != '\0';
     const char *main_text = completed ? xiaozhi_hud_done_text() : xiaozhi_hud_main_text(snapshot->state);
     const char *main_ascii = completed ? "DONE" : xiaozhi_hud_main_ascii(snapshot->state);
     const char *assistant_text = xiaozhi_hud_assistant_hint(snapshot, snapshot->last_tts);
     const char *assistant_ascii = xiaozhi_hud_assistant_ascii(snapshot, snapshot->last_tts);
-    bool stt_ascii_available = ascii_preview(stt_text, "", stt_preview, sizeof(stt_preview));
     bool assistant_ascii_available = ascii_preview(assistant_ascii, "", assistant_preview, sizeof(assistant_preview));
-    if (!stt_ascii_available) {
-        stt_preview[0] = '\0';
-    }
     if (!assistant_ascii_available) {
         assistant_preview[0] = '\0';
     }
@@ -2629,16 +2610,12 @@ void display_core_render_xiaozhi(
     const int outer_h = active_canvas->height - sy(12);
     const int time_y = sy(16);
     const int top_sep_y = sy(43);
-    const int query_x = sx(18);
-    const int query_y = sy(57);
-    const int query_w = active_canvas->width - sx(36);
-    const int query_h = sy(49);
     const int icon_size = ss(30);
     const int ring_cx = active_canvas->center_x;
-    const int ring_cy = sy(172);
+    const int ring_cy = sy(128);
     const int ring_r = ss(68);
     const int assistant_x = sx(18);
-    const int assistant_y = sy(273);
+    const int assistant_y = sy(222);
     const int assistant_w = active_canvas->width - sx(36);
     const int assistant_h = active_canvas->height - assistant_y - sy(18);
     const char *time_text = state != NULL && state->local_time[0] != '\0' ? state->local_time : "--:--";
@@ -2649,22 +2626,6 @@ void display_core_render_xiaozhi(
     draw_text_xy(sx(22), time_y, "XIAOZHI", text_scale, text_scale, HUD_WHITE);
     fill_circle(active_canvas->center_x, time_y + ss(3), ss(3), state_color);
     draw_text_right_fit_xy(active_canvas->width - sx(22), time_y, time_text, text_scale, text_scale, HUD_HUD_CYAN);
-
-    draw_hud_chamfer_box(query_x, query_y, query_w, query_h, ss(8), thin, HUD_HUD_DIM);
-    draw_hud_user_icon(query_x + ss(8), query_y + ss(9), icon_size, HUD_HUD_CYAN);
-    draw_hud_wrapped_text(
-        query_x + icon_size + ss(18),
-        query_y + ss(16),
-        stt_text,
-        stt_preview,
-        HUD_HUD_CYAN,
-        query_w - icon_size - ss(50),
-        2,
-        text_scale,
-        text_scale);
-    if (stt_text[0] != '\0') {
-        draw_text_xy(query_x + query_w - ss(30), query_y + query_h - ss(18), "...", text_scale, text_scale, HUD_HUD_CYAN);
-    }
 
     draw_hud_segmented_ring(ring_cx, ring_cy, ring_r, state_color);
     if (snapshot->state == XIAOZHI_CLIENT_STATE_LISTENING) {

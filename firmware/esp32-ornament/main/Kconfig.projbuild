@@ -110,11 +110,11 @@ config ORNAMENT_UI_FRAME_MS
 
 config ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
     bool "Enable rich Xiaozhi display overlay"
-    default n
+    default y
     help
         Builds bundled Chinese fonts and enables UTF-8 rendering on the
-        Xiaozhi assistant page. This uses substantially more internal RAM
-        and can prevent other service tasks from starting on the ornament.
+        Xiaozhi assistant page. This is required for the LVGL output-only
+        assistant page.
 
 menu "Page button"
 

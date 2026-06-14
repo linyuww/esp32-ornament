@@ -96,6 +96,8 @@ static void display_log_config(void)
 #if CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
 
 static const uint64_t LVGL_TICK_PERIOD_US = 1000;
+#define XIAOZHI_LVGL_AI_TEXT_MAX_BYTES 192
+#define XIAOZHI_LVGL_TEXT_BUFFER_BYTES (XIAOZHI_LVGL_AI_TEXT_MAX_BYTES + 4)
 
 LV_FONT_DECLARE(font_puhui_16_4);
 
@@ -106,13 +108,12 @@ static lv_display_t *lvgl_display;
 static lv_obj_t *lvgl_root;
 static lv_obj_t *lvgl_header_label;
 static lv_obj_t *lvgl_state_label;
-static lv_obj_t *lvgl_user_card;
 static lv_obj_t *lvgl_ai_card;
-static lv_obj_t *lvgl_user_label;
 static lv_obj_t *lvgl_ai_label;
-static lv_obj_t *lvgl_footer_label;
 static lv_obj_t *lvgl_spinner;
 static esp_timer_handle_t lvgl_tick_timer;
+static char lvgl_state_text_cache[32];
+static char lvgl_ai_text_cache[XIAOZHI_LVGL_TEXT_BUFFER_BYTES];
 
 static const char *const XIAOZHI_TITLE_TEXT = "\xE5\xB0\x8F\xE6\x99\xBA";
 static const char *const XIAOZHI_STATUS_CONNECTING_TEXT = "\xE8\xBF\x9E\xE6\x8E\xA5\xE4\xB8\xAD";
@@ -122,12 +123,8 @@ static const char *const XIAOZHI_STATUS_ERROR_TEXT = "\xE5\xBC\x82\xE5\xB8\xB8";
 static const char *const XIAOZHI_STATUS_CONFIG_MISSING_TEXT = "\xE6\x9C\xAA\xE9\x85\x8D\xE7\xBD\xAE";
 static const char *const XIAOZHI_STATUS_IDLE_TEXT = "\xE5\xBE\x85\xE6\x9C\xBA";
 static const char *const XIAOZHI_STATUS_DISABLED_TEXT = "\xE5\x85\xB3\xE9\x97\xAD";
-static const char *const XIAOZHI_PROMPT_SPEAK_TEXT = "\xE8\xAF\xB7\xE8\xAF\xB4\xE8\xAF\x9D...";
 static const char *const XIAOZHI_WAIT_RESPONSE_TEXT = "\xE7\xAD\x89\xE5\xBE\x85\xE5\x9B\x9E\xE7\xAD\x94...";
-static const char *const XIAOZHI_WAIT_BIND_TEXT = "\xE7\xAD\x89\xE5\xBE\x85\xE7\xBB\x91\xE5\xAE\x9A...";
 static const char *const XIAOZHI_BIND_HINT_TEXT = "\xE8\xAF\xB7\xE7\xBB\x91\xE5\xAE\x9A\xE5\xAE\x98\xE6\x96\xB9\xE5\x90\x8E\xE5\x8F\xB0";
-static const char *const XIAOZHI_WAIT_CODE_TEXT = "\xE7\xAD\x89\xE5\xBE\x85\xE4\xB8\x8B\xE5\x8F\x91";
-static const char *const XIAOZHI_FOOTER_DEFAULT_TEXT = "\xE4\xB8\x8A\xE8\xA1\x8C 0  \xE4\xB8\x8B\xE8\xA1\x8C 0";
 
 static void lvgl_tick_cb(void *arg)
 {
@@ -185,6 +182,107 @@ static void lvgl_style_label(lv_obj_t *obj, const lv_font_t *font, lv_color_t co
     lv_obj_set_style_text_align(obj, align, 0);
 }
 
+static bool utf8_is_continuation_byte(unsigned char byte)
+{
+    return (byte & 0xc0) == 0x80;
+}
+
+static size_t utf8_sequence_len(const char *text)
+{
+    unsigned char first = (unsigned char)text[0];
+    size_t len = 0;
+
+    if (first < 0x80) {
+        return 1;
+    } else if ((first & 0xe0) == 0xc0) {
+        len = 2;
+    } else if ((first & 0xf0) == 0xe0) {
+        len = 3;
+    } else if ((first & 0xf8) == 0xf0) {
+        len = 4;
+    } else {
+        return 0;
+    }
+
+    for (size_t i = 1; i < len; i++) {
+        if (!utf8_is_continuation_byte((unsigned char)text[i])) {
+            return 0;
+        }
+    }
+    return len;
+}
+
+static size_t utf8_safe_prefix_len(const char *text, size_t max_bytes)
+{
+    size_t used = 0;
+    while (text[used] != '\0' && used < max_bytes) {
+        size_t seq_len = utf8_sequence_len(&text[used]);
+        if (seq_len == 0 || used + seq_len > max_bytes) {
+            break;
+        }
+        used += seq_len;
+    }
+    return used;
+}
+
+static void lvgl_copy_bounded_utf8(char *dst, size_t dst_size, const char *src, size_t max_bytes)
+{
+    if (dst == NULL || dst_size == 0) {
+        return;
+    }
+    dst[0] = '\0';
+    if (src == NULL || dst_size == 1) {
+        return;
+    }
+
+    size_t copy_limit = max_bytes;
+    if (copy_limit > dst_size - 1) {
+        copy_limit = dst_size - 1;
+    }
+
+    size_t prefix_len = utf8_safe_prefix_len(src, copy_limit);
+    bool truncated = src[prefix_len] != '\0';
+    if (truncated && dst_size >= 4 && prefix_len > dst_size - 4) {
+        prefix_len = utf8_safe_prefix_len(src, dst_size - 4);
+    }
+
+    memcpy(dst, src, prefix_len);
+    if (truncated && prefix_len + 4 <= dst_size) {
+        memcpy(dst + prefix_len, "...", 4);
+    } else {
+        dst[prefix_len] = '\0';
+    }
+}
+
+static void lvgl_copy_cache_text(char *cache, size_t cache_size, const char *text)
+{
+    if (cache == NULL || cache_size == 0) {
+        return;
+    }
+
+    size_t i = 0;
+    if (text != NULL) {
+        while (i + 1 < cache_size && text[i] != '\0') {
+            cache[i] = text[i];
+            i++;
+        }
+    }
+    cache[i] = '\0';
+}
+
+static void lvgl_set_label_text_cached(lv_obj_t *label, char *cache, size_t cache_size, const char *text)
+{
+    if (label == NULL || cache == NULL || cache_size == 0 || text == NULL) {
+        return;
+    }
+    if (strcmp(cache, text) == 0) {
+        return;
+    }
+
+    lv_label_set_text(label, text);
+    lvgl_copy_cache_text(cache, cache_size, text);
+}
+
 static void lvgl_update_now(void)
 {
     if (!lvgl_ready) {
@@ -228,14 +326,6 @@ static const char *xiaozhi_status_cn(xiaozhi_client_state_t state)
     }
 }
 
-static const char *xiaozhi_default_user_text(const xiaozhi_client_snapshot_t *snapshot)
-{
-    if (snapshot != NULL && snapshot->activation_pending) {
-        return XIAOZHI_WAIT_BIND_TEXT;
-    }
-    return XIAOZHI_PROMPT_SPEAK_TEXT;
-}
-
 static const char *xiaozhi_default_ai_text(const xiaozhi_client_snapshot_t *snapshot)
 {
     if (snapshot != NULL && snapshot->activation_pending) {
@@ -261,24 +351,23 @@ static void lvgl_cleanup_failed_init(void)
     lvgl_root = NULL;
     lvgl_header_label = NULL;
     lvgl_state_label = NULL;
-    lvgl_user_card = NULL;
     lvgl_ai_card = NULL;
-    lvgl_user_label = NULL;
     lvgl_ai_label = NULL;
-    lvgl_footer_label = NULL;
     lvgl_spinner = NULL;
+    lvgl_state_text_cache[0] = '\0';
+    lvgl_ai_text_cache[0] = '\0';
     lvgl_ready = false;
     lvgl_xiaozhi_visible = false;
 }
 
-static void lvgl_release_xiaozhi_overlay(void)
+static void lvgl_hide_xiaozhi_overlay(void)
 {
-    if (lvgl_display == NULL && lvgl_tick_timer == NULL && !lvgl_ready) {
+    if (!lvgl_ready || lvgl_root == NULL || !lvgl_xiaozhi_visible) {
         return;
     }
 
-    lvgl_cleanup_failed_init();
-    ESP_LOGI(TAG, "LVGL overlay released");
+    lvgl_set_xiaozhi_visible(false);
+    ESP_LOGI(TAG, "LVGL overlay hidden");
 }
 
 static esp_err_t lvgl_xiaozhi_overlay_init(void)
@@ -367,22 +456,10 @@ static esp_err_t lvgl_xiaozhi_overlay_init(void)
     lv_obj_set_style_arc_color(lvgl_spinner, lv_color_hex(0x4dc7ff), LV_PART_INDICATOR);
     lv_obj_align(lvgl_spinner, LV_ALIGN_TOP_RIGHT, -18, 16);
 
-    lvgl_user_card = lv_obj_create(lvgl_root);
-    lvgl_style_card(lvgl_user_card, lv_color_hex(0x153248));
-    lv_obj_set_size(lvgl_user_card, 212, 72);
-    lv_obj_align(lvgl_user_card, LV_ALIGN_TOP_MID, 0, 72);
-
     lvgl_ai_card = lv_obj_create(lvgl_root);
     lvgl_style_card(lvgl_ai_card, lv_color_hex(0x113a2e));
-    lv_obj_set_size(lvgl_ai_card, 212, 96);
-    lv_obj_align(lvgl_ai_card, LV_ALIGN_TOP_MID, 0, 154);
-
-    lvgl_user_label = lv_label_create(lvgl_user_card);
-    lvgl_style_label(lvgl_user_label, &font_puhui_16_4, lv_color_hex(0xf8fbff), LV_TEXT_ALIGN_LEFT);
-    lv_label_set_long_mode(lvgl_user_label, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(lvgl_user_label, 184);
-    lv_obj_align(lvgl_user_label, LV_ALIGN_TOP_LEFT, 0, 0);
-    lv_label_set_text(lvgl_user_label, XIAOZHI_PROMPT_SPEAK_TEXT);
+    lv_obj_set_size(lvgl_ai_card, 212, 150);
+    lv_obj_align(lvgl_ai_card, LV_ALIGN_TOP_MID, 0, 88);
 
     lvgl_ai_label = lv_label_create(lvgl_ai_card);
     lvgl_style_label(lvgl_ai_label, &font_puhui_16_4, lv_color_hex(0xf8fbff), LV_TEXT_ALIGN_LEFT);
@@ -391,14 +468,10 @@ static esp_err_t lvgl_xiaozhi_overlay_init(void)
     lv_obj_align(lvgl_ai_label, LV_ALIGN_TOP_LEFT, 0, 0);
     lv_label_set_text(lvgl_ai_label, XIAOZHI_WAIT_RESPONSE_TEXT);
 
-    lvgl_footer_label = lv_label_create(lvgl_root);
-    lvgl_style_label(lvgl_footer_label, &font_puhui_16_4, lv_color_hex(0x8f9aa8), LV_TEXT_ALIGN_CENTER);
-    lv_label_set_text(lvgl_footer_label, XIAOZHI_FOOTER_DEFAULT_TEXT);
-    lv_obj_set_width(lvgl_footer_label, 220);
-    lv_obj_align(lvgl_footer_label, LV_ALIGN_BOTTOM_MID, 0, -18);
-
     lvgl_ready = true;
     lvgl_xiaozhi_visible = false;
+    lvgl_state_text_cache[0] = '\0';
+    lvgl_ai_text_cache[0] = '\0';
     lvgl_update_now();
     return ESP_OK;
 }
@@ -416,30 +489,17 @@ static void lvgl_render_xiaozhi_overlay(const xiaozhi_client_snapshot_t *snapsho
     }
 
     char state_text[32];
-    char footer_text[96];
-    const char *user_text = snapshot->last_stt[0] != '\0' ? snapshot->last_stt : xiaozhi_default_user_text(snapshot);
+    char ai_text_buffer[XIAOZHI_LVGL_TEXT_BUFFER_BYTES];
     const char *ai_text = snapshot->last_tts[0] != '\0' ? snapshot->last_tts : xiaozhi_default_ai_text(snapshot);
 
     snprintf(state_text, sizeof(state_text), "%s %s", XIAOZHI_TITLE_TEXT, xiaozhi_status_cn(snapshot->state));
-    if (snapshot->activation_pending) {
-        snprintf(
-            footer_text,
-            sizeof(footer_text),
-            "\xE9\xAA\x8C\xE8\xAF\x81\xE7\xA0\x81 %s",
-            snapshot->activation_code[0] != '\0' ? snapshot->activation_code : XIAOZHI_WAIT_CODE_TEXT);
-    } else {
-        snprintf(
-            footer_text,
-            sizeof(footer_text),
-            "\xE4\xB8\x8A\xE8\xA1\x8C %lu  \xE4\xB8\x8B\xE8\xA1\x8C %lu",
-            (unsigned long)snapshot->uplink_frames,
-            (unsigned long)snapshot->downlink_frames);
+    if (snapshot->activation_pending && snapshot->activation_code[0] != '\0') {
+        ai_text = snapshot->activation_code;
     }
+    lvgl_copy_bounded_utf8(ai_text_buffer, sizeof(ai_text_buffer), ai_text, XIAOZHI_LVGL_AI_TEXT_MAX_BYTES);
 
-    lv_label_set_text(lvgl_state_label, state_text);
-    lv_label_set_text(lvgl_user_label, user_text);
-    lv_label_set_text(lvgl_ai_label, ai_text);
-    lv_label_set_text(lvgl_footer_label, footer_text);
+    lvgl_set_label_text_cached(lvgl_state_label, lvgl_state_text_cache, sizeof(lvgl_state_text_cache), state_text);
+    lvgl_set_label_text_cached(lvgl_ai_label, lvgl_ai_text_cache, sizeof(lvgl_ai_text_cache), ai_text_buffer);
 
     lv_color_t state_color = lv_color_hex(0x8f9aa8);
     switch (snapshot->state) {
@@ -987,9 +1047,7 @@ static void render_boot_test_pattern(void)
 static void hide_xiaozhi_overlay_if_needed(void)
 {
 #if CONFIG_ORNAMENT_RICH_XIAOZHI_DISPLAY_ENABLED
-    if (lvgl_display != NULL || lvgl_ready || lvgl_xiaozhi_visible) {
-        lvgl_release_xiaozhi_overlay();
-    }
+    lvgl_hide_xiaozhi_overlay();
 #endif
 }
 
@@ -1180,7 +1238,7 @@ void display_render_voice_status(const ornament_state_t *state, const char *brid
 
 void display_render_xiaozhi(const ornament_state_t *state, const xiaozhi_client_snapshot_t *snapshot)
 {
-    ESP_LOGI(
+    ESP_LOGD(
         TAG,
         "xiaozhi display: state=%s",
         snapshot != NULL ? xiaozhi_client_state_name(snapshot->state) : "none");
