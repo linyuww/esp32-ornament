@@ -1976,7 +1976,7 @@ esp_err_t web_console_start(void)
     config.server_port = 80;
     config.lru_purge_enable = true;
     config.max_uri_handlers = 22;
-    config.stack_size = 32768;
+    config.stack_size = 16384;
 
     esp_err_t err = httpd_start(&server, &config);
     if (err != ESP_OK) {
