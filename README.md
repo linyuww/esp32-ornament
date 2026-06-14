@@ -10,6 +10,7 @@ Codex 登录凭据只保存在 PC 上。ESP32 只读取局域网内的展示 JSO
 
 ## 当前状态
 
+- 当前固件大版本为 `V3.0.0`，发布包提供 ESP32-S3 一体化烧录镜像 `codex_ornament_v3.0.0_merged.bin`。
 - PC 网桥接收 Codex/Claude hook，维护多生产者、多消费者场景下的任务状态。
 - Web 面板并列显示 Codex Task 和 Claude Task。
 - ESP 硬件屏幕保持合并任务视图，不区分 Codex/Claude。
@@ -280,6 +281,14 @@ idf.py build
 idf.py -p COM5 flash
 ```
 
+发布包烧录：
+
+```powershell
+python -m esptool --chip esp32s3 -p COM5 -b 460800 write_flash 0x0 release/codex_ornament_v3.0.0_merged.bin
+```
+
+注意：一体化镜像从 `0x0` 烧录会覆盖 NVS 区域，Wi-Fi、Bridge URL 和本地音量等设备配置会被清空。烧录后需要重新配网，或改用开发流程的 `idf.py -p COM5 flash` 保留已有 NVS 配置。
+
 `menuconfig` 入口：
 
 ```text
@@ -506,11 +515,10 @@ curl.exe --max-time 5 http://<device-ip>/status
 最近一次硬件验证：
 
 ```text
-2026-06-03
-idf.py -p COM5 flash 成功。
+2026-06-14
+V3.0.0 main 固件 idf.py build 通过，发布镜像 `codex_ornament_v3.0.0_merged.bin` 从 0x0 烧录成功。
 ESP32-S3 MAC：e0:72:a1:d3:4a:d4。
-mDNS 状态页可访问。
-/status 显示 Wi-Fi connected、fetch_error=ESP_OK、bridge_debug.consecutive_fetch_failures=0。
+启动日志显示 App version: v3.0.0；因 NVS 被发布镜像擦除，设备进入 Setup AP: 192.168.4.1 等待重新配网。
 ```
 
 ## 本地检查命令

@@ -2,6 +2,8 @@
 
 这是 Codex 桌面摆件的 ESP-IDF 固件。固件运行在 ESP32-S3 上，通过 Wi-Fi 轮询 PC 上的 `codex-ornament-bridge`，显示任务状态、额度、时间、天气和 Wi-Fi 信号。
 
+当前发布版本：`V3.0.0`。
+
 ## 当前硬件
 
 默认配置来自 `main/Kconfig.projbuild` 和 `sdkconfig.defaults`：
@@ -80,6 +82,14 @@ idf.py set-target esp32s3
 idf.py -p COM5 flash
 ```
 
+发布包包含一体化镜像，可从 `firmware/esp32-ornament` 目录烧录：
+
+```powershell
+python -m esptool --chip esp32s3 -p COM5 -b 460800 write_flash 0x0 release/codex_ornament_v3.0.0_merged.bin
+```
+
+注意：一体化镜像从 `0x0` 烧录会覆盖 NVS 区域，Wi-Fi、Bridge URL 和本地音量等设备配置会被清空。烧录后需要重新配网，或改用开发流程的 `idf.py -p COM5 flash` 保留已有 NVS 配置。
+
 烧录后建议继续监视启动日志：
 
 ```cmd
@@ -90,6 +100,15 @@ idf.py -p COM5 monitor
 
 ```powershell
 [System.IO.Ports.SerialPort]::GetPortNames()
+```
+
+最近一次硬件验证：
+
+```text
+2026-06-14
+V3.0.0 main 固件 idf.py build 通过，发布镜像 `codex_ornament_v3.0.0_merged.bin` 从 0x0 烧录成功。
+ESP32-S3 MAC：e0:72:a1:d3:4a:d4。
+启动日志显示 App version: v3.0.0；因 NVS 被发布镜像擦除，设备进入 Setup AP: 192.168.4.1 等待重新配网。
 ```
 
 ## 启动 PC 网桥

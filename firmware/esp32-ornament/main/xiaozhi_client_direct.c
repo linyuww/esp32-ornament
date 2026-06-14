@@ -503,7 +503,7 @@ static esp_err_t build_ota_request_body(
         "\"uuid\":\"%s\","
         "\"chip_model_name\":\"" CONFIG_IDF_TARGET "\","
         "\"chip_info\":{\"model\":9,\"cores\":2,\"revision\":0,\"features\":0},"
-        "\"application\":{\"name\":\"esp32-ornament\",\"version\":\"v2.0.0\",\"compile_time\":\"%sT%sZ\",\"idf_version\":\"%s\",\"elf_sha256\":\"\"},"
+        "\"application\":{\"name\":\"esp32-ornament\",\"version\":\"v3.0.0\",\"compile_time\":\"%sT%sZ\",\"idf_version\":\"%s\",\"elf_sha256\":\"\"},"
         "\"partition_table\":[{\"label\":\"factory\",\"type\":0,\"subtype\":0,\"address\":65536,\"size\":4194304}],"
         "\"ota\":{\"label\":\"factory\"},"
         "\"display\":{\"monochrome\":false,\"width\":%d,\"height\":%d},"
