@@ -64,6 +64,7 @@ typedef struct {
     char album[ORNAMENT_TEXT_MAX];
     char picture[ORNAMENT_BRIDGE_URL_MAX];
     char cover_url[ORNAMENT_BRIDGE_URL_MAX];
+    char stream_url[MUSIC_PLAYER_URL_MAX];
     char lyrics[MUSIC_PLAYER_LYRICS_MAX];
     uint32_t duration_ms;
 } resolved_song_t;
@@ -170,6 +171,24 @@ static void set_error_locked(const char *message)
 {
     set_state_locked(MUSIC_PLAYER_STATE_ERROR);
     strlcpy(s_snapshot.last_error, message != NULL ? message : "unknown", sizeof(s_snapshot.last_error));
+}
+
+static const char *music_player_error_text(esp_err_t err)
+{
+    switch (err) {
+    case ESP_ERR_NOT_SUPPORTED:
+        return "audio not supported";
+    case ESP_ERR_INVALID_RESPONSE:
+        return "bridge stream invalid";
+    case ESP_ERR_TIMEOUT:
+        return "music stream timeout";
+    case ESP_ERR_INVALID_STATE:
+        return "audio unavailable";
+    case ESP_ERR_NO_MEM:
+        return "music memory low";
+    default:
+        return esp_err_to_name(err);
+    }
 }
 
 static void mark_idle_locked(void)
@@ -398,6 +417,7 @@ static esp_err_t resolve_song(
     copy_json_string(root, "album", parsed.album, sizeof(parsed.album));
     copy_json_string(root, "picture", parsed.picture, sizeof(parsed.picture));
     copy_json_string(root, "coverUrl", parsed.cover_url, sizeof(parsed.cover_url));
+    copy_json_string(root, "url", parsed.stream_url, sizeof(parsed.stream_url));
     copy_json_string(root, "lyrics", parsed.lyrics, sizeof(parsed.lyrics));
     parsed.duration_ms = json_u32_or_zero(root, "durationMs");
     if (parsed.duration_ms == 0) {
@@ -502,7 +522,18 @@ static bool content_type_is_rejected(const char *content_type)
            strcasestr(content_type, "text/") != NULL;
 }
 
-static bool buffer_looks_like_non_pcm(const uint8_t *data, size_t size)
+static bool content_type_is_raw_pcm(const char *content_type)
+{
+    if (content_type == NULL || content_type[0] == '\0') {
+        return false;
+    }
+
+    return strcasestr(content_type, "audio/l16") != NULL ||
+           strcasestr(content_type, "audio/pcm") != NULL ||
+           strcasestr(content_type, "application/octet-stream") != NULL;
+}
+
+static bool buffer_looks_like_non_pcm(const uint8_t *data, size_t size, bool declared_pcm)
 {
     if (data == NULL || size < 4) {
         return false;
@@ -515,39 +546,45 @@ static bool buffer_looks_like_non_pcm(const uint8_t *data, size_t size)
         return true;
     }
 
-    return data[0] == 0xff && (data[1] & 0xe0) == 0xe0;
+    return !declared_pcm && data[0] == 0xff && (data[1] & 0xe0) == 0xe0;
 }
 
 static esp_err_t stream_song(
     const ornament_settings_t *settings,
-    const music_player_request_t *request)
+    const music_player_request_t *request,
+    const char *resolved_stream_url)
 {
     if (settings == NULL || request == NULL || request->song_name[0] == '\0') {
         return ESP_ERR_INVALID_ARG;
     }
 
-    char base_url[ORNAMENT_MUSIC_BASE_URL_MAX] = {0};
-    ESP_RETURN_ON_ERROR(
-        settings_resolve_bridge_music_base_url(settings, base_url, sizeof(base_url)),
-        TAG,
-        "music base url resolve failed");
-
     char *url = heap_caps_calloc(MUSIC_PLAYER_URL_MAX, 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (url == NULL) {
         return ESP_ERR_NO_MEM;
     }
-    esp_err_t err = build_music_request_url(
-        base_url,
-        "stream",
-        request->song_name,
-        request->artist_name[0] != '\0' ? request->artist_name : NULL,
-        request->index,
-        url,
-        MUSIC_PLAYER_URL_MAX);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "stream url build failed: %s", esp_err_to_name(err));
-        free(url);
-        return err;
+    esp_err_t err = ESP_OK;
+    if (resolved_stream_url != NULL && resolved_stream_url[0] != '\0') {
+        strlcpy(url, resolved_stream_url, MUSIC_PLAYER_URL_MAX);
+        ESP_LOGI(TAG, "using resolved music stream URL");
+    } else {
+        char base_url[ORNAMENT_MUSIC_BASE_URL_MAX] = {0};
+        err = settings_resolve_bridge_music_base_url(settings, base_url, sizeof(base_url));
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "music base url resolve failed: %s", esp_err_to_name(err));
+            goto cleanup_url;
+        }
+        err = build_music_request_url(
+            base_url,
+            "stream",
+            request->song_name,
+            request->artist_name[0] != '\0' ? request->artist_name : NULL,
+            request->index,
+            url,
+            MUSIC_PLAYER_URL_MAX);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "stream url build failed: %s", esp_err_to_name(err));
+            goto cleanup_url;
+        }
     }
 
     ornament_http_request_t http_request = {
@@ -575,8 +612,9 @@ static esp_err_t stream_song(
     if (content_type_is_rejected(content_type)) {
         ESP_LOGW(TAG, "stream content type is not raw PCM: %s", content_type);
         ornament_http_stream_close(stream);
-        return ESP_ERR_NOT_SUPPORTED;
+        return ESP_ERR_INVALID_RESPONSE;
     }
+    bool declared_pcm = content_type_is_raw_pcm(content_type);
     if (content_length > 0 && s_mutex != NULL && xSemaphoreTake(s_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
         if (s_snapshot.duration_ms == 0) {
             uint64_t frames = (uint64_t)content_length / MUSIC_PLAYER_PCM_SAMPLE_BYTES;
@@ -648,9 +686,9 @@ static esp_err_t stream_song(
         empty_reads = 0;
         if (!first_chunk_logged) {
             size_t preview_bytes = carry + read;
-            if (buffer_looks_like_non_pcm(read_buffer, preview_bytes)) {
+            if (buffer_looks_like_non_pcm(read_buffer, preview_bytes, declared_pcm)) {
                 ESP_LOGW(TAG, "stream body is not raw PCM, refusing playback");
-                err = ESP_ERR_NOT_SUPPORTED;
+                err = ESP_ERR_INVALID_RESPONSE;
                 break;
             }
             first_chunk_logged = true;
@@ -702,6 +740,10 @@ static esp_err_t stream_song(
     if (stop_requested()) {
         return ESP_OK;
     }
+    return err;
+
+cleanup_url:
+    free(url);
     return err;
 }
 
@@ -771,10 +813,19 @@ static void music_player_task(void *arg)
     }
 #endif
 
+    char *stream_url = heap_caps_calloc(MUSIC_PLAYER_URL_MAX, 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (stream_url == NULL) {
+        ESP_LOGW(TAG, "stream url alloc failed");
+        err = ESP_ERR_NO_MEM;
+        goto cleanup;
+    }
+    strlcpy(stream_url, resolved->stream_url, MUSIC_PLAYER_URL_MAX);
+
     free(resolved);
     resolved = NULL;
 
-    err = stream_song(&request->settings, request);
+    err = stream_song(&request->settings, request, stream_url);
+    free(stream_url);
     requested_stop = stop_requested();
 
 cleanup:
@@ -785,7 +836,7 @@ cleanup:
         } else if (requested_stop) {
             mark_idle_locked();
         } else {
-            set_error_locked(esp_err_to_name(err));
+            set_error_locked(music_player_error_text(err));
         }
         s_task = NULL;
         xSemaphoreGive(s_mutex);
